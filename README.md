@@ -1,6 +1,6 @@
 # 🐳 llm-docker
 
-![Version](https://img.shields.io/badge/Version-v1.1-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-v1.2-blue?style=for-the-badge)
 ![OpenCode](https://img.shields.io/badge/OpenCode-Supported-00A86B?style=for-the-badge&logo=openai&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Supported-D1913C?style=for-the-badge&logo=anthropic&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Isolated-2496ED?style=for-the-badge&logo=docker&logoColor=white)
@@ -14,6 +14,8 @@
 ## 📘 About
 
 **llm-docker** provides a secure, sandboxed environment for running **OpenCode** and **Claude Code** with complete data isolation and privacy.
+
+It maps your `~/Projects` folder into Docker. It also stores **OpenCode** and **Claude Code** data outside of Docker for persistent sessions, config, and API keys across container restarts.
 
 ![Screenshot](screenshot.png)
 
@@ -94,7 +96,9 @@ cld
 It will spin up or use existing docker container and drop you into its shell, then launch Claude Code.
 
 ### Continuing session
-`cld  -c` 
+```bash
+cld  -c
+```
 
 
 ## 🏗️ Container Architecture
