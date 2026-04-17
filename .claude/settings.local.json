@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(iconv -f UTF-16LE -t UTF-8 /Users/yaro/Projects/q3ide/setup_workspace.applescript)",
+      "Bash(iconv -f UTF-16LE -t UTF-8)",
+      "Bash(xxd /tmp/setup_workspace_utf8.applescript)",
+      "Bash(LC_ALL=C sed 1s/^xefxbbxbf// /tmp/setup_workspace_utf8.applescript)",
+      "Bash(xxd /tmp/setup_workspace_nobom.applescript)",
+      "Bash(iconv -f UTF-8 -t UTF-16LE /tmp/setup_workspace_nobom.applescript)",
+      "Bash(xxd /Users/yaro/Projects/q3ide/setup_workspace.applescript)",
+      "Bash(osascript /Users/yaro/Projects/q3ide/setup_workspace.applescript)",
+      "Bash(iconv -f UTF-8 -t UTF-16 /tmp/setup_workspace_nobom.applescript)",
+      "Bash(iconv -f UTF-8 -t UTF-16 /tmp/setup_workspace_edit.applescript)",
+      "Bash(bash -x /Users/yaro/Projects/llm_docker/cld --slot 1)",
+      "Bash(xxd /tmp/setup_workspace_edit.applescript)",
+      "Bash(FULL_SESSION_DIR=$HOME/.llm_docker/claude/.claude/projects/-root-Projects-q3ide)",
+      "Read(//Users/yaro/Projects/llm_docker/$FULL_SESSION_DIR/**)",
+      "Bash(find ~/.llm_docker/sessions/Users-yaro-Projects-q3ide/ -name \"slot*\" -delete)",
+      "Bash(find ~/.llm_docker/claude-slot1/ -name *.jsonl)",
+      "Bash(find ~/Projects/q3ide/.claude* -name *.jsonl)",
+      "Bash(ls -la ~/.llm_docker/claude/.claude/slot_*.id)",
+      "Bash(ls ~/.llm_docker/claude/.claude/projects/-root-Projects-q3ide/*.jsonl)",
+      "Bash(docker run:*)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(chmod +x /Users/yaro/Projects/llm_docker/setup.sh)",
+      "Bash(chmod +x /Users/yaro/Projects/llm_docker/install.sh)",
+      "Bash(iconv -f UTF-8 -t UTF-16BE /tmp/setup_workspace_edit.applescript)",
+      "Bash(xxd /Users/yaro/Projects/llm_docker/pro_llm.applescript)",
+      "Bash(osascript /Users/yaro/Projects/llm_docker/pro_llm.applescript /Users/yaro/Projects/llm_docker/cld 1 /Users/yaro/Projects/q3ide new)",
+      "Bash(osascript /Users/yaro/Projects/llm_docker/pro_llm.applescript /Users/yaro/Projects/llm_docker/cld 4 /Users/yaro/Projects/q3ide new)",
+      "Bash(chmod 644 /Users/yaro/Projects/llm_docker/pro_llm.applescript)",
+      "Bash(chmod 444 /Users/yaro/Projects/llm_docker/pro_llm.applescript)",
+      "Read(//Users/yaro/**)",
+      "Bash(bash -x /Users/yaro/Projects/llm_docker/cld 4)",
+      "Bash(defaults read:*)",
+      "Bash(find ~/Library -path *iTerm* -name *session* -o -path *iTerm* -name *state* -o -path *iTerm* -name *arrangement*)",
+      "Bash(ls -la ~/Library/Preferences/com.googlecode.iterm2.plist*)",
+      "Bash(tmutil listlocalsnapshotdates:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker exec:*)"
+    ]
+  }
+}

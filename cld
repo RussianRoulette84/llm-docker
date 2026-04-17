@@ -7,7 +7,7 @@ SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
 # Check if Docker is running
 if ! docker info > /dev/null 2>&1; then
     echo "Docker is not running. Starting Docker Desktop App..."
-    
+
     # Start Docker Desktop on macOS
     if [[ "$OSTYPE" == "darwin"* ]]; then
         open -a Docker
@@ -31,95 +31,268 @@ if ! docker info > /dev/null 2>&1; then
     echo -e "\nDocker is ready!"
 fi
 
+# Auto-setup on first run (dirs, .env, image)
+source "$SCRIPT_DIR/setup.sh"
+run_setup
+
 # Capture current directory before changing to script directory
 CURRENT_DIR=$(pwd)
+WINDOW_COUNT=1
+WINDOW_DELAY=0.5
+CONTINUE_SESSION=false
+RESUME_SESSION=""
+SLOT=""
 
-# Check if first argument is a directory
-if [ -d "$1" ]; then
-    CURRENT_DIR=$(realpath "$1")
-    shift
-fi
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--delay)
+            WINDOW_DELAY="$2"
+            shift 2
+            ;;
+        -s|--slot)
+            SLOT="$2"
+            shift 2
+            ;;
+        -c|--continue)
+            # -c alone = continue. -c UUID = resume specific session. -c NUMBER = continue + window count.
+            if [[ -n "$2" && "$2" != -* && ! "$2" =~ ^[0-9]+$ ]]; then
+                RESUME_SESSION="$2"
+                shift 2
+            else
+                CONTINUE_SESSION=true
+                shift
+            fi
+            ;;
+        -h|--help)
+            echo "Usage: cld [DIRECTORY] [WINDOW_COUNT] [--delay SECONDS] [-c [SESSION_ID]] [-s SLOT]"
+            echo "  DIRECTORY        Project directory (default: current)"
+            echo "  WINDOW_COUNT     Number of terminal windows to open (default: 1)"
+            echo "  --delay          Seconds to wait between opening windows (default: 0.5)"
+            echo "  -c/--continue    Continue most recent session, or resume specific session by ID"
+            echo "  -s/--slot N      Auto-save/restore session for this slot number (used by workspace script)"
+            exit 0
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                WINDOW_COUNT=$1
+                shift
+            elif [ -d "$1" ]; then
+                CURRENT_DIR=$(realpath "$1")
+                shift
+            else
+                break
+            fi
+            ;;
+    esac
+done
 
-cd "$SCRIPT_DIR"
+# Colors
+C1='\033[38;5;209m'  # orange
+C2='\033[38;5;214m'  # light orange
+DIM='\033[2m'
+RST='\033[0m'
+GRN='\033[38;5;82m'
+CYN='\033[38;5;81m'
 
-# Calculate the working directory inside Docker
-# If current dir is under ~/Projects, map it to /root/Projects/<relative_path>
-PROJECTS_DIR="$HOME/Projects"
-if [[ "$CURRENT_DIR" == "$PROJECTS_DIR"* ]]; then
-    # Get relative path from ~/Projects
-    RELATIVE_PATH="${CURRENT_DIR#$PROJECTS_DIR}"
-    RELATIVE_PATH="${RELATIVE_PATH#/}"  # Remove leading slash if present
-    if [ -z "$RELATIVE_PATH" ]; then
-        DOCKER_WORKDIR="/root/Projects"
-    else
-        DOCKER_WORKDIR="/root/Projects/$RELATIVE_PATH"
+_spin() {
+    local msg="$1" frames=("◐" "◑" "◒" "◓") i=0
+    printf "\033[?25l"
+    while kill -0 $$ 2>/dev/null; do
+        printf "\r  ${C1}%s${RST} ${DIM}%s${RST}" "${frames[$((i % 4))]}" "$msg"
+        sleep 0.1; i=$((i+1))
+    done
+}
+
+_status() { printf "  ${C1}%s${RST} %s\n" "$1" "$2"; }
+
+# If --slot is set, try to restore saved session
+CLAUDE_HOME="$HOME/.llm_docker/claude"
+if [ -n "$SLOT" ]; then
+    SLOT_FILE="$CLAUDE_HOME/.claude/slot_${SLOT}.id"
+    if [ -f "$SLOT_FILE" ] && [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" = true ]; then
+        SAVED_ID=$(cat "$SLOT_FILE")
+        PROJECTS_DIR_CHECK="$HOME/Projects"
+        if [[ "$CURRENT_DIR" == "$PROJECTS_DIR_CHECK"* ]]; then
+            REL_CHECK="${CURRENT_DIR#$PROJECTS_DIR_CHECK}"
+            REL_CHECK="${REL_CHECK#/}"
+            DOCKER_PATH_CHECK="root-Projects${REL_CHECK:+"-$REL_CHECK"}"
+        else
+            DOCKER_PATH_CHECK="root-Projects"
+        fi
+        SESSION_DIR="$CLAUDE_HOME/.claude/projects/-$DOCKER_PATH_CHECK"
+        if [ -f "$SESSION_DIR/$SAVED_ID.jsonl" ]; then
+            RESUME_SESSION="$SAVED_ID"
+        fi
     fi
-else
-    # If outside ~/Projects, default to /root/Projects
-    DOCKER_WORKDIR="/root/Projects"
-    echo "Warning: Path $CURRENT_DIR is outside ~/Projects, starting in /root/Projects"
 fi
 
-echo "Starting Claude Code sandbox in $DOCKER_WORKDIR..."
+# Function to run a single Claude container
+run_claude_container() {
+    local WORKDIR="$1"
+    shift
+    cd "$SCRIPT_DIR"
 
-# Forward terminal environment variables for proper mouse reporting and scrolling
-# Get terminal size if available
-if command -v stty > /dev/null 2>&1; then
-    TERM_SIZE=$(stty size 2>/dev/null || echo "24 80")
-    export LINES=$(echo $TERM_SIZE | cut -d' ' -f1)
-    export COLUMNS=$(echo $TERM_SIZE | cut -d' ' -f2)
-fi
+    CONTAINER_NAME="claude-$$"
 
-# Ensure TERM is set (default to xterm-256color for iTerm compatibility)
-export TERM=${TERM:-xterm-256color}
+    # Cleanup on exit: kill watchdog, stop container
+    cleanup_container() {
+        [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
+        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    }
+    trap cleanup_container EXIT INT TERM HUP
 
-# Use docker run directly to have control over volume mounts for Claude
-# Load environment variables from .env file if it exists
-ENV_FILE=""
-SANDBOX_ENABLED="true"
-INTERNET_ACCESS="true"
-NETWORK_MODE="host"
-CAP_DROP="--cap-drop ALL"
-CAP_ADD="--cap-add NET_BIND_SERVICE --cap-add NET_ADMIN"
-SECURITY_OPT="--security-opt no-new-privileges:true"
+    # Build claude flags
+    CLAUDE_FLAGS=()
+    if [ -n "$RESUME_SESSION" ]; then
+        CLAUDE_FLAGS=(--resume "$RESUME_SESSION")
+    elif [ "$CONTINUE_SESSION" = true ]; then
+        CLAUDE_FLAGS=(--continue)
+    fi
 
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    ENV_FILE="--env-file $SCRIPT_DIR/.env"
-    # Load SANDBOX_ENABLED and INTERNET_ACCESS from .env
-    set -a
-    source <(grep -v '^#' "$SCRIPT_DIR/.env" | grep -v '^$' | sed 's/^/export /')
-    set +a
-    SANDBOX_ENABLED=${SANDBOX_ENABLED:-true}
-    INTERNET_ACCESS=${INTERNET_ACCESS:-true}
-fi
+    # Calculate docker working directory
+    PROJECTS_DIR="$HOME/Projects"
+    if [[ "$WORKDIR" == "$PROJECTS_DIR"* ]]; then
+        RELATIVE_PATH="${WORKDIR#$PROJECTS_DIR}"
+        RELATIVE_PATH="${RELATIVE_PATH#/}"
+        if [ -z "$RELATIVE_PATH" ]; then
+            DOCKER_WORKDIR="/root/Projects"
+        else
+            DOCKER_WORKDIR="/root/Projects/$RELATIVE_PATH"
+        fi
+    else
+        DOCKER_WORKDIR="/root/Projects"
+    fi
 
-# Configure security settings based on SANDBOX_ENABLED
-if [ "$SANDBOX_ENABLED" = "false" ]; then
-    CAP_DROP=""
+    # Background watchdog: survives CMD+Q / crashes
+    # - Periodically finds active session via lsof inside the container (process-specific, no race)
+    # - If parent shell dies, kills the container
+    WATCHDOG_PID=""
+    DOCKER_SESSION_DIR="/root/.claude/projects/$(echo "$DOCKER_WORKDIR" | sed 's|/|-|g')"
+    (
+        set +e
+        PARENT_PID=$$
+        sleep 10
+        while kill -0 "$PARENT_PID" 2>/dev/null; do
+            if [ -n "$SLOT" ]; then
+                # Find which .jsonl the claude process has open via /proc (unique to THIS container)
+                SID=$(docker exec "$CONTAINER_NAME" sh -c \
+                    "for f in /proc/*/fd/*; do readlink \"\$f\" 2>/dev/null; done | grep '$DOCKER_SESSION_DIR/.*\.jsonl' | sort -u | tail -1" \
+                    2>/dev/null)
+                if [ -n "$SID" ]; then
+                    basename "$SID" .jsonl > "$CLAUDE_HOME/.claude/slot_${SLOT}.id"
+                fi
+            fi
+            sleep 5
+        done
+        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    ) &
+    WATCHDOG_PID=$!
+    disown "$WATCHDOG_PID"
+
+    # Animated startup
+    printf "\n"
+    printf "  ${C1}  ___| |   __| ${RST}\n"
+    printf "  ${C2} |     |  |    ${RST}\n"
+    printf "  ${C1} |     |  |    ${RST}\n"
+    printf "  ${C2}\\____|_|\\____|${RST}\n"
+    printf "\n"
+    if [ -n "$SLOT" ]; then
+        if [ -n "$RESUME_SESSION" ]; then
+            _status "${GRN}[restore]${RST}" "slot ${CYN}$SLOT${RST}  session ${DIM}${RESUME_SESSION:0:8}...${RST}"
+        else
+            _status "${C2}[new]${RST}" "slot ${CYN}$SLOT${RST}"
+        fi
+    fi
+    _status ">" "$DOCKER_WORKDIR"
+    printf "\n"
+    sleep 0.3
+    # Clear screen right before Claude takes over
+    clear
+
+    # Forward terminal environment variables
+    if command -v stty > /dev/null 2>&1; then
+        TERM_SIZE=$(stty size 2>/dev/null || echo "24 80")
+        export LINES=$(echo $TERM_SIZE | cut -d' ' -f1)
+        export COLUMNS=$(echo $TERM_SIZE | cut -d' ' -f2)
+    fi
+
+    export TERM=${TERM:-xterm-256color}
+
+    # Load environment variables
+    ENV_FILE=""
+    SANDBOX_ENABLED="true"
+    INTERNET_ACCESS="true"
+    NETWORK_MODE="host"
+    CAP_DROP="--cap-drop ALL"
     CAP_ADD="--cap-add NET_BIND_SERVICE --cap-add NET_ADMIN"
-    SECURITY_OPT=""
+    SECURITY_OPT="--security-opt no-new-privileges:true"
+
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        ENV_FILE="--env-file $SCRIPT_DIR/.env"
+        set -a
+        source <(grep -v '^#' "$SCRIPT_DIR/.env" | grep -v '^$' | sed 's/^/export /')
+        set +a
+        SANDBOX_ENABLED=${SANDBOX_ENABLED:-true}
+        INTERNET_ACCESS=${INTERNET_ACCESS:-true}
+    fi
+
+    if [ "$SANDBOX_ENABLED" = "false" ]; then
+        CAP_DROP=""
+        CAP_ADD="--cap-add NET_BIND_SERVICE --cap-add NET_ADMIN"
+        SECURITY_OPT=""
+    fi
+
+    if [ "$INTERNET_ACCESS" = "false" ]; then
+        NETWORK_MODE="bridge"
+    else
+        NETWORK_MODE="host"
+    fi
+
+    PORT_MAPPING=""
+
+    # SLOT env var tells the entrypoint to save session ID on exit
+    # SLOT_RESUME_ID tells it which session was resumed (so it can identify THIS container's session)
+    SLOT_ENV=""
+    if [ -n "$SLOT" ]; then
+        SLOT_ENV="-e SLOT=$SLOT"
+        if [ -n "$RESUME_SESSION" ]; then
+            SLOT_ENV="$SLOT_ENV -e SLOT_RESUME_ID=$RESUME_SESSION"
+        fi
+    fi
+
+    docker run --rm -it \
+        --label com.docker.compose.project=llm-docker \
+        --name "$CONTAINER_NAME" \
+        -w "$DOCKER_WORKDIR" \
+        -v ~/Projects:/root/Projects \
+        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        -v ~/.llm_docker/claude:/root \
+        -v "$SCRIPT_DIR/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
+        --network "$NETWORK_MODE" \
+        $PORT_MAPPING \
+        $CAP_DROP \
+        $CAP_ADD \
+        $SECURITY_OPT \
+        -e SANDBOX_MODE="$SANDBOX_ENABLED" \
+        -e TERM \
+        -e COLUMNS \
+        -e LINES \
+        -e TOOL=claude \
+        -e ANTHROPIC_API_KEY \
+        $SLOT_ENV \
+        $ENV_FILE \
+        llm-docker:latest "${CLAUDE_FLAGS[@]}" "$@"
+}
+
+# If WINDOW_COUNT > 1 and we're on macOS, use pro_llm multi-window layout
+if [ "$WINDOW_COUNT" -gt 1 ] && [[ "$OSTYPE" == "darwin"* ]]; then
+    SLOT_MODE="new"
+    [ "$CONTINUE_SESSION" = true ] && SLOT_MODE="restore"
+    echo "Opening $WINDOW_COUNT terminal windows ($SLOT_MODE mode)..."
+    osascript "$SCRIPT_DIR/pro_llm.applescript" "$SCRIPT_DIR/cld" "$WINDOW_COUNT" "$CURRENT_DIR" "$SLOT_MODE"
+    exit 0
 fi
 
-# Configure network mode based on INTERNET_ACCESS
-if [ "$INTERNET_ACCESS" = "false" ]; then
-    NETWORK_MODE="bridge"
-fi
-
-docker run --rm -it \
-    -w "$DOCKER_WORKDIR" \
-    -v ~/Projects:/root/Projects \
-    -v /var/run/docker.sock:/var/run/docker.sock:ro \
-    -v ~/.llm_docker/claude:/root \
-    -v "$SCRIPT_DIR/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
-    --network "$NETWORK_MODE" \
-    $CAP_DROP \
-    $CAP_ADD \
-    $SECURITY_OPT \
-    -e SANDBOX_MODE="$SANDBOX_ENABLED" \
-    -e TERM \
-    -e COLUMNS \
-    -e LINES \
-    -e TOOL=claude \
-    -e ANTHROPIC_API_KEY \
-    $ENV_FILE \
-    llm-docker:latest "$@"
+# Single window - run directly
+run_claude_container "$CURRENT_DIR"

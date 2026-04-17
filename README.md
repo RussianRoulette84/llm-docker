@@ -1,105 +1,96 @@
 # 🐳 llm-docker
 
-![Version](https://img.shields.io/badge/Version-v1.2-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-v2.0-blue?style=for-the-badge)
 ![OpenCode](https://img.shields.io/badge/OpenCode-Supported-00A86B?style=for-the-badge&logo=openai&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Supported-D1913C?style=for-the-badge&logo=anthropic&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Isolated-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![Security](https://img.shields.io/badge/Security-Sandboxed-8A2BE2?style=for-the-badge&logo=lock&logoColor=white)
 ![Shell](https://img.shields.io/badge/Shell-Automated-4EAA25?style=for-the-badge&logo=gnu-bash&logoColor=white)
-
 ![Logo](logo.png)
 
 ---
 
 ## 📘 About
 
-**llm-docker** provides a secure, sandboxed environment for running **OpenCode** and **Claude Code** with complete data isolation and privacy.
+**llm-docker** provides a secure, sandboxed environment for running **OpenCode** and **Claude Code** with complete data isolation and privacy. Run multiple LLM sessions with automatic session restoration — even if you wipe your Docker.
 
-It maps your `~/Projects` folder into Docker. It also stores **OpenCode** and **Claude Code** data outside of Docker for persistent sessions, config, and API keys across container restarts.
+It bind-mounts your `~/Projects` folder into Docker and stores all tool data (sessions, config, API keys) outside the container at `~/.llm_docker/` for persistence across restarts.
+
+Sleep well knowing your LLM runs in a container you built and control:
+1. A prompt injection can only reach files in `~/Projects` — not your system. From there on it's your responsibility to store API keys in a keychain or key manager (example: Infisical), and definaltelly NOT in  `.env` or `.profile` or even worse: a global VAR)
+2. A hallucinating LLM can't `rm -rf /` your machine — worst case it nukes the container
 
 ![Screenshot](screenshot.png)
 
 ---
 
-## 🚀 Quick Start
+## ✨ Core Features
+* ✅ **One command setup** - `./install.sh` handles everything: Docker image, `.env`, PATH linking
+* ✅ **Complete isolation** - Separate from native macOS installations (privacy-focused)
+* ✅ **Data persistence** - Sessions, API keys, and config saved to `~/.llm_docker/` — survives container rebuilds
+* ✅ **Dual tool support** - Run both OpenCode and Claude Code from the same Docker image
+* ✅ **Auto-start Docker** - Automatically starts Docker Desktop on macOS, then launches your tool and restores session
+* ✅ **Smart directory detection** - `cld ./my-project` starts a sandboxed session in any directory under `~/Projects`
+* ✅ **Slot-based multi-session** - Run 4 Claude instances side by side, each with its own persistent session (`cld --slot N`)
 
-Run these commands instead of the native tools:
+### 🔒 Security Features
 
-*   **OpenCode**: `ocd`
-*   **Claude Code**: `cld`
+* ✅ **Restricted file access** - Only `~/Projects` is accessible inside the container
+* ✅ **Dropped capabilities** - Minimal(ish) container privileges
+* ✅ **No new privileges** - Security hardening enabled. If you need a new tool installed then edit Dockerfile.
+* ✅ **Isolated data** - Tool data completely separate from host
+* ✅ **Graceful cleanup** - Background watchdog kills containers on terminal close, CMD+Q, or crash
 
-Simple as that. The environment handles the rest.
+### ⚙️ Configuration Features
 
-You can use `ocd ./my-path` too with params `ocd ./my-path -c`
+* ✅ **Environment variables** - API keys from `.env` file (OPENAI_API_KEY, ZAI_API_KEY, ANTHROPIC_API_KEY)
+* ✅ **Config file support** - JSONC format with comments for OpenCode
+* ✅ **Model customization** - Configure agents and models per your needs
+* ✅ **Custom hostname** - Easy identification (`llm-docker`)
 
 ---
 
-## 🛠️ Setup Procedure
+## 🚀 Quick Start
 
-### 1. Create `.env` File
-
-Create a `.env` file with your API keys:
+> **One command. That's it.**
 
 ```bash
-cp .env.sample .env
-nano .env
+bash <(curl -fsSL https://raw.githubusercontent.com/RussianRoulette84/llm_docker/master/install.sh)
 ```
 
-### 2. Configure OpenCode Settings
+> Installs everything: Docker image, `.env`, PATH — then you're ready to go.
 
-Edit `opencode.config.jsonc` to customize your OpenCode model preferences. 
+That's it. The installer handles everything:
+- Creates data directories
+- Sets up `.env` from template (add your API keys)
+- Builds the Docker image
+- Links `cld` and `ocd` to `/usr/local/bin`
 
-```jsonc
-{
-  "model": "openai/gpt-5",
-  "small_model": "zai/glm-4.7-flash",
-  "agent": {
-    "build": {
-      "model": "openai/gpt-5"
-    },
-    // ... more agent configurations. I left a 6 agent madness for you ;)
-  }
-}
-```
+Then just run:
 
-### 3. Verify Docker Setup
+*   **Claude Code**: `cld`
+*   **OpenCode**: `ocd`
 
-Ensure Docker is installed and accessible:
+### Options
 
 ```bash
-docker --version
-docker compose version
+cld                    # New session
+cld -c                 # Continue last session
+cld -c <session-id>    # Resume specific session
+cld ./my-project       # Start in a specific directory
+cld 4                  # 4 terminals in grid layout (macOS, new sessions)
+cld -c 4               # 4 terminals with session restore
+cld 8 -c               # 8 terminals across monitors with restore
+ocd 4                  # 4 OpenCode terminals
+ocd ./my-project -c    # OpenCode with params
 ```
 
-### 4. 🚀 Installation and command setup
+### Multi-Window Layout (macOS only)
 
-```bash
-docker compose build
-sudo ln -sf $(pwd)/ocd /usr/local/bin/ocd
-sudo ln -sf $(pwd)/cld /usr/local/bin/cld
-```
-
-## ⚡ Running
-
-### OpenCode
-
-```bash
-ocd
-```
-It will spin up or use existing docker container and drop you into its shell, then launch OpenCode.
-
-### Claude Code
-
-```bash
-cld
-```
-It will spin up or use existing docker container and drop you into its shell, then launch Claude Code.
-
-### Continuing session
-```bash
-cld  -c
-```
-
+When launching with a window count (`cld 4`, `cld 8`), terminals are automatically arranged:
+- **1 monitor**: all windows in a 2-column grid
+- **2 monitors**: windows on the right monitor
+- **3+ monitors**: windows on all monitors except the middle one (your coding screen)
 
 ## 🏗️ Container Architecture
 
@@ -117,35 +108,10 @@ The llm-docker container includes:
   - `~/.llm_docker/claude` → `/root_claude` (persistent Claude Code data, automatically symlinked to `/root` when using docker-compose)
   - `opencode.config.jsonc` → `/tmp/opencode.config.jsonc` (config file, OpenCode only)
 
-## 🔍 Features
-
-### ✨ Core Features
-
-* ✅ **Auto-start OpenCode/Claude Code** - Launches automatically when container starts
-* ✅ **Smart directory detection** - Starts in your current directory
-* ✅ **Interactive shell access** - Drop to shell after tool exits
-* ✅ **Data persistence** - All sessions, API keys, and config saved to `~/.llm_docker/opencode` (OpenCode) or `~/.llm_docker/claude` (Claude Code)
-* ✅ **Complete isolation** - Separate from native macOS installations (privacy-focused)
-* ✅ **Auto-start Docker** - Automatically starts Docker Desktop on macOS
-* ✅ **Dual tool support** - Run both OpenCode and Claude Code from the same Docker image
-
-### 🔒 Security Features
-
-* ✅ **Restricted file access** - Only `~/Projects` is accessible
-* ✅ **Dropped capabilities** - Minimal container privileges
-* ✅ **No new privileges** - Security hardening enabled
-* ✅ **Isolated data** - Tool data completely separate from host
-
-### ⚙️ Configuration Features
-
-* ✅ **Environment variables** - API keys from `.env` file (OPENAI_API_KEY, ZAI_API_KEY, ANTHROPIC_API_KEY)
-* ✅ **Config file support** - JSONC format with comments for OpenCode
-* ✅ **Model customization** - Configure agents and models per your needs
-* ✅ **Custom hostname** - Easy identification (`llm-docker`)
-
 
 ## 🚧 Roadmap
 
+* **Custom API deamon**: LLM calls this API for building & running code locally :) DOCKER => API helper on host server => lint/test/build/debug(websocket)/run[agent.queueID]/interact/read_logs => DOCKER
 * **ocd/cld --params**: Allow to pass through params from ocd/cld to docker's opencode/claude
 * **Server Mode**: Run OpenCode/Claude Code as a server for IDE integration (port 49455)
 * **SSH/GIT**: Securely forward your SSH/Git credentials to the container

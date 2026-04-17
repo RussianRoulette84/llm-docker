@@ -31,67 +31,112 @@ if ! docker info > /dev/null 2>&1; then
     echo -e "\nDocker is ready!"
 fi
 
+# Auto-setup on first run (SSH keys, dirs, .env, image)
+source "$SCRIPT_DIR/setup.sh"
+run_setup
+
 # Capture current directory before changing to script directory
 CURRENT_DIR=$(pwd)
+WINDOW_COUNT=1
+WINDOW_DELAY=0.5
+CONTINUE_SESSION=false
 
-# Check if first argument is a directory
-if [ -d "$1" ]; then
-    CURRENT_DIR=$(realpath "$1")
-    shift
-fi
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--delay)
+            WINDOW_DELAY="$2"
+            shift 2
+            ;;
+        -c|--continue)
+            CONTINUE_SESSION=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: ocd [DIRECTORY] [WINDOW_COUNT] [--delay SECONDS] [-c]"
+            echo "  DIRECTORY    Project directory (default: current)"
+            echo "  WINDOW_COUNT Number of terminal windows to open (default: 1)"
+            echo "  --delay      Seconds to wait between opening windows (default: 0.5)"
+            echo "  -c/--continue Continue last session"
+            exit 0
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                WINDOW_COUNT=$1
+                shift
+            elif [ -d "$1" ]; then
+                CURRENT_DIR=$(realpath "$1")
+                shift
+            else
+                break
+            fi
+            ;;
+    esac
+done
 
-cd "$SCRIPT_DIR"
-
-# Calculate the working directory inside Docker
-# If current dir is under ~/Projects, map it to /root/Projects/<relative_path>
-PROJECTS_DIR="$HOME/Projects"
-if [[ "$CURRENT_DIR" == "$PROJECTS_DIR"* ]]; then
-    # Get relative path from ~/Projects
-    RELATIVE_PATH="${CURRENT_DIR#$PROJECTS_DIR}"
-    RELATIVE_PATH="${RELATIVE_PATH#/}"  # Remove leading slash if present
-    if [ -z "$RELATIVE_PATH" ]; then
-        DOCKER_WORKDIR="/root/Projects"
+# Function to run a single OpenCode container
+run_opencode_container() {
+    local WORKDIR="$1"
+    cd "$SCRIPT_DIR"
+    
+    # Calculate the working directory inside Docker
+    PROJECTS_DIR="$HOME/Projects"
+    if [[ "$WORKDIR" == "$PROJECTS_DIR"* ]]; then
+        RELATIVE_PATH="${WORKDIR#$PROJECTS_DIR}"
+        RELATIVE_PATH="${RELATIVE_PATH#/}"
+        if [ -z "$RELATIVE_PATH" ]; then
+            DOCKER_WORKDIR="/root/Projects"
+        else
+            DOCKER_WORKDIR="/root/Projects/$RELATIVE_PATH"
+        fi
     else
-        DOCKER_WORKDIR="/root/Projects/$RELATIVE_PATH"
+        DOCKER_WORKDIR="/root/Projects"
+        echo "Warning: Path $WORKDIR is outside ~/Projects, starting in /root/Projects"
     fi
-else
-    # If outside ~/Projects, default to /root/Projects
-    DOCKER_WORKDIR="/root/Projects"
-    echo "Warning: Path $CURRENT_DIR is outside ~/Projects, starting in /root/Projects"
+
+    echo "Starting OpenCode sandbox in $DOCKER_WORKDIR..."
+
+    # Forward terminal environment variables for proper mouse reporting and scrolling
+    if command -v stty > /dev/null 2>&1; then
+        TERM_SIZE=$(stty size 2>/dev/null || echo "24 80")
+        export LINES=$(echo $TERM_SIZE | cut -d' ' -f1)
+        export COLUMNS=$(echo $TERM_SIZE | cut -d' ' -f2)
+    fi
+
+    export TERM=${TERM:-xterm-256color}
+
+    # Load .env to get INTERNET_ACCESS and SANDBOX_ENABLED
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        set -a
+        source <(grep -v '^#' "$SCRIPT_DIR/.env" | grep -v '^$' | sed 's/^/export /')
+        set +a
+    fi
+
+    # Set NETWORK_MODE based on INTERNET_ACCESS
+    if [ "${INTERNET_ACCESS:-true}" = "false" ]; then
+        export NETWORK_MODE=bridge
+    else
+        export NETWORK_MODE=host
+    fi
+
+    docker compose run --rm --service-ports -w "$DOCKER_WORKDIR" \
+        -e TERM \
+        -e COLUMNS \
+        -e LINES \
+        -e TOOL=opencode \
+        -e SSH_ENABLED=true \
+        llm_docker "$@"
+}
+
+# If WINDOW_COUNT > 1 and we're on macOS with iTerm2, open multiple windows
+# If WINDOW_COUNT > 1 and we're on macOS, use pro_llm multi-window layout
+if [ "$WINDOW_COUNT" -gt 1 ] && [[ "$OSTYPE" == "darwin"* ]]; then
+    SLOT_MODE="new"
+    [ "$CONTINUE_SESSION" = true ] && SLOT_MODE="restore"
+    echo "Opening $WINDOW_COUNT terminal windows ($SLOT_MODE mode)..."
+    osascript "$SCRIPT_DIR/pro_llm.applescript" "$SCRIPT_DIR/ocd" "$WINDOW_COUNT" "$CURRENT_DIR" "$SLOT_MODE"
+    exit 0
 fi
 
-echo "Starting OpenCode sandbox in $DOCKER_WORKDIR..."
-
-# Forward terminal environment variables for proper mouse reporting and scrolling
-# Get terminal size if available
-if command -v stty > /dev/null 2>&1; then
-    TERM_SIZE=$(stty size 2>/dev/null || echo "24 80")
-    export LINES=$(echo $TERM_SIZE | cut -d' ' -f1)
-    export COLUMNS=$(echo $TERM_SIZE | cut -d' ' -f2)
-fi
-
-# Ensure TERM is set (default to xterm-256color for iTerm compatibility)
-export TERM=${TERM:-xterm-256color}
-
-# Load .env to get INTERNET_ACCESS and SANDBOX_ENABLED
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    set -a
-    source <(grep -v '^#' "$SCRIPT_DIR/.env" | grep -v '^$' | sed 's/^/export /')
-    set +a
-fi
-
-# Set NETWORK_MODE based on INTERNET_ACCESS
-# If INTERNET_ACCESS=true → host mode (full network access)
-# If INTERNET_ACCESS=false → bridge mode (for internet blocking via iptables)
-if [ "${INTERNET_ACCESS:-true}" = "false" ]; then
-    export NETWORK_MODE=bridge
-else
-    export NETWORK_MODE=host
-fi
-
-docker compose run --rm -w "$DOCKER_WORKDIR" \
-    -e TERM \
-    -e COLUMNS \
-    -e LINES \
-    -e TOOL=opencode \
-    llm_docker "$@"
+# Single window - run directly
+run_opencode_container "$CURRENT_DIR" "$@"
