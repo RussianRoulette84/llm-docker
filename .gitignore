@@ -1,13 +1,24 @@
+# Secrets & env (any depth — .env lives in src/, templates stay tracked)
 .env
+.env.local
+
+# Build / test artifacts
 *.log
-.DS_Store
+logs/
+dist/
+build/
 node_modules/
 __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
-dist/
-build/
 
+# OS metadata
+.DS_Store
+
+# Private agent notes / scratch
 .agents/
 AGENTS.md
+
+# Quake reference implementation — never committed, wherever it ends up in the tree.
+quake_api/

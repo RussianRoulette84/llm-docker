@@ -1,0 +1,73 @@
+# Example builder-api config. Copy to your project root and edit.
+# Any path you reference here must sit under this project's root, or the
+# server will refuse to start.
+
+name = "my-project"
+
+# 127.0.0.1 only reaches the container via host.docker.internal on macOS.
+# Set to 0.0.0.0 if you actually need LAN access — server will require a
+# non-empty password in that case.
+bind = "127.0.0.1"
+port = 6666
+
+# API password. Use env interpolation so the secret never lives in git.
+# Any non-empty value gates POST/DELETE endpoints.
+password = "${BUILDER_API_PASSWORD}"
+
+# When true, GETs (logs, events, queue) also require the password.
+# Auto-defaults to true on non-loopback binds; leaving it unset is fine.
+# auth_reads = true
+
+# ─── Build ───────────────────────────────────────────────────────────────
+# Exactly one predefined command. API invokes it via execvp (no shell), with
+# an optional subset of allowed_args appended. Anything not on the whitelist
+# is rejected with HTTP 400.
+#
+# Need `make clean && make`? Wrap it in a script:
+#   ./build.sh --clean   → runs `make clean && make`
+[build]
+command      = "./build.sh"
+allowed_args = ["--clean", "--fast", "--clear"]
+timeout_s    = 900
+
+# ─── Log aliases ─────────────────────────────────────────────────────────
+# Each alias maps to a file path relative to project root. `/logs?file=<alias>`
+# is the only way to read log files; the client cannot reach arbitrary paths.
+[logs]
+build = "logs/build.log"
+test  = "logs/test.log"
+app   = "logs/app.log"
+
+# ─── Runtime (optional) ──────────────────────────────────────────────────
+# The process `/run` launches and `/stop` kills. `/run` always restarts
+# (existing process is killed with stop_signal, then freshly launched).
+[runtime]
+enabled        = false
+start_command  = "./my-app --server"
+cwd            = "."
+env            = { PORT = "8080" }
+stop_signal    = "SIGTERM"
+stop_timeout_s = 5
+
+# ─── Events jsonl (optional) ─────────────────────────────────────────────
+# Server appends lifecycle events (build_started, runtime_exited, ...) here.
+# Your build/run processes can append their own JSON lines too. Rotation is
+# transparent: when the file exceeds max_bytes, the oldest ~drop_bytes are
+# discarded so the newest stay readable.
+[events]
+path       = "logs/events.jsonl"
+max_bytes  = 209715200    # 200 MB
+drop_bytes = 10485760     # ~10 MB
+
+# ─── Security tuning (optional) ──────────────────────────────────────────
+[security]
+auth_failures_per_min = 10
+lockout_s             = 300
+max_body_bytes        = 1048576   # 1 MB
+max_url_bytes         = 8192      # 8 KB
+
+# ─── Plugin (optional) ───────────────────────────────────────────────────
+# Uncomment to load a Python plugin that can register custom HTTP endpoints
+# and lifecycle hooks. The plugin runs unrestricted in the server's process
+# — only enable this for code you wrote or fully trust.
+# plugin = "builder_plugin.py"

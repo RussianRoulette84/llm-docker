@@ -1,0 +1,772 @@
+#!/bin/bash
+
+set -e
+
+# --- Yaro-only hack: inject KeePassXC secrets via env-gorilla before launch.
+# Re-execs self through `env-gorilla llm-docker --` so API keys live in the
+# keystore, not in .env. Guard var prevents an infinite re-exec loop.
+if [ "${USER:-}" = "yaro" ] \
+   && [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
+   && command -v env-gorilla >/dev/null 2>&1; then
+    export LLM_DOCKER_ENV_GORILLA=1
+    exec env-gorilla llm-docker -- "$0" "$@"
+fi
+
+SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
+
+source "$SCRIPT_DIR/setup.sh"
+
+# Check if Docker is running
+if ! docker info > /dev/null 2>&1; then
+    _log CLD WARNING "Docker is not running — starting Docker Desktop..."
+
+    # Start Docker Desktop on macOS
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        open -a Docker
+    else
+        _log CLD ERROR "Please start Docker manually on your system"
+        exit 1
+    fi
+
+    _log CLD "Waiting for Docker to start (this may take a minute)..."
+    max_wait=60
+    waited=0
+    until docker info > /dev/null 2>&1; do
+        if [ $waited -ge $max_wait ]; then
+            _log CLD ERROR "Docker did not start within $max_wait seconds"
+            exit 1
+        fi
+        echo -n "."
+        sleep 2
+        waited=$((waited + 2))
+    done
+    _log CLD "Docker is ready!"
+fi
+
+# Quick pre-scan: --build forces an image rebuild. run_setup only builds when
+# the image is missing, so we wipe both candidate tags first and let it rebuild.
+_user_requested_build=false
+for _arg in "$@"; do
+    if [ "$_arg" = "--build" ]; then
+        _user_requested_build=true
+        _log CLD "Rebuilding image (--build) — removing llm-docker-claude:latest + llm-docker:latest..."
+        docker rmi llm-docker-claude:latest llm-docker:latest 2>/dev/null || true
+        break
+    fi
+done
+unset _arg
+
+# Pre-scan: if the user passed -t/-tt/-tr/-tc/-tcl but the matching
+# INSTALL_TMUX_* is still false in llm-docker.conf, the tool won't be in the
+# image. When --build was passed, silently flip the flags and let the rebuild
+# pick them up. Otherwise prompt before rebuilding.
+_tmux_flip_kvs=""
+_tmux_flip_labels=""
+_register_tmux_flip() {
+    local flag="$1" label="$2"
+    local cur
+    cur="$(_read_env_var "$flag" "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
+    [ "$cur" = "true" ] && return 0
+    case " $_tmux_flip_kvs " in *" ${flag}=true "*) return 0 ;; esac
+    _tmux_flip_kvs+="${flag}=true "
+    [ -n "$_tmux_flip_labels" ] && _tmux_flip_labels+=", "
+    _tmux_flip_labels+="$label"
+}
+for _arg in "$@"; do
+    case "$_arg" in
+        -t|--tmux)          _register_tmux_flip INSTALL_TMUX_VANILLA "-t (vanilla tmux)" ;;
+        -tt|--tmux-team)    _register_tmux_flip INSTALL_TMUX_TEAM    "-tt (tmux team layout)" ;;
+        -tr|--tmux-recon)   _register_tmux_flip INSTALL_TMUX_RECON   "-tr (gavraz/recon)" ;;
+        -tc|--tmux-codeman) _register_tmux_flip INSTALL_TMUX_CODEMAN "-tc (Ark0N/Codeman)" ;;
+        -tcl|--tmux-claude) _register_tmux_flip INSTALL_TMUX_CLAUDE  "-tcl (nielsgroen/claude-tmux)" ;;
+        --) break ;;
+    esac
+done
+unset _arg
+
+if [ -n "$_tmux_flip_kvs" ]; then
+    if [ "$_user_requested_build" = true ]; then
+        _log CLD "Enabling for --build: ${_tmux_flip_labels}"
+    else
+        _log CLD "Tmux flag(s) requested but not baked into the image: ${_tmux_flip_labels}"
+        if [ -t 0 ]; then
+            printf "  [cld] Enable and rebuild image now? [Y/n] "
+            read -r _ans
+        else
+            _ans="y"
+        fi
+        case "${_ans:-y}" in
+            n|N|no|No|NO)
+                _log CLD ERROR "Aborted. Re-run with the flag after enabling INSTALL_TMUX_* in llm-docker.conf."
+                exit 1
+                ;;
+        esac
+    fi
+    for _kv in $_tmux_flip_kvs; do
+        _k="${_kv%%=*}"; _v="${_kv#*=}"
+        if grep -q "^${_k}=" "$SCRIPT_DIR/llm-docker.conf"; then
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                sed -i '' "s|^${_k}=.*|${_k}=${_v}|" "$SCRIPT_DIR/llm-docker.conf"
+            else
+                sed -i "s|^${_k}=.*|${_k}=${_v}|" "$SCRIPT_DIR/llm-docker.conf"
+            fi
+        else
+            printf "\n%s=%s\n" "$_k" "$_v" >> "$SCRIPT_DIR/llm-docker.conf"
+        fi
+    done
+    if [ "$_user_requested_build" != true ]; then
+        _log CLD "llm-docker.conf updated — rebuilding image..."
+        docker rmi llm-docker-claude:latest llm-docker:latest 2>/dev/null || true
+    fi
+    unset _ans _kv _k _v
+fi
+unset _tmux_flip_kvs _tmux_flip_labels _user_requested_build
+
+# Auto-setup on first run (dirs, .env, image).
+# Build the claude-only image (llm-docker-claude:latest). If install.sh has
+# already produced the combined llm-docker:latest, that's reused — otherwise
+# we skip the opencode install entirely.
+run_setup claude
+
+# DOCKER_DIR = container-side parent for every mount (default /root).
+# WORKSPACE_DIR = optional host dir persistently mirrored at DOCKER_DIR/basename.
+WORKSPACE_DIR=""
+DOCKER_DIR=""
+if [ -f "$SCRIPT_DIR/llm-docker.conf" ]; then
+    WS_ENV="$(_read_env_var WORKSPACE_DIR "$SCRIPT_DIR/llm-docker.conf")"
+    [ -n "$WS_ENV" ] && WORKSPACE_DIR="${WS_ENV/#\~/$HOME}"
+    DD_ENV="$(_read_env_var DOCKER_DIR "$SCRIPT_DIR/llm-docker.conf")"
+    [ -n "$DD_ENV" ] && DOCKER_DIR="$DD_ENV"
+fi
+: "${DOCKER_DIR:=/root}"
+
+WORKSPACE_MOUNT_ACTIVE=false
+DOCKER_WORKSPACE_TARGET=""
+if [ -n "$WORKSPACE_DIR" ]; then
+    DOCKER_WORKSPACE_TARGET="$DOCKER_DIR/$(basename "$WORKSPACE_DIR")"
+    if ! _validate_workspace_paths "$WORKSPACE_DIR" "$DOCKER_WORKSPACE_TARGET"; then
+        _log CLD ERROR "Invalid WORKSPACE_DIR — edit $SCRIPT_DIR/llm-docker.conf"
+        exit 1
+    fi
+    WORKSPACE_MOUNT_ACTIVE=true
+fi
+export WORKSPACE_DIR DOCKER_DIR WORKSPACE_MOUNT_ACTIVE DOCKER_WORKSPACE_TARGET
+
+# Capture current directory before changing to script directory
+CURRENT_DIR=$(pwd)
+WINDOW_COUNT=1
+WINDOW_DELAY=0.5
+CONTINUE_SESSION=false
+RESUME_SESSION=""
+SLOT=""
+START_API=false   # --api / -a toggle; see _maybe_start_api below
+CLEAN_CONTAINERS=false   # --clean: stop/remove leftover llm-docker containers
+USE_TMUX=false    # -t / --tmux: wrap claude launch inside a tmux session
+TMUX_TEAM=false   # -tt / --tmux-team: multi-pane tmux layout inside one container
+TMUX_TEAM_SIZE=0  # 0=default (1+3), 2=side-by-side, 3=1+2 stacked, 4=2x2 grid
+TMUX_RECON=false  # -tr / --tmux-recon: launch gavraz/recon dashboard (cld only)
+TMUX_CODEMAN=false # -tc / --tmux-codeman: launch Ark0N/Codeman web UI (port 3000)
+TMUX_CLAUDE=false  # -tcl / --tmux-claude: launch nielsgroen/claude-tmux popup (cld only)
+DANGER_MODE=false  # --danger / --dg: --dangerously-skip-permissions + bypassPermissions
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--delay)
+            WINDOW_DELAY="$2"
+            shift 2
+            ;;
+        --slot)
+            SLOT="$2"
+            shift 2
+            ;;
+        --)
+            # Stop parsing; everything after `--` passes through to claude.
+            shift
+            break
+            ;;
+        -c|--continue)
+            # -c alone = continue. -c UUID = resume specific session. -c NUMBER = continue + window count.
+            if [[ -n "$2" && "$2" != -* && ! "$2" =~ ^[0-9]+$ ]]; then
+                RESUME_SESSION="$2"
+                shift 2
+            else
+                CONTINUE_SESSION=true
+                shift
+            fi
+            ;;
+        --clean)
+            CLEAN_CONTAINERS=true
+            shift
+            ;;
+        --build)
+            # Already handled by the pre-scan above (wipes image pre-run_setup).
+            shift
+            ;;
+        -tt|--tmux-team)
+            TMUX_TEAM=true
+            if [[ -n "$2" && "$2" =~ ^[234]$ ]]; then
+                TMUX_TEAM_SIZE="$2"
+                shift 2
+            elif [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                echo "cld: -tt supports sizes 2, 3, or 4 (got '$2'). Omit the number for the default 1+3 layout." >&2
+                exit 1
+            else
+                shift
+            fi
+            ;;
+        -tr|--tmux-recon)
+            TMUX_RECON=true
+            shift
+            ;;
+        -tc|--tmux-codeman)
+            TMUX_CODEMAN=true
+            shift
+            ;;
+        -tcl|--tmux-claude)
+            TMUX_CLAUDE=true
+            shift
+            ;;
+        -t|--tmux)
+            USE_TMUX=true
+            shift
+            ;;
+        --dg|--danger)
+            DANGER_MODE=true
+            shift
+            ;;
+        -a|--api)
+            # -a alone = true. -a true/false = explicit. Anything else after
+            # the flag is treated as the next arg (bare -a means "on").
+            if [[ -n "$2" && "$2" =~ ^(true|false|yes|no|on|off|1|0)$ ]]; then
+                case "$2" in
+                    true|yes|on|1) START_API=true ;;
+                    *)             START_API=false ;;
+                esac
+                shift 2
+            else
+                START_API=true
+                shift
+            fi
+            ;;
+        -h|--help)
+            cat <<'HELP'
+cld — Claude Code wrapper (Dockerized, sandboxed, slot-aware)
+
+USAGE
+  cld [DIRECTORY] [WINDOW_COUNT] [FLAGS...] [-- CLAUDE_ARGS...]
+
+POSITIONAL
+  DIRECTORY             Project directory (default: current).
+  WINDOW_COUNT          Number of macOS terminal windows to open in the grid
+                        layout (default: 1). Combined with -c, each window
+                        restores its own slot (auto --slot 1..N).
+
+SESSION / SLOT
+  -c, --continue        Continue the most recent session in this directory.
+  -c <SESSION_ID>       Resume a specific Claude session by UUID.
+  --slot <N>            Auto-save/restore a tagged session for slot N.
+                        `-c --slot N` resumes slot N's last session.
+  -d, --delay <sec>     Seconds between opening windows (default: 0.5).
+
+TMUX MODES  (mutually exclusive — pick at most one)
+  -t,  --tmux           Wrap claude in a tmux session inside the container.
+                        Detach with Ctrl+b d. If host is already in tmux,
+                        you'll be prompted how to handle nesting.
+
+  -tt, --tmux-team [N]  Multi-pane claude, ONE container, shared FS/sessions.
+                        Lead pane runs your default model; LAST pane auto-runs
+                        `claude --model haiku` (cheap/fast runner) with an
+                        orange powerline border. Pink border = active pane.
+                          (no N)  1 main + 3 stacked   (4 panes)
+                          N=2     side-by-side         (2 panes)
+                          N=3     1 main + 2 stacked   (3 panes)
+                          N=4     2x2 grid             (4 panes)
+
+  -tr, --tmux-recon     Launch gavraz/recon — tmux-native multi-session
+                        dashboard for Claude Code. Baked into every image.
+                        https://github.com/gavraz/recon
+
+  -tc, --tmux-codeman   Launch Ark0N/Codeman — web UI for session management
+                        on http://localhost:3000 (port 3000 auto-published on
+                        the container). Baked into every image.
+                        https://github.com/Ark0N/Codeman
+
+  -tcl, --tmux-claude   Launch nielsgroen/claude-tmux — tmux popup session
+                        manager for Claude Code. Starts claude in a tmux
+                        session and binds Ctrl+b Ctrl+c to the popup.
+                        Baked into every image.
+                        https://github.com/nielsgroen/claude-tmux
+
+BUILDER API
+  -a, --api [bool]      Spawn the host-side builder-api daemon in a new
+                        terminal. `-a` alone = on. `-a false` = off.
+                        Default: off. Requires BUILDER_API_PASSWORD in .env.
+
+YOLO MODE
+  --danger, --dg        Launch claude with --dangerously-skip-permissions AND
+                        write settings.local.json with defaultMode=bypassPermissions.
+                        No allow/deny gates. Use at your own risk.
+
+CONTAINER LIFECYCLE
+  --clean               Stop + remove any leftover llm-docker containers
+                        before launching (filters on label
+                        com.docker.compose.project=llm-docker).
+  --build               Force an image rebuild. Removes llm-docker-claude:latest
+                        and llm-docker:latest, then run_setup rebuilds from
+                        Dockerfile. Use after editing Dockerfile / devpack /
+                        INSTALL_* flags in llm-docker.conf.
+
+PASSTHROUGH
+  --                    Everything after `--` is forwarded to claude verbatim.
+                        Examples:
+                          cld -c -- --permission-mode plan
+                          cld -- --model opus
+                          cld -- --resume <uuid>
+
+EXAMPLES
+  cld                                Fresh session in CWD
+  cld -c                             Continue last session
+  cld 4                              4 terminals, fresh sessions
+  cld -c 4                           4 terminals, each restores its slot
+  cld --slot 2 -c                    Resume slot 2
+  cld -tt                            4-pane team (1 + 3 stacked)
+  cld -tt 4                          2x2 team grid
+  cld -tr                            Launch recon dashboard
+  cld -tc                            Launch Codeman web UI on :3000
+  cld -tcl                           Claude + claude-tmux popup (Ctrl+b C-c)
+  cld ./my-project -a                Open my-project + start builder-api
+  cld -c -- --permission-mode plan   Resume + pass plan mode to claude
+
+CONFIG (in src/)
+  .env                  Secrets: ANTHROPIC_API_KEY, BUILDER_API_PASSWORD,
+                        LLM_DOCKER_SSH_AUTHORIZED_KEYS
+  llm-docker.conf       Everything else: DOCKER_DIR, WORKSPACE_DIR,
+                        SANDBOX_ENABLED, INTERNET_ACCESS, INSTALL_* groups,
+                        SSH settings, Claude tuning
+
+NOTES
+  * Sessions are workdir-scoped: `cld -c` in ~/Projects/foo won't see
+    sessions started in ~/Projects/bar.
+  * The last -tt pane runs Haiku for cheap/fast tasks
+    (grep, lint, log tails) — delegate to it instead of the main model.
+  * Bind-mounted from host (auto when present):
+      ~/.tmux.conf   →  /root/.tmux.conf   (your keybindings)
+      ~/.p10k.zsh    →  /root/.p10k.zsh    (prompt, no wizard)
+
+DOCS
+  README.md             Full setup, architecture, security model, SSH,
+                        builder-api
+HELP
+            exit 0
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                WINDOW_COUNT=$1
+                shift
+            elif [ -d "$1" ]; then
+                CURRENT_DIR=$(realpath "$1")
+                shift
+            else
+                break
+            fi
+            ;;
+    esac
+done
+
+# Mutual exclusion: the tmux modes own the foreground, can't combine.
+_tmux_mode_count=0
+[ "$USE_TMUX" = true ]    && _tmux_mode_count=$((_tmux_mode_count + 1))
+[ "$TMUX_TEAM" = true ]   && _tmux_mode_count=$((_tmux_mode_count + 1))
+[ "$TMUX_RECON" = true ]  && _tmux_mode_count=$((_tmux_mode_count + 1))
+[ "$TMUX_CODEMAN" = true ] && _tmux_mode_count=$((_tmux_mode_count + 1))
+[ "$TMUX_CLAUDE" = true ] && _tmux_mode_count=$((_tmux_mode_count + 1))
+if [ "$_tmux_mode_count" -gt 1 ]; then
+    echo "cld: -t / -tt / -tr / -tc / -tcl are mutually exclusive — pick one." >&2
+    exit 1
+fi
+unset _tmux_mode_count
+
+# --clean: stop + remove any leftover llm-docker containers before launching.
+# Matches containers spawned by cld (claude-<pid>) and ocd (llm-docker-opencode-<pid>).
+if [ "$CLEAN_CONTAINERS" = true ]; then
+    # Label-based so both llm-docker:latest and llm-docker-<tool>:latest match.
+    _leftover_ids=$(docker ps -aq --filter "label=com.docker.compose.project=llm-docker" 2>/dev/null)
+    if [ -n "$_leftover_ids" ]; then
+        _log CLD "Cleaning up $(echo "$_leftover_ids" | wc -l | tr -d ' ') leftover llm-docker container(s)..."
+        docker stop $_leftover_ids >/dev/null 2>&1 || true
+        docker rm -f $_leftover_ids >/dev/null 2>&1 || true
+        _log CLD "Done."
+    else
+        _log CLD "No leftover llm-docker containers to clean."
+    fi
+fi
+
+# Colors
+C1='\033[38;5;209m'  # orange
+C2='\033[38;5;214m'  # light orange
+DIM='\033[2m'
+RST='\033[0m'
+GRN='\033[38;5;82m'
+CYN='\033[38;5;81m'
+
+_spin() {
+    local msg="$1" frames=("◐" "◑" "◒" "◓") i=0
+    printf "\033[?25l"
+    while kill -0 $$ 2>/dev/null; do
+        printf "\r  ${C1}%s${RST} ${DIM}%s${RST}" "${frames[$((i % 4))]}" "$msg"
+        sleep 0.1; i=$((i+1))
+    done
+}
+
+_status() { printf "  ${C1}%s${RST} %s\n" "$1" "$2"; }
+
+# _maybe_start_api — spawn the builder-api server in a separate window if
+# --api was passed AND one isn't already listening on the configured port.
+# macOS: osascript opens a new Terminal tab. Otherwise: background + log.
+_maybe_start_api() {
+    [ "$START_API" = true ] || return 0
+
+    local project_dir="$1"
+    local port
+    port="$(_read_env_var BUILDER_API_PORT "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
+    port="${port:-6666}"
+
+    # Quick TCP probe — if the port accepts a connection, assume a daemon
+    # is already running and bail out instead of spawning a duplicate.
+    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+        exec 3<&- 2>/dev/null || true
+        _status "api" "builder-api already running on :$port — not spawning a new one"
+        return 0
+    fi
+
+    local launcher="$SCRIPT_DIR/builder-api/run-local.sh"
+    if [ ! -f "$launcher" ]; then
+        echo "[cld] warning: $launcher not found; skipping --api spawn" >&2
+        return 0
+    fi
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" >/dev/null
+        _status "api" "builder-api spawned in new Terminal window (port $port)"
+    else
+        # Linux/other: no universal terminal, so background it.
+        local log="/tmp/builder-api-$$.log"
+        nohup bash "$launcher" "$project_dir" > "$log" 2>&1 &
+        _status "api" "builder-api started in background (pid $!, log: $log)"
+    fi
+}
+
+# If --slot is set, try to restore saved session. Predict DOCKER_WORKDIR
+# (same logic as run_claude_container below) so we can find Claude's
+# session files, which live at /root/.claude/projects/-<dashed-workdir>/.
+CLAUDE_HOME="$HOME/.llm-docker/claude"
+if [ -n "$SLOT" ]; then
+    SLOT_FILE="$CLAUDE_HOME/.claude/slot_${SLOT}.id"
+    if [ -f "$SLOT_FILE" ] && [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" = true ]; then
+        SAVED_ID=$(cat "$SLOT_FILE")
+        if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$CURRENT_DIR" == "$WORKSPACE_DIR"* ]]; then
+            REL_CHECK="${CURRENT_DIR#$WORKSPACE_DIR}"
+            REL_CHECK="${REL_CHECK#/}"
+            DOCKER_WD_PREDICT="${DOCKER_WORKSPACE_TARGET}${REL_CHECK:+/$REL_CHECK}"
+        else
+            DOCKER_WD_PREDICT="$DOCKER_DIR/$(basename "$CURRENT_DIR")"
+        fi
+        DOCKER_PATH_CHECK="${DOCKER_WD_PREDICT#/}"
+        DOCKER_PATH_CHECK="${DOCKER_PATH_CHECK//\//-}"
+        SESSION_DIR="$CLAUDE_HOME/.claude/projects/-$DOCKER_PATH_CHECK"
+        if [ -f "$SESSION_DIR/$SAVED_ID.jsonl" ]; then
+            RESUME_SESSION="$SAVED_ID"
+        fi
+    fi
+fi
+
+# Function to run a single Claude container
+run_claude_container() {
+    local WORKDIR="$1"
+    shift
+    cd "$SCRIPT_DIR"
+
+    _tmux_nested_prompt
+
+    CONTAINER_NAME="claude-$$"
+
+    _iterm_tag "Claude" "$WORKDIR"
+
+    # Cleanup on exit: kill watchdog, stop container
+    cleanup_container() {
+        [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
+        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        _iterm_untag
+    }
+    trap cleanup_container EXIT INT TERM HUP
+
+    # Build claude flags + optional initial-prompt positional.
+    # Positional prompt (claude "query") starts interactive + sends it as the
+    # first user message, so Claude responds immediately. --append-system-prompt
+    # only modifies behavior — it doesn't trigger a turn. See claude CLI docs.
+    CLAUDE_FLAGS=()
+    INIT_PROMPT=()
+    if [ -n "$RESUME_SESSION" ]; then
+        CLAUDE_FLAGS=(--resume "$RESUME_SESSION")
+    elif [ "$CONTINUE_SESSION" = true ]; then
+        CLAUDE_FLAGS=(--continue)
+    elif [ -f "$WORKDIR/BOOT.md" ]; then
+        INIT_PROMPT=("$(cat "$WORKDIR/BOOT.md")")
+    elif [ -f "$WORKDIR/CLAUDE.md" ]; then
+        INIT_PROMPT=("Read ./CLAUDE.md in full and follow its BOOT steps before anything else.")
+    fi
+
+    # Compute per-invocation mount target from CWD's basename.
+    CWD_BASE="$(basename "$WORKDIR")"
+    PER_INVOKE_TARGET="$DOCKER_DIR/$CWD_BASE"
+    ADD_PER_INVOKE_MOUNT=false
+
+    if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$WORKDIR" == "$WORKSPACE_DIR"* ]]; then
+        # CWD is inside the persistent workspace — no extra mount needed.
+        RELATIVE_PATH="${WORKDIR#$WORKSPACE_DIR}"
+        RELATIVE_PATH="${RELATIVE_PATH#/}"
+        if [ -z "$RELATIVE_PATH" ]; then
+            DOCKER_WORKDIR="$DOCKER_WORKSPACE_TARGET"
+        else
+            DOCKER_WORKDIR="$DOCKER_WORKSPACE_TARGET/$RELATIVE_PATH"
+        fi
+    else
+        # CWD outside workspace (or persistent disabled). Need a per-invoke mount.
+        if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [ "$PER_INVOKE_TARGET" = "$DOCKER_WORKSPACE_TARGET" ]; then
+            _log CLD ERROR "CWD basename '$CWD_BASE' collides with persistent workspace mount at $DOCKER_WORKSPACE_TARGET. Rename the folder or launch from elsewhere."
+            exit 1
+        fi
+        if ! _validate_workspace_paths "$WORKDIR" "$PER_INVOKE_TARGET"; then
+            _log CLD ERROR "Launch cld from inside a specific project folder and try again."
+            exit 1
+        fi
+        ADD_PER_INVOKE_MOUNT=true
+        DOCKER_WORKDIR="$PER_INVOKE_TARGET"
+    fi
+
+    # Background watchdog: survives CMD+Q / crashes
+    # - Periodically finds active session via lsof inside the container (process-specific, no race)
+    # - If parent shell dies, kills the container
+    WATCHDOG_PID=""
+    DOCKER_SESSION_DIR="/root/.claude/projects/$(echo "$DOCKER_WORKDIR" | sed 's|/|-|g')"
+    (
+        set +e
+        PARENT_PID=$$
+        sleep 10
+        while kill -0 "$PARENT_PID" 2>/dev/null; do
+            if [ -n "$SLOT" ]; then
+                # Find which .jsonl the claude process has open via /proc (unique to THIS container)
+                SID=$(docker exec "$CONTAINER_NAME" sh -c \
+                    "for f in /proc/*/fd/*; do readlink \"\$f\" 2>/dev/null; done | grep '$DOCKER_SESSION_DIR/.*\.jsonl' | sort -u | tail -1" \
+                    2>/dev/null)
+                if [ -n "$SID" ]; then
+                    basename "$SID" .jsonl > "$CLAUDE_HOME/.claude/slot_${SLOT}.id"
+                fi
+            fi
+            sleep 5
+        done
+        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    ) &
+    WATCHDOG_PID=$!
+    disown "$WATCHDOG_PID"
+
+    if [ -n "$SLOT" ]; then
+        if [ -n "$RESUME_SESSION" ]; then
+            _status "${GRN}[restore]${RST}" "slot ${CYN}$SLOT${RST}  session ${DIM}${RESUME_SESSION:0:8}...${RST}"
+        else
+            _status "${C2}[new]${RST}" "slot ${CYN}$SLOT${RST}"
+        fi
+    fi
+    _status ">" "$DOCKER_WORKDIR"
+    printf "\n"
+    sleep 0.3
+    # Clear screen right before Claude takes over
+    clear
+
+    # Forward terminal environment variables
+    if command -v stty > /dev/null 2>&1; then
+        TERM_SIZE=$(stty size 2>/dev/null || echo "24 80")
+        export LINES=$(echo $TERM_SIZE | cut -d' ' -f1)
+        export COLUMNS=$(echo $TERM_SIZE | cut -d' ' -f2)
+    fi
+
+    export TERM=${TERM:-xterm-256color}
+
+    # Load llm-docker.conf (non-secret config) then .env (secrets + overrides).
+    # Order matters: .env wins when a var is set in both. See setup.sh.
+    ENV_FILES=""
+    SANDBOX_ENABLED="true"
+    INTERNET_ACCESS="true"
+    NETWORK_MODE="host"
+
+    _source_all_config
+    SANDBOX_ENABLED=${SANDBOX_ENABLED:-true}
+    INTERNET_ACCESS=${INTERNET_ACCESS:-true}
+    [ -f "$SCRIPT_DIR/llm-docker.conf" ] && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/llm-docker.conf"
+    [ -f "$SCRIPT_DIR/.env" ]            && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/.env"
+
+    # Single source of truth for cap/security flags (see setup.sh).
+    _compute_cap_flags "$SANDBOX_ENABLED" "$INTERNET_ACCESS" "${LLM_DOCKER_SSH_ENABLED:-false}" CAP_DROP CAP_ADD SECURITY_OPT
+
+    # SSH port publish requires bridge networking (`-p` can't be used with host).
+    # With SLOT: offset host port by (SLOT - 1) → slot 1=8884, slot 2=8885, etc.
+    # Without SLOT: start at base port and auto-bump upward if it's taken (so
+    # a second `cld` without --slot just works instead of erroring on bind).
+    SSH_PORT_MAPPING=""
+    SSH_HOST_KEY_MOUNT=""
+    if [ "${LLM_DOCKER_SSH_ENABLED:-false}" = "true" ]; then
+        _SSH_BASE="${LLM_DOCKER_SSH_HOST_PORT:-8884}"
+        _SSH_CONTAINER="${LLM_DOCKER_SSH_PORT:-22}"
+        if [ -n "$SLOT" ]; then
+            _SSH_HOST_PORT=$(( _SSH_BASE + SLOT - 1 ))
+        else
+            _SSH_HOST_PORT="$_SSH_BASE"
+            _SSH_MAX=$(( _SSH_BASE + 50 ))
+            while (timeout 1 bash -c "</dev/tcp/127.0.0.1/$_SSH_HOST_PORT") 2>/dev/null; do
+                _SSH_HOST_PORT=$(( _SSH_HOST_PORT + 1 ))
+                if [ "$_SSH_HOST_PORT" -gt "$_SSH_MAX" ]; then
+                    _log CLD ERROR "No free SSH port in $_SSH_BASE-$_SSH_MAX. Stop some containers or pass --slot N."
+                    exit 1
+                fi
+            done
+            if [ "$_SSH_HOST_PORT" != "$_SSH_BASE" ]; then
+                _log CLD "SSH port $_SSH_BASE busy — using $_SSH_HOST_PORT (ssh -p $_SSH_HOST_PORT root@localhost)"
+            fi
+        fi
+        SSH_PORT_MAPPING="-p ${_SSH_HOST_PORT}:${_SSH_CONTAINER}"
+        SSH_HOST_KEY_MOUNT="-v $HOME/.llm-docker/ssh:/etc/ssh/keys"
+    fi
+
+    # Codeman exposes its web UI on port 3000 — needs bridge networking to
+    # publish with `-p`. In host mode the port is already reachable on localhost.
+    CODEMAN_PORT_MAPPING=""
+    if [ "$TMUX_CODEMAN" = true ]; then
+        CODEMAN_PORT_MAPPING="-p 3000:3000"
+    fi
+
+    if [ "$INTERNET_ACCESS" = "false" ] || [ -n "$SSH_PORT_MAPPING" ] || [ -n "$CODEMAN_PORT_MAPPING" ]; then
+        NETWORK_MODE="bridge"
+    else
+        NETWORK_MODE="host"
+    fi
+
+    PORT_MAPPING="$SSH_PORT_MAPPING $CODEMAN_PORT_MAPPING"
+
+    # SLOT env var tells the entrypoint to save session ID on exit
+    # SLOT_RESUME_ID tells it which session was resumed (so it can identify THIS container's session)
+    SLOT_ENV=""
+    if [ -n "$SLOT" ]; then
+        SLOT_ENV="-e SLOT=$SLOT"
+        if [ -n "$RESUME_SESSION" ]; then
+            SLOT_ENV="$SLOT_ENV -e SLOT_RESUME_ID=$RESUME_SESSION"
+        fi
+    fi
+
+    # Fresh-session detector: if we're NOT continuing or resuming, tell the
+    # entrypoint to re-seed /root/.claude/settings.local.json from the
+    # repo-bundled defaults. Resuming keeps whatever permissions the user
+    # accumulated in-session.
+    NEW_CLAUDE_SESSION="true"
+    [ -n "$RESUME_SESSION" ] && NEW_CLAUDE_SESSION="false"
+    [ "$CONTINUE_SESSION" = true ] && NEW_CLAUDE_SESSION="false"
+
+    # Build the mount args. Persistent always mounted when active;
+    # per-invoke added only when CWD is outside the persistent tree.
+    WORKSPACE_MOUNT=""
+    [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && WORKSPACE_MOUNT="-v $WORKSPACE_DIR:$DOCKER_WORKSPACE_TARGET"
+    [ "$ADD_PER_INVOKE_MOUNT" = true ]   && WORKSPACE_MOUNT="$WORKSPACE_MOUNT -v $WORKDIR:$PER_INVOKE_TARGET"
+
+    TMUX_CONF_MOUNT=""
+    [ -f "$HOME/.tmux.conf" ] && TMUX_CONF_MOUNT="-v $HOME/.tmux.conf:/root/.tmux.conf:ro"
+
+    P10K_MOUNT=""
+    [ -f "$HOME/.p10k.zsh" ] && P10K_MOUNT="-v $HOME/.p10k.zsh:/root/.p10k.zsh:ro"
+
+    # Resolve image tag: prefer the claude-only image, fall back to the
+    # combined llm-docker:latest if that's what install.sh produced.
+    IMAGE_TAG="$(_llm-docker_image_for_tool claude)"
+
+    docker run --rm -it \
+        --label com.docker.compose.project=llm-docker \
+        --hostname llm-docker \
+        --name "$CONTAINER_NAME" \
+        -w "$DOCKER_WORKDIR" \
+        $WORKSPACE_MOUNT \
+        $TMUX_CONF_MOUNT \
+        $P10K_MOUNT \
+        -v ~/.llm-docker/claude/.claude:/root/.claude \
+        -v ~/.llm-docker/claude/.config:/root/.config \
+        -v ~/.llm-docker/claude/.claude.json:/root/.claude.json \
+        -v "$SCRIPT_DIR/docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
+        -v "$SCRIPT_DIR/../README.md:/opt/llm-docker/README.md:ro" \
+        -v "$SCRIPT_DIR/ascii/llm-docker.txt:/opt/llm-docker/ascii.txt:ro" \
+        -v "$SCRIPT_DIR/docker/colorize.sh:/opt/llm-docker/colorize.sh:ro" \
+        -v "$SCRIPT_DIR/llm-container-claude-settings.json:/opt/llm-docker/templates/claude-settings.json:ro" \
+        -v "$SCRIPT_DIR/docker/zprofile:/root/.zprofile:ro" \
+        $SSH_HOST_KEY_MOUNT \
+        --network "$NETWORK_MODE" \
+        $PORT_MAPPING \
+        $CAP_DROP \
+        $CAP_ADD \
+        $SECURITY_OPT \
+        -e TERM \
+        -e COLUMNS \
+        -e LINES \
+        -e TOOL=claude \
+        -e NEW_CLAUDE_SESSION="$NEW_CLAUDE_SESSION" \
+        -e USE_TMUX="$USE_TMUX" \
+        -e TMUX_TEAM="$TMUX_TEAM" \
+        -e TMUX_TEAM_SIZE="$TMUX_TEAM_SIZE" \
+        -e TMUX_RECON="$TMUX_RECON" \
+        -e TMUX_CODEMAN="$TMUX_CODEMAN" \
+        -e TMUX_CLAUDE="$TMUX_CLAUDE" \
+        -e DANGER_MODE="$DANGER_MODE" \
+        $SLOT_ENV \
+        $ENV_FILES \
+        -e DOCKER_DIR \
+        -e ANTHROPIC_API_KEY \
+        -e OPENAI_API_KEY \
+        -e ZAI_API_KEY \
+        -e BUILDER_API_PASSWORD \
+        -e CODEMAN_USERNAME \
+        -e CODEMAN_PASSWORD \
+        -e LLM_DOCKER_SSH_AUTHORIZED_KEYS \
+        "$IMAGE_TAG" "${CLAUDE_FLAGS[@]}" "$@" "${INIT_PROMPT[@]}"
+    # NOTE: secrets (ANTHROPIC/OPENAI/ZAI/BUILDER_API/SSH_AUTHORIZED_KEYS)
+    # are listed AFTER $ENV_FILES so docker's last-flag-wins rule makes
+    # the current shell's values override whatever's in .env. This is how
+    # env-gorilla-injected secrets override an out-of-date or empty .env.
+}
+
+# --api: start the builder-api BEFORE fan-out so we spawn it exactly once
+# (multi-llm-docker.applescript's children don't inherit START_API).
+_maybe_start_api "$CURRENT_DIR"
+
+# If WINDOW_COUNT > 1 and we're on macOS, use multi-llm-docker layout
+if [ "$WINDOW_COUNT" -gt 1 ] && [[ "$OSTYPE" == "darwin"* ]]; then
+    SLOT_MODE="new"
+    [ "$CONTINUE_SESSION" = true ] && SLOT_MODE="restore"
+    _log CLD "Opening $WINDOW_COUNT terminal windows ($SLOT_MODE mode)..."
+    _OSA_ERR=$(osascript "$SCRIPT_DIR/multi-llm-docker.applescript" "$SCRIPT_DIR/cld" "$WINDOW_COUNT" "$CURRENT_DIR" "$SLOT_MODE" 2>&1)
+    _OSA_RC=$?
+    if [ "$_OSA_RC" -ne 0 ]; then
+        # macOS AppleEvents permission denied (-1743 or "Not authorised to send Apple events to iTerm").
+        if printf '%s' "$_OSA_ERR" | grep -qE -- '-1743|Not authori[sz]ed'; then
+            _log CLD ERROR "macOS blocked AppleScript from controlling iTerm."
+            _log CLD "Resetting the permission now so macOS will re-prompt..."
+            tccutil reset AppleEvents com.googlecode.iterm2 2>/dev/null || true
+            _log CLD "Now rerun: ${C2}cld $WINDOW_COUNT${RST}"
+            _log CLD "macOS will prompt 'iTerm wants to control iTerm' — click Allow."
+            _log CLD "Permanent fix: System Settings → Privacy & Security → Automation → iTerm → check iTerm."
+        else
+            _log CLD ERROR "multi-window layout failed:"
+            printf '%s\n' "$_OSA_ERR" | sed 's/^/    /'
+        fi
+        exit 1
+    fi
+    exit 0
+fi
+
+# Single window - run directly
+run_claude_container "$CURRENT_DIR"

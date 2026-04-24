@@ -1,0 +1,49 @@
+# YAML equivalent of .builder-api.toml. Requires `pip install pyyaml`.
+# Any path you reference here must sit under this project's root, or the
+# server will refuse to start.
+
+name: my-project
+bind: "127.0.0.1"         # 0.0.0.0 to expose to LAN (requires password)
+port: 6666
+password: "${BUILDER_API_PASSWORD}"  # API password; env var interpolation
+# auth_reads: true        # default true on non-loopback binds
+
+# Build — exactly one command + arg whitelist. No shell features (execvp).
+build:
+  command: "./build.sh"
+  allowed_args:
+    - "--clean"
+    - "--fast"
+    - "--clear"
+  timeout_s: 900
+
+# Log aliases — `/logs?file=<alias>` is the only way to read log files.
+logs:
+  build: "logs/build.log"
+  test:  "logs/test.log"
+  app:   "logs/app.log"
+
+# Runtime — /run always restarts; /stop always kills.
+runtime:
+  enabled: false
+  start_command: "./my-app --server"
+  cwd: "."
+  env:
+    PORT: "8080"
+  stop_signal: "SIGTERM"
+  stop_timeout_s: 5
+
+# Events JSONL feed — rotating append, read via /events.
+events:
+  path: "logs/events.jsonl"
+  max_bytes: 209715200      # 200 MB
+  drop_bytes: 10485760      # ~10 MB
+
+# Security tuning
+security:
+  auth_failures_per_min: 10
+  lockout_s: 300
+  max_body_bytes: 1048576
+  max_url_bytes: 8192
+
+# plugin: "builder_plugin.py"   # only enable for code you trust

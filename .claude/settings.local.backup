@@ -140,8 +140,10 @@
       "Read(//private/etc/sudoers.d/**)",
       "Read(//private/etc/ssh/**)",
       "Read(//private/etc/ssl/private/**)",
+      "Read(//root/**)",
       "Read(//proc/**)",
       "Read(//sys/**)",
+      "Read(//var/log/**)",
 
       "Bash(# ----- 1g. bash: system-path reads via any command -----)",
       "Bash(*/etc/passwd*)",
@@ -157,6 +159,7 @@
       "Bash(*/private/etc/sudoers*)",
       "Bash(*/private/etc/ssh/*)",
       "Bash(*/private/etc/ssl/private/*)",
+      "Bash(*/root/*)",
       "Bash(*/proc/*)",
       "Bash(*/sys/*)",
       "Bash(*/var/log/*)",

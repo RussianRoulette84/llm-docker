@@ -1,0 +1,746 @@
+##########################################################################################
+## .zlprofile — Linux (Ubuntu/Debian) shell profile
+## Source this from ~/.zprofile or ~/.bashrc
+## Usage: echo 'source ~/.zlprofile' >> ~/.zprofile
+##########################################################################################
+
+# [[ $- == *i* ]] && clear
+
+# Load the user's Powerlevel10k config if cld/ocd bind-mounted it from the
+# host (~/.p10k.zsh). Prevents p10k from launching its configuration wizard
+# every time a new shell / tmux pane starts.
+[[ -f "$HOME/.p10k.zsh" ]] && source "$HOME/.p10k.zsh"
+
+##########################################################################################
+## Welcome Screen
+##########################################################################################
+
+# if [[ $- == *i* ]]; then
+#     clear  # wipe the "Last login:" line
+# EOF
+# fi
+
+## ---------------------------------------------------------------------------------------
+## ASCI Art here
+## ---------------------------------------------------------------------------------------
+# IFS= read -r -d '' var <<'EOF' ||:
+# ... 
+# EOF cls; printf '%s' "$var";
+
+
+##########################################################################################
+## System Paths
+##########################################################################################
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/bin:$HOME/.local/bin:$PATH"
+
+##########################################################################################
+## Language
+##########################################################################################
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+##########################################################################################
+## Default Editor
+##########################################################################################
+export EDITOR='micro'
+export VISUAL='micro'
+
+##########################################################################################
+## History Settings
+##########################################################################################
+export HISTFILE="$HOME/.zsh_history"
+export HISTSIZE=1000000
+export SAVEHIST=1000000
+export HISTIGNORE="&:[ ]*:exit"
+
+setopt EXTENDED_HISTORY          # Write the history file in the ":start:elapsed;command" format.
+setopt SHARE_HISTORY             # Share history between all sessions.
+
+##########################################################################################
+## My Aliases
+##########################################################################################
+alias rp="source $HOME/.zprofile"
+alias bed="micro $HOME/.zprofile"
+alias nano='micro'
+alias na='micro'
+alias cls='clear'
+alias trr='tree --du -shaC -L 1'
+alias trrr='tree --du -shaC -L 2'
+alias trrrr='tree --du -shaC -L 5'
+alias tt='ncdu'
+alias l='ls -lFh'
+alias ll='ls -lAFh'
+alias chmodsh='find . -type f -iname "*.sh" -exec chmod +x {} \;'
+alias pp='cd $HOME/Projects'
+alias venvme='python3 -m venv venv && source venv/bin/activate'
+alias venvmei='python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt'
+
+##########################################################################################
+## Git
+##########################################################################################
+# usage: lgit "My commit msg"
+function lgit() {
+    git add .
+    git commit -a -m "$1"
+    git push
+}
+
+##########################################################################################
+## Python
+##########################################################################################
+# alias pip='pip3'
+# alias python='python3'
+
+function pyclean() {
+    find . -type f -name "*.py[co]" -delete
+    find . -type d -name "__pycache__" -delete
+}
+
+function venv() {
+    local dir="${1:-.}"
+    if [[ -f "$dir/venv/bin/activate" ]]; then
+        source "$dir/venv/bin/activate"
+    elif [[ -f "$dir/.venv/bin/activate" ]]; then
+        source "$dir/.venv/bin/activate"
+    else
+        echo "No venv found in $dir"
+    fi
+}
+
+##########################################################################################
+## Node
+##########################################################################################
+# export NVM_DIR="$HOME/.nvm"
+# [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh"
+# [[ -s "$NVM_DIR/bash_completion" ]] && source "$NVM_DIR/bash_completion"
+
+##########################################################################################
+## Go
+##########################################################################################
+export PATH="$PATH:/usr/local/go/bin"
+export GOPATH="$HOME/go"
+export PATH="$PATH:$GOPATH/bin"
+
+##########################################################################################
+## Rust / Cargo
+##########################################################################################
+# export PATH="$HOME/.cargo/bin:$PATH"
+# [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+
+##########################################################################################
+## Ruby / Gem
+##########################################################################################
+# export GEM_HOME="$HOME/.gem"
+# export PATH="$HOME/.gem/bin:$PATH"
+
+##########################################################################################
+## Java / SDKMan
+##########################################################################################
+# export SDKMAN_DIR="$HOME/.sdkman"
+# [[ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]] && source "$HOME/.sdkman/bin/sdkman-init.sh"
+
+##########################################################################################
+## Android
+##########################################################################################
+# export ANDROID_HOME="$HOME/Android/Sdk"
+# export PATH="$ANDROID_HOME/platform-tools:$PATH"
+# export PATH="$ANDROID_HOME/emulator:$PATH"
+
+##########################################################################################
+## Docker
+##########################################################################################
+
+# ── Basic ─────────────────────────────────────────────────────────────────
+alias doc='docker ps && docker images'
+alias docp='docker ps'
+alias doci='docker images'
+
+# ── Build / Up / Down ─────────────────────────────────────────────────────
+alias docbuild='docker compose build'
+alias docup='docker compose up'
+alias docupd='docker compose up -d'
+alias docdown='docker compose down'
+
+# ── Django helpers ────────────────────────────────────────────────────────
+alias docuser='docker compose run --rm web ./manage.py createsuperuser'
+alias docmig='docker compose run --rm web ./manage.py showmigrations --list'
+alias clrmig='find . -path "*/migrations/*.py" -not -name "__init__.py" -delete; find . -path "*/migrations/*.pyc" -delete'
+
+# ── DANGER LEVELS ─────────────────────────────────────────────────────────
+#  1. docstop   — stop all running containers        (safe, reversible)
+#  2. docremove — remove all images                  (re-pull needed)
+#  3. docwipei  — force remove all images, silent    (no output)
+#  4. docwipe   — stop + remove + full system prune  (⚠️  nukes volumes & networks)
+#  5. docbomb   — full wipe then rebuild & restart   (💀 destroys everything)
+
+alias docstop='printf "\nStopping all containers..\n\n"; docker ps -a -q | xargs -r docker stop; printf "\nDone!\n\n"'
+alias docremove='printf "\nRemoving all images..\n\n"; docker images -q | xargs -r docker rmi -f; printf "\nDone!\n\n"'
+alias docwipei='docker images -q | xargs -r docker rmi -f'
+alias docwipe='printf "\nDocker stop & full wipe..\n\n"; docker ps; printf "\n"; docstop; docremove; echo "y" | docker system prune -a; printf "\nDocker Pruned. Done!\n\n"'
+alias docbomb='clear; printf "\n💀 Docker Atomic Bomb: wipe everything then rebuild..\n\n"; docwipe; sleep 1; docbuild; sleep 1; docupd; printf "\nAll DONE :)\n"'
+
+# ── dex — interactive container picker ───────────────────────────────────
+function dex() {
+    local C1=$'\033[38;5;177m'
+    local C2=$'\033[38;5;213m'
+    local C3=$'\033[38;5;208m'
+    local RS=$'\033[0m'
+    local DIM=$'\033[2m'
+
+    printf "\n"
+    printf "  ${C1} ██████╗ ${C2}███████╗${C3}██╗  ██╗${RS}\n"
+    printf "  ${C1}██╔══██╗${C2}██╔════╝${C3}╚██╗██╔╝${RS}\n"
+    printf "  ${C1}██║  ██║${C2}█████╗  ${C3} ╚███╔╝ ${RS}\n"
+    printf "  ${C1}██║  ██║${C2}██╔══╝  ${C3} ██╔██╗ ${RS}\n"
+    printf "  ${C1}██████╔╝${C2}███████╗${C3}██╔╝ ██╗${RS}\n"
+    printf "  ${C1}╚═════╝ ${C2}╚══════╝${C3}╚═╝  ╚═╝${RS}\n"
+    printf "  ${DIM}${C2}exec into any container${RS}\n"
+    printf "\n"
+
+    local selected
+    selected=$(
+        {
+            docker ps --format '{{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null | \
+                awk -F'\t' '{printf "%-30s  \033[38;5;82m[running]\033[0m  %-20s  \033[38;5;214m%s\033[0m\n", $1, $2, $3}'
+            docker ps -a --filter "status=exited" --filter "status=created" \
+                --format '{{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null | \
+                awk -F'\t' '{printf "%-30s  \033[38;5;240m[stopped]\033[0m  %-20s  \033[38;5;214m%s\033[0m\n", $1, $2, $3}'
+        } | fzf \
+            --ansi \
+            --prompt $'\033[38;5;177m❯ container \033[0m' \
+            --pointer '◆' \
+            --marker '●' \
+            --border rounded \
+            --header $'\033[38;5;213m  ↑↓ select   enter exec   esc cancel\033[0m' \
+            --header-first \
+            --color 'bg:#1a1a2e,bg+:#2a2a4e,border:#5f5f87,hl:#87d7ff,hl+:#87d7ff,prompt:#d787ff,pointer:#d787ff'
+    )
+
+    [ -z "$selected" ] && return 0
+
+    local container
+    container=$(echo "$selected" | awk '{print $1}')
+
+    if echo "$selected" | grep -q '\[stopped\]'; then
+        printf "${C1}│  ${C2}%s${RS} is stopped. Start it? ${DIM}[y/N]${RS} " "$container"
+        read -r answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            docker start "$container"
+            sleep 1
+        else
+            printf "${C3}│  Aborted.${RS}\n\n"
+            return 0
+        fi
+    fi
+
+    printf "\n${C1}│  \033[38;5;82m[ exec ]${RS}  ${C3}%s${RS}\n\n" "$container"
+    docker exec -it "$container" bash 2>/dev/null || docker exec -it "$container" sh
+}
+
+##########################################################################################
+## SSH wrapper — auto-prepends root@ to bare hostnames
+##########################################################################################
+ssh() {
+    local args=()
+    local host_set=false
+
+    for arg in "$@"; do
+        if [[ "$host_set" == false && "$arg" != -* ]]; then
+            local prev=""
+            [[ ${#args[@]} -gt 0 ]] && prev="${args[-1]}"
+
+            local flag_takes_value=false
+            case "$prev" in
+                -p|-i|-l|-o|-F|-J|-L|-R|-D|-W|-b|-c|-e|-m|-S|-w|-E|-B|-I|-Q|-O)
+                    flag_takes_value=true ;;
+            esac
+
+            if $flag_takes_value; then
+                args+=("$arg")
+            elif [[ "$arg" != *@* ]]; then
+                args+=("root@$arg")
+                host_set=true
+            else
+                args+=("$arg")
+                host_set=true
+            fi
+        else
+            args+=("$arg")
+        fi
+    done
+
+    command ssh "${args[@]}"
+}
+
+##########################################################################################
+## fz — fuzzy file finder with preview
+##
+## Usage:
+##   fz                    search files in current dir
+##   fz <path>             search files in <path>
+##   fz <path> <query>     pre-filter filenames by <query>
+##   fz -c                 search file CONTENTS in current dir
+##   fz -c <path>          search file contents in <path>
+##   fz -c <path> <query>  search contents, pre-filter by <query>
+##
+## Keybindings: ctrl-/ toggle preview
+## Dependencies: fzf, bat, ripgrep
+##########################################################################################
+fz() {
+    local content_mode=false
+    local dir="."
+    local query=""
+    local dir_set=false
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -c) content_mode=true ;;
+            *)
+                if ! $dir_set; then
+                    dir="$1"
+                    dir_set=true
+                else
+                    query="$1"
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    if $content_mode; then
+        rg --line-number --no-heading --color=never "$dir" 2>/dev/null \
+            | fzf \
+                --query "$query" \
+                --ansi \
+                --delimiter ':' \
+                --preview 'bat --color=always --highlight-line {2} --line-range {2}: {1}' \
+                --preview-window=right:60%:wrap \
+                --bind 'ctrl-/:toggle-preview'
+    else
+        find "$dir" -type f | fzf \
+            --query "$query" \
+            --preview 'bat --color=always --line-range=:200 {}' \
+            --preview-window=right:60%:wrap \
+            --bind 'ctrl-/:toggle-preview'
+    fi
+}
+
+##########################################################################################
+## kk — interactive process killer
+##
+## Usage: kk <name>
+##########################################################################################
+kk() {
+    local name="${1:?Usage: kk <process name>}"
+    ps aux | grep -i "$name" | grep -v grep | fzf | awk '{print $2}' | xargs -I{} kill {}
+}
+
+##########################################################################################
+## clrhis — clear last N lines from zsh history
+##
+## Usage:
+##   clrhis        wipe entire history
+##   clrhis 10     remove last 10 entries
+##########################################################################################
+clrhis() {
+    local n=${1:-9999999999}
+    local total
+    total=$(wc -l < ~/.zsh_history | awk '{print $1}')
+    local keep=$(( total - n ))
+    [[ "$keep" -lt 0 ]] && keep=0
+    local removed=$(( total - keep ))
+
+    if [[ "$keep" -eq 0 ]]; then
+        printf "" > ~/.zsh_history
+    else
+        head -n "$keep" ~/.zsh_history > ~/.zsh_history.new \
+            && mv ~/.zsh_history.new ~/.zsh_history
+    fi
+
+    history -c 2>/dev/null || true
+    fc -R ~/.zsh_history 2>/dev/null || true
+
+    local -a quotes
+    quotes=(
+        "what commands? i saw nothing."
+        "the evidence has been... handled."
+        "your secrets are safe. probably."
+        "sudo rm -rf /regrets"
+        "history? never heard of her."
+        "shredding your crimes since 2024."
+        "the NSA is mildly disappointed."
+        "no logs, no crime. that's the law."
+        "git blame can't save you now."
+        "404: history not found."
+        "what happens in terminal, stays in terminal."
+        "plausible deniability: achieved."
+        "CIA wishes they had this tool."
+        "history.exe has stopped working."
+        "clean slate. dirty mind."
+        "this never happened. wink."
+        "witnesses: eliminated."
+        "men in black would approve."
+        "whoami? nobody. that's who."
+        "classified. burn after reading."
+        "like tears in rain... gone."
+        "zsh: i have amnesia again."
+        "edward snowden nods approvingly."
+        "the matrix has been reset."
+        "sudo forget --everything --now"
+        "no ragrets. not even one letter."
+        "what were we talking about?"
+        "alibis secured. you may proceed."
+        "redacted. redacted. redacted."
+        "commit -m 'nothing to see here'"
+        "history? i think you mean: mythology."
+    )
+
+    local quote="${quotes[$(( RANDOM % ${#quotes[@]} ))]}"
+
+    local -a frames
+    frames[1]="  __|__        (@)\n | ___ |          \n ||   ||          \n ||   ||          \n |_____|          "
+    frames[2]="  __|__     (@)   \n | ___ |       \n ||   ||       \n ||   ||       \n |_____|       "
+    frames[3]="  __|__  (@)  \n | ___ |     \n ||   ||     \n ||   ||     \n |_____|     "
+    frames[4]="  __|__\n |(@)__|\n ||   ||\n ||   ||\n |_____|"
+    frames[5]="  __|__\n | ___ |\n ||(o)||\n ||   ||\n |_____|"
+    frames[6]="  __|__\n | ___ |\n ||   ||\n ||(o)||\n |_____|"
+    frames[7]="  __|__\n | ___ |\n ||(o)||\n ||~~~||\n |_____|"
+    frames[8]="  __|__\n | ___ |\n ||~~~||\n ||~~~||\n |_____|"
+
+    for i in 1 2 3 4 5 6 7 8; do
+        printf "\033[H\033[2J"
+        printf "\n  shredding %d lines...\n" "$removed"
+        printf "\n  \"%s\"\n\n" "$quote"
+        printf "${frames[$i]}\n"
+        sleep 0.13
+    done
+
+    for b in 1 2 3; do
+        printf "\033[H\033[2J"
+        printf "\n  shredding %d lines...\n\n  \"%s\"\n\n  __|__\n | ___ |\n ||~o~||\n ||~~~||\n |_____|\n" "$removed" "$quote"
+        sleep 0.07
+        printf "\033[H\033[2J"
+        printf "\n  shredding %d lines...\n\n  \"%s\"\n\n  __|__\n | ___ |\n ||~~~||\n ||~o~||\n |_____|\n" "$removed" "$quote"
+        sleep 0.07
+    done
+
+    printf "\033[H\033[2J"
+    printf "\n  __|__\n | ___ |\n ||~~~||\n ||~~~||\n |_____|\n\n  (^_^)/  %d lines shredded\n\n  \"%s\"\n\n" "$removed" "$quote"
+}
+
+##########################################################################################
+## zoxide — smarter cd
+##########################################################################################
+[[ $- == *i* ]] && command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"
+
+##########################################################################################
+## Oh My ZSH installer
+##########################################################################################
+function installOhmyzsh() {
+    printf 'Installing Oh My Zsh + Powerlevel10k...\n'
+
+    export ZSH="${ZSH:-$HOME/.oh-my-zsh}"
+    export ZSH_CUSTOM="${ZSH_CUSTOM:-$ZSH/custom}"
+
+    if [ ! -d "$ZSH" ]; then
+        RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+    fi
+
+    if [ ! -d "$ZSH_CUSTOM/plugins/zsh-autosuggestions" ]; then
+        git clone https://github.com/zsh-users/zsh-autosuggestions "$ZSH_CUSTOM/plugins/zsh-autosuggestions"
+    fi
+
+    if [ ! -d "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting" ]; then
+        git clone https://github.com/zsh-users/zsh-syntax-highlighting "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
+    fi
+
+    if [ ! -d "$ZSH_CUSTOM/themes/powerlevel10k" ]; then
+        git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM/themes/powerlevel10k"
+    fi
+
+    if [ -f "$HOME/.zshrc" ]; then
+        if ! grep -q '^export ZSH=' "$HOME/.zshrc"; then
+            printf '\nexport ZSH="$HOME/.oh-my-zsh"\n' >> "$HOME/.zshrc"
+        fi
+        if grep -q '^ZSH_THEME=' "$HOME/.zshrc"; then
+            sed -i 's/^ZSH_THEME=.*/ZSH_THEME="powerlevel10k\/powerlevel10k"/' "$HOME/.zshrc"
+        else
+            printf '\nZSH_THEME="powerlevel10k/powerlevel10k"\n' >> "$HOME/.zshrc"
+        fi
+        if ! grep -q 'source \$ZSH/oh-my-zsh.sh' "$HOME/.zshrc"; then
+            printf '\nsource $ZSH/oh-my-zsh.sh\n' >> "$HOME/.zshrc"
+        fi
+        if grep -q '^plugins=' "$HOME/.zshrc"; then
+            grep -q 'zsh-autosuggestions' "$HOME/.zshrc" || \
+                sed -i 's/^plugins=(/plugins=(zsh-autosuggestions /' "$HOME/.zshrc"
+            grep -q 'zsh-syntax-highlighting' "$HOME/.zshrc" || \
+                sed -i 's/^plugins=(/plugins=(zsh-syntax-highlighting /' "$HOME/.zshrc"
+        else
+            printf '\nplugins=(git zsh-autosuggestions zsh-syntax-highlighting)\n' >> "$HOME/.zshrc"
+        fi
+    fi
+
+    printf 'Install complete. Launching Powerlevel10k wizard...\n'
+    exec zsh -lc 'p10k configure'
+}
+
+##########################################################################################
+## devpack — Linux (Ubuntu/Debian) dev environment installer
+##########################################################################################
+
+_dp_init_theme() {
+    C7=$'\033[38;5;177m'; C8=$'\033[38;5;213m'
+    RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+    LIGHT_GREEN=$'\033[38;5;82m'; RED=$'\033[31m'
+    YELLOW=$'\033[33m'
+    LIGHT_ORANGE=$'\033[38;5;214m'
+    DIM_PINK="${C8}${DIM}"
+    TREE_MID="│  "; TREE_SECTION="├"
+    accent_color="${C7}"
+    SHAZAMP_GRADIENT=(
+        $'\033[38;5;177m' $'\033[38;5;176m' $'\033[38;5;175m' $'\033[38;5;174m'
+        $'\033[38;5;173m' $'\033[38;5;172m' $'\033[38;5;171m' $'\033[38;5;170m'
+        $'\033[38;5;169m' $'\033[38;5;168m' $'\033[38;5;208m' $'\033[38;5;209m'
+        $'\033[38;5;210m' $'\033[38;5;211m' $'\033[38;5;212m' $'\033[38;5;213m'
+    )
+}
+
+_dp_section() {
+    printf "\n%b%s%b %b%s%b\n" "$accent_color" "$TREE_SECTION" "$RESET" "$LIGHT_ORANGE" "$1" "$RESET"
+}
+
+_dp_banner() {
+    local g_len=${#SHAZAMP_GRADIENT[@]} i=0
+    local lines=(
+        ' ██████╗ ███████╗██╗   ██╗      ██████╗  █████╗  ██████╗██╗  ██╗'
+        ' ██╔══██╗██╔════╝██║   ██║      ██╔══██╗██╔══██╗██╔════╝██║ ██╔╝'
+        ' ██║  ██║█████╗  ██║   ██║█████╗██████╔╝███████║██║     █████╔╝ '
+        ' ██║  ██║██╔══╝  ╚██╗ ██╔╝╚════╝██╔═══╝ ██╔══██║██║     ██╔═██╗ '
+        ' ██████╔╝███████╗ ╚████╔╝       ██║     ██║  ██║╚██████╗██║  ██╗'
+        ' ╚═════╝ ╚══════╝  ╚═══╝        ╚═╝     ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝'
+        "                   installing dev-pack on Linux...                  "
+    )
+    printf "\n"
+    for line in "${lines[@]}"; do
+        printf "  %b%s%b\n" "${SHAZAMP_GRADIENT[$((i % g_len))]}" "$line" "$RESET"
+        i=$((i+1))
+    done
+    printf "\n"
+}
+
+# Run a command: show live output, print OK/FAIL/TIMEOUT, never abort on failure
+_dp_run() {
+    local label="$1"
+    local cmd="$2"
+
+    printf "\n%b%s%b %b▶ %s%b\n" \
+        "$accent_color" "$TREE_MID" "$RESET" \
+        "$LIGHT_ORANGE" "$label" "$RESET"
+
+    local rc=0
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 300 bash -c "$cmd" || rc=$?
+    else
+        bash -c "$cmd" || rc=$?
+    fi
+
+    if [[ $rc -eq 0 ]]; then
+        printf "%b%s%b %b[ OK ]%b  %b%s%b\n" \
+            "$accent_color" "$TREE_MID" "$RESET" \
+            "$LIGHT_GREEN" "$RESET" \
+            "$LIGHT_ORANGE" "$label" "$RESET"
+    elif [[ $rc -eq 124 ]]; then
+        printf "%b%s%b %b[TIMEOUT]%b  %b%s%b\n" \
+            "$accent_color" "$TREE_MID" "$RESET" \
+            "$YELLOW" "$RESET" \
+            "$LIGHT_ORANGE" "$label" "$RESET"
+    else
+        printf "%b%s%b %b[FAIL rc=%d]%b  %b%s%b\n" \
+            "$accent_color" "$TREE_MID" "$RESET" \
+            "$RED" "$rc" "$RESET" \
+            "$LIGHT_ORANGE" "$label" "$RESET"
+    fi
+
+    return 0
+}
+
+# apt install wrapper
+_apt() {
+    local pkg="$1" desc="$2" apt_name="${3:-$1}"
+    _dp_run "${pkg}  (${desc})" \
+        "DEBIAN_FRONTEND=noninteractive sudo apt-get install -y $apt_name"
+}
+
+_devpack_packages_linux() {
+
+    # ── 1. Package Manager Bootstrap ─────────────────────────────────────
+    _dp_section "1. Package Manager Bootstrap"
+    _dp_run "apt update" \
+        "sudo apt-get update -y"
+    _dp_run "apt upgrade" \
+        "DEBIAN_FRONTEND=noninteractive sudo apt-get upgrade -y"
+    _dp_run "apt base deps" \
+        "DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+            curl wget git gnupg ca-certificates \
+            software-properties-common apt-transport-https \
+            build-essential pkg-config unzip"
+
+    # ── 2. Go ─────────────────────────────────────────────────────────────
+    _dp_section "2. Go"
+    _dp_run "golang" \
+        'GO_VER=$(curl -s "https://go.dev/VERSION?m=text" | head -1) \
+        && curl -fsSL "https://dl.google.com/go/${GO_VER}.linux-amd64.tar.gz" -o /tmp/go.tar.gz \
+        && sudo rm -rf /usr/local/go \
+        && sudo tar -C /usr/local -xzf /tmp/go.tar.gz \
+        && rm -f /tmp/go.tar.gz \
+        && grep -q "/usr/local/go/bin" ~/.zprofile || echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.zprofile \
+        && export PATH=$PATH:/usr/local/go/bin'
+
+    # ── 3. Python ─────────────────────────────────────────────────────────
+    _dp_section "3. Python"
+    _apt "python3-pip"  "pip3"
+    _apt "python3-venv" "venv support"
+    _dp_run "uv" \
+        "curl -LsSf https://astral.sh/uv/install.sh | sh"
+    _dp_run "pipx" \
+        "pip3 install --user pipx || pip3 install pipx"
+    _dp_run "six" \
+        "pip3 install six"
+    _dp_run "yt-dlp" \
+        "pip3 install yt-dlp"
+
+    # ── 4. Node ───────────────────────────────────────────────────────────
+    _dp_section "4. Node"
+    _dp_run "node via nvm" \
+        'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash \
+        && export NVM_DIR="$HOME/.nvm" \
+        && [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" \
+        && nvm install --lts'
+    _dp_run "pnpm" \
+        "npm install -g pnpm"
+
+    # ── 5. Rust ───────────────────────────────────────────────────────────
+    _dp_section "5. Rust"
+    _dp_run "rustup" \
+        'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+        && source "$HOME/.cargo/env"'
+
+    # ── 7. Dev / Build Tools ──────────────────────────────────────────────
+    _dp_section "7. Dev / Build Tools"
+    _apt "cmake"          "C/C++ build system"
+    _apt "clang-format"   "C/C++ code formatter"
+    _apt "cppcheck"       "static analysis for C/C++"
+    _apt "binutils"       "GNU binary tools"
+    _apt "pkg-config"     "helps compilers find libraries"
+    _apt "php"            "PHP runtime"         "php"
+    _apt "php-cli"        "PHP CLI"
+
+    # ── 8. CLI Favourites ─────────────────────────────────────────────────
+    _dp_section "8. CLI Favourites"
+    _apt "wget"           "HTTP downloader"
+    _apt "curl"           "HTTP client"
+    _apt "git"            "version control"
+    _apt "telnet"         "telnet client"
+    _apt "cmatrix"        "matrix effect"
+    _apt "tree"           "nice directory listing"
+    _apt "ncdu"           "disk space explorer"
+    _apt "mtr"            "traceroute + ping"       "mtr-tiny"
+    _apt "imagemagick"    "image converter"
+    _apt "lolcat"         "rainbow colors"
+    _apt "jq"             "JSON processor for CLI"
+    _apt "gnupg"          "GPG encryption & signing" "gnupg2"
+    _apt "testdisk"       "recover lost partitions"
+    _apt "tmux"           "split terminals, persistent sessions"
+    _apt "micro"          "modern terminal editor"
+    _apt "htop"           "interactive process viewer"
+    _apt "iotop"          "disk I/O monitor"
+    _apt "net-tools"      "ifconfig, netstat etc"
+    _apt "dnsutils"       "dig, nslookup"
+    _apt "rsync"          "file sync"
+    _apt "zip"            "zip/unzip"              "zip unzip"
+
+    # ── 9. fzf stack ──────────────────────────────────────────────────────
+    _dp_section "9. fzf stack"
+    _dp_run "fzf" \
+        "git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf && ~/.fzf/install --all"
+    _apt "bat"            "syntax-highlighted cat"
+    _apt "ripgrep"        "fast grep"
+    _dp_run "zoxide" \
+        "curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh"
+
+    # ── 10. Media / Audio ─────────────────────────────────────────────────
+    _dp_section "10. Media / Audio"
+    _apt "ffmpeg"         "video/audio converter"
+    _apt "sox"            "audio file converter"
+
+    # ── 11. GitHub CLI ────────────────────────────────────────────────────
+    _dp_section "11. GitHub CLI"
+    _dp_run "gh CLI" \
+        '(type -p wget >/dev/null || sudo apt-get install wget -y) \
+        && sudo mkdir -p -m 755 /etc/apt/keyrings \
+        && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null \
+        && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null \
+        && sudo apt-get update \
+        && sudo apt-get install gh -y'
+    _dp_run "git global .gitignore" \
+        "git config --global core.excludesFile ~/.gitignore_global"
+
+    # ── 12. Security / Pentesting ─────────────────────────────────────────
+    _dp_section "12. Security / Pentesting"
+    _apt "nmap"           "network port scanner"
+    _apt "nikto"          "web server vulnerability scanner"
+    _apt "sqlmap"         "automatic SQL injection tool"
+    _apt "chkrootkit"     "rootkit scanner"
+    _apt "rkhunter"       "rootkit hunter"
+    _apt "lynis"          "security auditing tool"
+    _apt "wireshark"      "network packet analyser"   "wireshark-common"
+    _apt "tcpdump"        "CLI packet capture"
+    _apt "netcat"         "netcat"                    "netcat-openbsd"
+    _dp_run "trufflehog" \
+        "curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin"
+    _dp_run "feroxbuster" \
+        "curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s /usr/local/bin"
+    _dp_run "nuclei" \
+        "export PATH=\$PATH:/usr/local/go/bin && go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+    _dp_run "httpx" \
+        "export PATH=\$PATH:/usr/local/go/bin && go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
+    _dp_run "subfinder" \
+        "export PATH=\$PATH:/usr/local/go/bin && go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+    _dp_run "gobuster" \
+        "export PATH=\$PATH:/usr/local/go/bin && go install github.com/OJ/gobuster/v3@latest"
+    _dp_run "ffuf" \
+        "export PATH=\$PATH:/usr/local/go/bin && go install github.com/ffuf/ffuf/v2@latest"
+    _dp_run "amass" \
+        "export PATH=\$PATH:/usr/local/go/bin && go install -v github.com/owasp-amass/amass/v4/...@master"
+
+    # ── 14. Docker ────────────────────────────────────────────────────────
+    _dp_section "14. Docker"
+    _dp_run "docker" \
+        'curl -fsSL https://get.docker.com | sh \
+        && sudo usermod -aG docker $USER'
+}
+
+function devpack() {
+    _dp_init_theme
+    _dp_banner
+    printf "%bUbuntu/Debian Linux%b detected — %bstarting install..%b\n\n" \
+        "$LIGHT_ORANGE" "$RESET" "$DIM_PINK" "$RESET"
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    _devpack_packages_linux
+
+    printf "\n%b%s%b\n" "$accent_color" \
+        "└──────────────────────────────────────────────" "$RESET"
+    printf "  %b(^_^)/%b  %bdev-pack installed!%b\n\n" \
+        "$LIGHT_GREEN" "$RESET" "$LIGHT_ORANGE" "$RESET"
+    printf "  %bNOTE:%b Log out and back in for docker group, nvm, cargo, go to take effect.\n\n" \
+        "$YELLOW" "$RESET"
+}
+
+##########################################################################################
+## THE END
+##########################################################################################
