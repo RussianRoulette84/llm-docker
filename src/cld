@@ -43,16 +43,28 @@ if ! docker info > /dev/null 2>&1; then
     _log CLD "Docker is ready!"
 fi
 
-# Quick pre-scan: --build forces an image rebuild. run_setup only builds when
-# the image is missing, so we wipe both candidate tags first and let it rebuild.
-_user_requested_build=false
+# Quick pre-scan for the two rebuild flags:
+#   --build         smart rebuild: re-runs install scripts inside the existing
+#                   image and `docker commit`s, skipping already-installed
+#                   tools (Go binaries, cargo crates, npm globals, etc.).
+#                   Layer-on-top — fast but accumulates cruft over time.
+#   --rebuild-force full rebuild from the Dockerfile: docker rmi + docker build.
+#                   Slow but produces a clean image. Use when --build's
+#                   accumulated cruft is bothering you, or the Dockerfile
+#                   itself changed (smart can only re-run the install scripts).
+_user_requested_build=false       # smart rebuild requested
+_user_requested_force_rebuild=false
 for _arg in "$@"; do
-    if [ "$_arg" = "--build" ]; then
-        _user_requested_build=true
-        _log CLD "Rebuilding image (--build) — removing llm-docker-claude:latest + llm-docker:latest..."
-        docker rmi llm-docker-claude:latest llm-docker:latest 2>/dev/null || true
-        break
-    fi
+    case "$_arg" in
+        --rebuild-force)
+            _user_requested_force_rebuild=true
+            _log CLD "Force rebuild (--rebuild-force) — removing llm-docker-claude:latest + llm-docker:latest..."
+            docker rmi llm-docker-claude:latest llm-docker:latest 2>/dev/null || true
+            ;;
+        --build)
+            _user_requested_build=true
+            ;;
+    esac
 done
 unset _arg
 
@@ -85,12 +97,12 @@ done
 unset _arg
 
 if [ -n "$_tmux_flip_kvs" ]; then
-    if [ "$_user_requested_build" = true ]; then
-        _log CLD "Enabling for --build: ${_tmux_flip_labels}"
+    if [ "$_user_requested_build" = true ] || [ "$_user_requested_force_rebuild" = true ]; then
+        _log CLD "Enabling: ${_tmux_flip_labels}"
     else
         _log CLD "Tmux flag(s) requested but not baked into the image: ${_tmux_flip_labels}"
         if [ -t 0 ]; then
-            printf "  [cld] Enable and rebuild image now? [Y/n] "
+            printf "  [cld] Enable and rebuild image now (smart)? [Y/n] "
             read -r _ans
         else
             _ans="y"
@@ -101,6 +113,8 @@ if [ -n "$_tmux_flip_kvs" ]; then
                 exit 1
                 ;;
         esac
+        # Promote to smart rebuild — don't docker rmi (incremental layers on top).
+        _user_requested_build=true
     fi
     for _kv in $_tmux_flip_kvs; do
         _k="${_kv%%=*}"; _v="${_kv#*=}"
@@ -114,19 +128,24 @@ if [ -n "$_tmux_flip_kvs" ]; then
             printf "\n%s=%s\n" "$_k" "$_v" >> "$SCRIPT_DIR/llm-docker.conf"
         fi
     done
-    if [ "$_user_requested_build" != true ]; then
-        _log CLD "llm-docker.conf updated — rebuilding image..."
-        docker rmi llm-docker-claude:latest llm-docker:latest 2>/dev/null || true
-    fi
     unset _ans _kv _k _v
 fi
-unset _tmux_flip_kvs _tmux_flip_labels _user_requested_build
+unset _tmux_flip_kvs _tmux_flip_labels
 
 # Auto-setup on first run (dirs, .env, image).
 # Build the claude-only image (llm-docker-claude:latest). If install.sh has
 # already produced the combined llm-docker:latest, that's reused — otherwise
-# we skip the opencode install entirely.
+# we skip the opencode install entirely. --rebuild-force already wiped any
+# existing image above, so this falls into the full-build path.
 run_setup claude
+
+# Smart rebuild (--build): re-run install scripts inside the existing image
+# and commit. No-op when --rebuild-force already triggered a full build via
+# run_setup, since the image is now fresh.
+if [ "$_user_requested_build" = true ] && [ "$_user_requested_force_rebuild" != true ]; then
+    setup_image_incremental claude || _log CLD ERROR "Smart rebuild reported errors — see logs/llm-docker.log"
+fi
+unset _user_requested_build _user_requested_force_rebuild
 
 # DOCKER_DIR = container-side parent for every mount (default /root).
 # WORKSPACE_DIR = optional host dir persistently mirrored at DOCKER_DIR/basename.
@@ -199,8 +218,8 @@ while [[ $# -gt 0 ]]; do
             CLEAN_CONTAINERS=true
             shift
             ;;
-        --build)
-            # Already handled by the pre-scan above (wipes image pre-run_setup).
+        --build|--rebuild-force)
+            # Already handled by the pre-scan above (smart rebuild / docker rmi).
             shift
             ;;
         -tt|--tmux-team)
@@ -312,10 +331,18 @@ CONTAINER LIFECYCLE
   --clean               Stop + remove any leftover llm-docker containers
                         before launching (filters on label
                         com.docker.compose.project=llm-docker).
-  --build               Force an image rebuild. Removes llm-docker-claude:latest
-                        and llm-docker:latest, then run_setup rebuilds from
-                        Dockerfile. Use after editing Dockerfile / devpack /
-                        INSTALL_* flags in llm-docker.conf.
+  --build               Smart rebuild — re-runs the install scripts INSIDE the
+                        existing image and `docker commit`s the result. Skips
+                        already-installed tools (Go binaries, cargo crates, npm
+                        globals, ferox/nikto/codeman). Fast; use after flipping
+                        an INSTALL_* flag or editing install_devpack.sh /
+                        install_cli.sh. Falls back to a full build when no
+                        image exists yet.
+  --rebuild-force       Full rebuild from the Dockerfile — removes
+                        llm-docker-claude:latest + llm-docker:latest, then
+                        rebuilds from scratch. Slow but clean. Use when --build
+                        cruft is bothering you, or when you've edited the
+                        Dockerfile itself.
 
 PASSTHROUGH
   --                    Everything after `--` is forwarded to claude verbatim.
@@ -514,7 +541,7 @@ run_claude_container() {
     elif [ -f "$WORKDIR/BOOT.md" ]; then
         INIT_PROMPT=("$(cat "$WORKDIR/BOOT.md")")
     elif [ -f "$WORKDIR/CLAUDE.md" ]; then
-        INIT_PROMPT=("Read ./CLAUDE.md in full and follow its BOOT steps before anything else.")
+        INIT_PROMPT=("Read ./CLAUDE.md in full and follow its instructions.")
     fi
 
     # Compute per-invocation mount target from CWD's basename.

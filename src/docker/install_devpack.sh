@@ -14,6 +14,7 @@
 #   INSTALL_NS          — NativeScript CLI + node version manager (n)
 #   INSTALL_MEDIA       — ffmpeg + sox + yt-dlp + pipx
 #   INSTALL_QUAKE       — full C/C++ toolchain + SDL2 (for the Quake port)
+#   INSTALL_BROWSING    — chromium-headless-shell + headful chromium
 #
 # Inspired by the macOS `devpack` script — same array-of-packages idea,
 # adapted to Linux/apt.
@@ -49,6 +50,8 @@ SW_MEDIA_PIP=(yt-dlp pipx)
 
 SW_QUAKE_APT=(clang clang-format clang-tools make cmake gcc g++ libc6-dev libsdl2-dev)
 
+SW_BROWSING_APT=(chromium-headless-shell chromium)
+
 # ── Helpers ─────────────────────────────────────────────────────────
 _apt_install() {
     [ $# -eq 0 ] && return 0
@@ -68,8 +71,26 @@ _gem_install() {
 }
 _go_install() {
     [ $# -eq 0 ] && return 0
-    local pkg
+    local pkg bin
     for pkg in "$@"; do
+        # Derive binary name from the Go module path so we can skip if already
+        # installed (smart-rebuild idempotency). Rules: strip @version, strip
+        # trailing /..., take last path segment; if last segment is a Go major
+        # alias like /v3, climb one level up. Matches httpx, nuclei, subfinder,
+        # trufflehog (v3 → trufflehog), amass (/... → amass).
+        bin="${pkg%@*}"
+        bin="${bin%/...}"
+        bin="${bin##*/}"
+        if [[ "$bin" =~ ^v[0-9]+$ ]]; then
+            local _p="${pkg%@*}"
+            _p="${_p%/...}"
+            _p="${_p%/$bin}"
+            bin="${_p##*/}"
+        fi
+        if [ -x "/usr/local/bin/$bin" ]; then
+            echo "[DEVPACK] go: $bin already installed — skipping"
+            continue
+        fi
         GOBIN=/usr/local/bin go install "$pkg" || true
     done
 }
@@ -96,30 +117,43 @@ if _is_true "${INSTALL_SECURITY:-false}"; then
         aarch64|arm64) GO_ARCH=arm64 ;;
         *) GO_ARCH=amd64 ;;
     esac
-    echo "[DEVPACK] SECURITY → installing Go ${GO_VER} (${GO_ARCH}) — apt golang-go is too old for projectdiscovery tools"
-    if curl -sL "https://go.dev/dl/go${GO_VER}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tgz \
-        && rm -rf /usr/local/go \
-        && tar -C /usr/local -xzf /tmp/go.tgz \
-        && ln -sf /usr/local/go/bin/go /usr/local/bin/go \
-        && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
-        && rm -f /tmp/go.tgz; then
+    if [ -x /usr/local/go/bin/go ] && /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VER}"; then
+        echo "[DEVPACK] SECURITY → Go ${GO_VER} already installed — skipping toolchain"
         _go_install "${SW_SECURITY_GO[@]}"
     else
-        echo "[DEVPACK][WARNING] Go ${GO_VER} install failed — skipping Go-based security tools"
+        echo "[DEVPACK] SECURITY → installing Go ${GO_VER} (${GO_ARCH}) — apt golang-go is too old for projectdiscovery tools"
+        if curl -sL "https://go.dev/dl/go${GO_VER}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tgz \
+            && rm -rf /usr/local/go \
+            && tar -C /usr/local -xzf /tmp/go.tgz \
+            && ln -sf /usr/local/go/bin/go /usr/local/bin/go \
+            && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
+            && rm -f /tmp/go.tgz; then
+            _go_install "${SW_SECURITY_GO[@]}"
+        else
+            echo "[DEVPACK][WARNING] Go ${GO_VER} install failed — skipping Go-based security tools"
+        fi
     fi
     # feroxbuster: prebuilt binary from GitHub releases.
-    echo "[DEVPACK] SECURITY → feroxbuster (prebuilt)"
-    curl -sL "$SW_SECURITY_FEROX_URL" -o /tmp/ferox.tgz \
-        && tar -xzf /tmp/ferox.tgz -C /usr/local/bin feroxbuster \
-        && chmod +x /usr/local/bin/feroxbuster \
-        && rm -f /tmp/ferox.tgz \
-        || echo "[DEVPACK][WARNING] feroxbuster install failed — skipping"
+    if [ -x /usr/local/bin/feroxbuster ]; then
+        echo "[DEVPACK] SECURITY → feroxbuster already installed — skipping"
+    else
+        echo "[DEVPACK] SECURITY → feroxbuster (prebuilt)"
+        curl -sL "$SW_SECURITY_FEROX_URL" -o /tmp/ferox.tgz \
+            && tar -xzf /tmp/ferox.tgz -C /usr/local/bin feroxbuster \
+            && chmod +x /usr/local/bin/feroxbuster \
+            && rm -f /tmp/ferox.tgz \
+            || echo "[DEVPACK][WARNING] feroxbuster install failed — skipping"
+    fi
     # nikto: upstream git clone (not in Debian bookworm).
-    echo "[DEVPACK] SECURITY → nikto (git)"
-    git clone --depth 1 "$SW_SECURITY_NIKTO_REPO" /opt/nikto \
-        && ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto \
-        && chmod +x /opt/nikto/program/nikto.pl \
-        || echo "[DEVPACK][WARNING] nikto install failed — skipping"
+    if [ -d /opt/nikto/.git ]; then
+        echo "[DEVPACK] SECURITY → nikto already cloned — skipping"
+    else
+        echo "[DEVPACK] SECURITY → nikto (git)"
+        git clone --depth 1 "$SW_SECURITY_NIKTO_REPO" /opt/nikto \
+            && ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto \
+            && chmod +x /opt/nikto/program/nikto.pl \
+            || echo "[DEVPACK][WARNING] nikto install failed — skipping"
+    fi
 fi
 
 # ── RUBY ────────────────────────────────────────────────────────────
@@ -146,8 +180,12 @@ fi
 
 # ── NativeScript ────────────────────────────────────────────────────
 if _is_true "${INSTALL_NS:-false}"; then
-    echo "[DEVPACK] NS group"
-    _npm_install "${SW_NS_NPM[@]}"
+    if command -v ns >/dev/null 2>&1 && command -v n >/dev/null 2>&1; then
+        echo "[DEVPACK] NS group already installed — skipping"
+    else
+        echo "[DEVPACK] NS group"
+        _npm_install "${SW_NS_NPM[@]}"
+    fi
 fi
 
 # ── MEDIA ───────────────────────────────────────────────────────────
@@ -161,6 +199,19 @@ fi
 if _is_true "${INSTALL_QUAKE:-false}"; then
     echo "[DEVPACK] QUAKE group"
     _apt_install "${SW_QUAKE_APT[@]}"
+fi
+
+# ── BROWSING (headless + headful chromium for agentic browsing) ─────
+# chromium-headless-shell is the no-systemd headless build (HyperFrames uses
+# this via $HYPERFRAMES_BROWSER_PATH). Plain `chromium` is the full headful
+# browser — its post-install would invoke-rc.d dbus/systemd and dpkg-exit-1
+# in non-systemd containers, so we drop a policy-rc.d shim that returns 101
+# to make invoke-rc.d skip every service start during install.
+if _is_true "${INSTALL_BROWSING:-false}"; then
+    echo "[DEVPACK] BROWSING group"
+    echo 'exit 101' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+    _apt_install "${SW_BROWSING_APT[@]}"
+    rm -f /usr/sbin/policy-rc.d
 fi
 
 # ── SSH (openssh-server only when user enabled SSH in llm-docker.conf) ────
@@ -189,9 +240,10 @@ if [ "$_tmux_any" = true ]; then
     _apt_install tmux
 fi
 
+# Only need rustup if the corresponding cargo binary is missing (idempotency).
 _tmux_need_rustup=false
-_is_true "${INSTALL_TMUX_RECON:-false}"  && _tmux_need_rustup=true
-_is_true "${INSTALL_TMUX_CLAUDE:-false}" && _tmux_need_rustup=true
+_is_true "${INSTALL_TMUX_RECON:-false}"  && [ ! -x /usr/local/bin/recon ]       && _tmux_need_rustup=true
+_is_true "${INSTALL_TMUX_CLAUDE:-false}" && [ ! -x /usr/local/bin/claude-tmux ] && _tmux_need_rustup=true
 
 if [ "$_tmux_need_rustup" = true ]; then
     echo "[DEVPACK] installing rustup (build dependency for recon / claude-tmux)..."
@@ -201,23 +253,31 @@ if [ "$_tmux_need_rustup" = true ]; then
 fi
 
 if _is_true "${INSTALL_TMUX_RECON:-false}"; then
-    echo "[DEVPACK] installing recon (gavraz/recon)..."
-    cargo install -v --git https://github.com/gavraz/recon --locked || \
-        echo "[DEVPACK][WARNING] recon build failed — skipping"
-    if [ -x /root/.cargo/bin/recon ]; then
-        mv /root/.cargo/bin/recon /usr/local/bin/recon
-        chmod +x /usr/local/bin/recon
+    if [ -x /usr/local/bin/recon ]; then
+        echo "[DEVPACK] recon already installed — skipping"
+    else
+        echo "[DEVPACK] installing recon (gavraz/recon)..."
+        cargo install -v --git https://github.com/gavraz/recon --locked || \
+            echo "[DEVPACK][WARNING] recon build failed — skipping"
+        if [ -x /root/.cargo/bin/recon ]; then
+            mv /root/.cargo/bin/recon /usr/local/bin/recon
+            chmod +x /usr/local/bin/recon
+        fi
     fi
 fi
 
 if _is_true "${INSTALL_TMUX_CLAUDE:-false}"; then
-    echo "[DEVPACK] installing claude-tmux (nielsgroen/claude-tmux)..."
-    cargo install -v --git https://github.com/nielsgroen/claude-tmux --locked || \
-        cargo install -v claude-tmux --locked || \
-        echo "[DEVPACK][WARNING] claude-tmux build failed — skipping"
-    if [ -x /root/.cargo/bin/claude-tmux ]; then
-        mv /root/.cargo/bin/claude-tmux /usr/local/bin/claude-tmux
-        chmod +x /usr/local/bin/claude-tmux
+    if [ -x /usr/local/bin/claude-tmux ]; then
+        echo "[DEVPACK] claude-tmux already installed — skipping"
+    else
+        echo "[DEVPACK] installing claude-tmux (nielsgroen/claude-tmux)..."
+        cargo install -v --git https://github.com/nielsgroen/claude-tmux --locked || \
+            cargo install -v claude-tmux --locked || \
+            echo "[DEVPACK][WARNING] claude-tmux build failed — skipping"
+        if [ -x /root/.cargo/bin/claude-tmux ]; then
+            mv /root/.cargo/bin/claude-tmux /usr/local/bin/claude-tmux
+            chmod +x /usr/local/bin/claude-tmux
+        fi
     fi
 fi
 
@@ -228,24 +288,28 @@ if [ "$_tmux_need_rustup" = true ]; then
 fi
 
 if _is_true "${INSTALL_TMUX_CODEMAN:-false}"; then
-    echo "[DEVPACK] installing codeman (Ark0N/Codeman)..."
-    # Codeman pulls puppeteer + playwright as dev deps — both download Chromium
-    # browser bundles (~150-300 MB each) on npm install. That's what makes
-    # "==> Installing dependencies..." look frozen for 10+ minutes on arm64.
-    # Codeman's server runtime doesn't need them, so we block the downloads.
-    export PUPPETEER_SKIP_DOWNLOAD=true
-    export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-    export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-    export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
-    # Make npm chatty so the log shows progress instead of silent hangs.
-    export NPM_CONFIG_LOGLEVEL=info
-    export NPM_CONFIG_PROGRESS=true
-    export NPM_CONFIG_FUND=false
-    export NPM_CONFIG_AUDIT=false
-    curl -fsSL https://raw.githubusercontent.com/Ark0N/Codeman/master/install.sh | bash \
-        || echo "[DEVPACK][WARNING] codeman install failed — skipping"
-    if [ ! -x /usr/local/bin/codeman ] && [ -x /root/.codeman/bin/codeman ]; then
-        ln -sf /root/.codeman/bin/codeman /usr/local/bin/codeman
+    if command -v codeman >/dev/null 2>&1 || [ -x /root/.codeman/bin/codeman ]; then
+        echo "[DEVPACK] codeman already installed — skipping"
+    else
+        echo "[DEVPACK] installing codeman (Ark0N/Codeman)..."
+        # Codeman pulls puppeteer + playwright as dev deps — both download Chromium
+        # browser bundles (~150-300 MB each) on npm install. That's what makes
+        # "==> Installing dependencies..." look frozen for 10+ minutes on arm64.
+        # Codeman's server runtime doesn't need them, so we block the downloads.
+        export PUPPETEER_SKIP_DOWNLOAD=true
+        export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+        export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+        export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
+        # Make npm chatty so the log shows progress instead of silent hangs.
+        export NPM_CONFIG_LOGLEVEL=info
+        export NPM_CONFIG_PROGRESS=true
+        export NPM_CONFIG_FUND=false
+        export NPM_CONFIG_AUDIT=false
+        curl -fsSL https://raw.githubusercontent.com/Ark0N/Codeman/master/install.sh | bash \
+            || echo "[DEVPACK][WARNING] codeman install failed — skipping"
+        if [ ! -x /usr/local/bin/codeman ] && [ -x /root/.codeman/bin/codeman ]; then
+            ln -sf /root/.codeman/bin/codeman /usr/local/bin/codeman
+        fi
     fi
 fi
 

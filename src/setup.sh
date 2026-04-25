@@ -324,37 +324,105 @@ _docker_pretty() {
     fi
 }
 
-# Estimate wall-seconds the install_devpack.sh RUN step will take, based on
-# which INSTALL_* flags are enabled in llm-docker.conf. Numbers are rough
-# averages on Apple-Silicon Docker (arm64). Overshooting is fine — pct just
-# ticks slower and hits 99% near the real finish. Undershooting is what
-# causes the 99% stall (pct plateaus before the build actually ends).
-_compute_devpack_weight() {
+# _count_apt_array — count tokens inside a single-line bash array
+# `NAME=(a b c)` literal in $1. All SW_*_APT arrays in install_devpack.sh
+# are single-line, so this is enough.
+_count_apt_array() {
+    local file="$1" name="$2"
+    grep -E "^${name}=\(" "$file" 2>/dev/null | head -1 \
+        | sed -E "s/^${name}=\(//; s/\\).*\$//" \
+        | tr -s ' \t' '\n' \
+        | grep -cE '[a-zA-Z]'
+}
+
+# _count_total_packages — total install ops the build will perform.
+# An "op" is one apt package (Dockerfile RUN apt-get install + each enabled
+# SW_*_APT array in install_devpack.sh) or one non-apt step (npm install -g
+# call, git clone, curl|sh installer, gem/pip/cargo/go install). The spinner
+# counts completion markers in the build log and divides by this total to
+# get an honest, monotonic percentage. Replaces the old wall-time-weighted
+# guesstimate that jumped erratically when its hardcoded step shape shifted.
+_count_total_packages() {
     local conf="$SCRIPT_DIR/llm-docker.conf"
-    local w=30   # apt-get update + script overhead
-    [ -f "$conf" ] || { printf '%d' 400; return; }
-    local _v
-    _v=$(_read_env_var INSTALL_SECURITY "$conf")
-    [ "$_v" = "true" ] && w=$((w + 270))   # apt + Go 1.22 + 4×go install + amass v4 + feroxbuster + nikto
-    _v=$(_read_env_var INSTALL_RUBY "$conf");       [ "$_v" = "true" ] && w=$((w + 45))
-    _v=$(_read_env_var INSTALL_CPP "$conf");        [ "$_v" = "true" ] && w=$((w + 15))
-    _v=$(_read_env_var INSTALL_LLVM_CLANG "$conf"); [ "$_v" = "true" ] && w=$((w + 90))
-    _v=$(_read_env_var INSTALL_NS "$conf");         [ "$_v" = "true" ] && w=$((w + 75))
-    _v=$(_read_env_var INSTALL_MEDIA "$conf");      [ "$_v" = "true" ] && w=$((w + 45))
-    _v=$(_read_env_var INSTALL_QUAKE "$conf");      [ "$_v" = "true" ] && w=$((w + 45))
-    local _f _any_tmux=false _need_rustup=false
-    for _f in INSTALL_TMUX_VANILLA INSTALL_TMUX_TEAM INSTALL_TMUX_RECON INSTALL_TMUX_CODEMAN INSTALL_TMUX_CLAUDE; do
-        [ "$(_read_env_var "$_f" "$conf")" = "true" ] && _any_tmux=true
-    done
-    [ "$_any_tmux" = true ] && w=$((w + 15))   # apt tmux
-    for _f in INSTALL_TMUX_RECON INSTALL_TMUX_CLAUDE; do
-        [ "$(_read_env_var "$_f" "$conf")" = "true" ] && _need_rustup=true
-    done
-    [ "$_need_rustup" = true ] && w=$((w + 45))                                                    # rustup install + uninstall
-    [ "$(_read_env_var INSTALL_TMUX_RECON "$conf")"   = "true" ] && w=$((w + 120))                 # cargo build recon
-    [ "$(_read_env_var INSTALL_TMUX_CLAUDE "$conf")"  = "true" ] && w=$((w + 120))                 # cargo build claude-tmux
-    [ "$(_read_env_var INSTALL_TMUX_CODEMAN "$conf")" = "true" ] && w=$((w + 30))
-    printf '%d' "$w"
+    local dockerfile="$SCRIPT_DIR/Dockerfile"
+    local devpack="$SCRIPT_DIR/docker/install_devpack.sh"
+    local total=0
+
+    # ── Dockerfile apt blocks. Join `\`-continued lines into single logical
+    # lines; for each line containing `apt-get install`, take the slice
+    # between that and the next `&&` (or EOL) and count tokens that don't
+    # start with `-`.
+    if [ -f "$dockerfile" ]; then
+        local joined ln pkgs t
+        joined=$(awk 'BEGIN{ORS=""} /\\$/{sub(/\\$/,""); print; next} {print $0 "\n"}' "$dockerfile")
+        while IFS= read -r ln; do
+            [[ "$ln" != *"apt-get install"* ]] && continue
+            pkgs="${ln##*apt-get install}"
+            pkgs="${pkgs%%&&*}"
+            for t in $pkgs; do
+                case "$t" in
+                    -*|"") continue ;;
+                    *) total=$((total + 1)) ;;
+                esac
+            done
+        done <<< "$joined"
+    fi
+
+    # ── install_devpack.sh apt arrays, gated by the matching INSTALL_* flag.
+    if [ -f "$devpack" ] && [ -f "$conf" ]; then
+        local map=(
+            "SW_SECURITY_APT:INSTALL_SECURITY"
+            "SW_RUBY_APT:INSTALL_RUBY"
+            "SW_CPP_APT:INSTALL_CPP"
+            "SW_LLVM_CLANG_APT:INSTALL_LLVM_CLANG"
+            "SW_MEDIA_APT:INSTALL_MEDIA"
+            "SW_QUAKE_APT:INSTALL_QUAKE"
+            "SW_BROWSING_APT:INSTALL_BROWSING"
+        )
+        local entry arr flag c
+        for entry in "${map[@]}"; do
+            arr="${entry%%:*}"; flag="${entry##*:}"
+            [ "$(_read_env_var "$flag" "$conf")" = "true" ] || continue
+            c=$(_count_apt_array "$devpack" "$arr")
+            total=$(( total + c ))
+        done
+        # openssh-server (1) when SSH on; tmux (1) when any tmux-helper flag on.
+        [ "$(_read_env_var LLM_DOCKER_SSH_ENABLED "$conf")" = "true" ] && total=$(( total + 1 ))
+        local f any_tmux=false
+        for f in INSTALL_TMUX_VANILLA INSTALL_TMUX_TEAM INSTALL_TMUX_RECON INSTALL_TMUX_CODEMAN INSTALL_TMUX_CLAUDE; do
+            [ "$(_read_env_var "$f" "$conf")" = "true" ] && any_tmux=true
+        done
+        [ "$any_tmux" = true ] && total=$(( total + 1 ))
+    fi
+
+    # ── Always-run non-apt ops in the Dockerfile.
+    total=$(( total + 1 ))   # npm i -g pnpm
+    total=$(( total + 1 ))   # oh-my-zsh installer (sh -c)
+    total=$(( total + 3 ))   # zsh-autosuggestions + zsh-syntax-highlighting + powerlevel10k git clones
+    total=$(( total + 1 ))   # uv installer (curl | sh)
+
+    # ── install_cli.sh. TOOL build-arg defaults to "both" — opencode + claude
+    # + Claude's post-install (install.cjs). Hyperframes skill add when
+    # INSTALL_BROWSING is on.
+    total=$(( total + 3 ))
+    [ "$(_read_env_var INSTALL_BROWSING "$conf")" = "true" ] && total=$(( total + 1 ))
+
+    # ── install_devpack.sh non-apt ops, gated by enabled flags.
+    if [ "$(_read_env_var INSTALL_SECURITY "$conf")" = "true" ]; then
+        total=$(( total + 1 ))   # Go toolchain tarball download+unpack
+        total=$(( total + 5 ))   # 5 go install targets in SW_SECURITY_GO
+        total=$(( total + 1 ))   # feroxbuster prebuilt download
+        total=$(( total + 1 ))   # nikto git clone
+    fi
+    [ "$(_read_env_var INSTALL_RUBY "$conf")" = "true" ]    && total=$(( total + 1 ))   # cocoapods gem
+    [ "$(_read_env_var INSTALL_NS "$conf")"   = "true" ]    && total=$(( total + 1 ))   # n + nativescript via one npm i -g
+    [ "$(_read_env_var INSTALL_MEDIA "$conf")" = "true" ]   && total=$(( total + 1 ))   # yt-dlp + pipx via one pip install
+    [ "$(_read_env_var INSTALL_TMUX_RECON "$conf")"   = "true" ]  && total=$(( total + 2 ))   # rustup + cargo recon
+    [ "$(_read_env_var INSTALL_TMUX_CLAUDE "$conf")"  = "true" ]  && total=$(( total + 1 ))   # cargo claude-tmux
+    [ "$(_read_env_var INSTALL_TMUX_CODEMAN "$conf")" = "true" ]  && total=$(( total + 1 ))   # codeman installer (curl|bash)
+
+    [ "$total" -lt 1 ] && total=1
+    printf '%d' "$total"
 }
 
 # Pipe stdout/stderr through [DOCKER] prefix, tee to LOG_FILE. Don't use
@@ -411,10 +479,12 @@ _log_docker_exec() {
     # Monotonic pct floor: never let the displayed percentage go backwards,
     # even if a tick's log-parse reads a stale/partial state.
     local _last_pct=0
-    # Precompute step-15 weight from enabled INSTALL_* flags — the only
-    # weight that varies per user config. Others are config-independent.
-    local _sw15
-    _sw15="$(_compute_devpack_weight)"
+    # Precompute total install-ops (apt packages + non-apt ops). The pct
+    # comes from counting completion markers in the build log and dividing
+    # by this total — no weights, no wall-time guesses, no jumping.
+    local _total_pkgs
+    _total_pkgs="$(_count_total_packages)"
+    [ "${_total_pkgs:-0}" -lt 1 ] 2>/dev/null && _total_pkgs=1
     # Reserve 7 rows by printing 7 newlines (terminal scrolls if needed),
     # then move cursor back up 7 rows to the top of the reserved block.
     # Relative cursor-up is scroll-safe; save/restore (\033[s/\033[u) isn't.
@@ -435,66 +505,27 @@ _log_docker_exec() {
         [ -z "$cols" ] && cols="${COLUMNS:-80}"
         [ "$cols" -lt 40 ] 2>/dev/null && cols=40
 
-        # Percent: weighted cumulative progress + within-step interpolation.
-        # Naive cur/TOTAL makes the bar stall for 2–4 minutes on heavy RUN
-        # steps (install_cli.sh, install_devpack.sh). Instead, weight each
-        # [N/TOTAL] step by its estimated wall seconds for a full-enabled
-        # build, and interpolate the current step's progress from BuildKit's
-        # own "#<stage_id> <seconds>" timestamps in the log.
-        #
-        # Weights assume the default Dockerfile shape (19 steps) with most
-        # INSTALL_* flags on. If Dockerfile step count ≠ 19 we fall back to
-        # naive cur/tot so the bar still advances.
+        # Percent: count actual completion markers in the build log and
+        # divide by the pre-computed total of install ops. One marker per:
+        #   apt:   `Setting up <pkg>:<arch> (<ver>) ...`        — dpkg per-package
+        #   npm:   `added <N> packages` line                    — one per npm install
+        #   pip:   `Successfully installed <pkg>...`            — one per pip / gem call
+        #   gem:   shares `Successfully installed` with pip
+        #   cargo: `   Installing /usr/local/bin/<bin>`         — one per cargo install
+        #   git:   `Resolving deltas: 100%`                     — one per git clone
+        # No wall-time weights, no BuildKit step-id math, no can-go-backwards
+        # `done_n / max_n` lie. Final monotonic clamp below covers regex jitter.
         local pct=0
-        # Weights are computed once per spinner run and cached in _sw15 outside
-        # the loop. install_devpack.sh (step 15) cost depends on INSTALL_* flags.
-        local _sw=(0  10 120 20 30 20 5 5 15 1 1 1 150 2 2 "$_sw15" 1 1 1 1)
-        #            ^ idx 0 unused. heavy: step 2=apt, 12=install_cli, 15=install_devpack.
         if [ -s "$BUILD_LOG" ]; then
-            local step_frac cur tot
-            # Anchor to BuildKit's own "#<stage_id> [N/TOTAL]" prefix — keeps
-            # us from matching unrelated "[n/m]"-shaped text from sub-builds
-            # (cargo/rustup progress, npm/apt oddities). Allow whitespace
-            # padding on single-digit steps like "[ 8/19]".
-            step_frac=$(grep -oE '#[0-9]+ \[[[:space:]]*[0-9]+/[0-9]+\]' "$BUILD_LOG" 2>/dev/null \
-                        | tail -1 | grep -oE '[0-9]+/[0-9]+' | tail -1)
-            if [[ "$step_frac" =~ ^([0-9]+)/([0-9]+)$ ]]; then
-                cur="${BASH_REMATCH[1]}"
-                tot="${BASH_REMATCH[2]}"
-                if [ "$tot" = "19" ] && [ "$cur" -ge 1 ] && [ "$cur" -le 19 ]; then
-                    local _base=0 _total_w=0 _k
-                    for ((_k=1; _k<cur; _k++)); do _base=$(( _base + _sw[_k] )); done
-                    for ((_k=1; _k<=19; _k++)); do _total_w=$(( _total_w + _sw[_k] )); done
-                    # Elapsed seconds in current step = last "#<stage> <T>" where
-                    # <stage> is the BuildKit stage containing [cur/19].
-                    local _stage_id _elapsed=0
-                    _stage_id=$(grep -oE "#[0-9]+ \[[[:space:]]*${cur}/" "$BUILD_LOG" 2>/dev/null \
-                                | tail -1 | grep -oE '^#[0-9]+')
-                    if [ -n "$_stage_id" ]; then
-                        _elapsed=$(grep -oE "${_stage_id} [0-9]+\.[0-9]+" "$BUILD_LOG" 2>/dev/null \
-                                   | awk '{print int($2)}' | sort -n | tail -1)
-                        [ -z "$_elapsed" ] && _elapsed=0
-                    fi
-                    local _w_cur="${_sw[cur]}"
-                    [ "$_elapsed" -gt "$_w_cur" ] && _elapsed="$_w_cur"
-                    pct=$(( (_base + _elapsed) * 100 / _total_w ))
-                    [ "$pct" -gt 99 ] && pct=99
-                elif [ "${tot:-0}" -gt 0 ]; then
-                    pct=$(( cur * 100 / tot ))
-                    [ "$pct" -gt 99 ] && pct=99
-                fi
-            else
-                local max_n done_n
-                max_n=$(grep -oE '^\[DOCKER\] #[0-9]+' "$BUILD_LOG" 2>/dev/null \
-                        | grep -oE '[0-9]+' | sort -n | tail -1)
-                done_n=$(grep -cE '^\[DOCKER\] #[0-9]+ DONE ' "$BUILD_LOG" 2>/dev/null)
-                [ -z "$max_n" ] && max_n=0
-                [ -z "$done_n" ] && done_n=0
-                if [ "$max_n" -gt 0 ]; then
-                    pct=$(( done_n * 100 / max_n ))
-                    [ "$pct" -gt 99 ] && pct=99
-                fi
-            fi
+            local _apt _npm _pip_gem _cargo _git _done
+            _apt=$(grep -cE '^\[DOCKER\] Setting up '         "$BUILD_LOG" 2>/dev/null) || _apt=0
+            _npm=$(grep -cE 'added [0-9]+ package'            "$BUILD_LOG" 2>/dev/null) || _npm=0
+            _pip_gem=$(grep -cE 'Successfully installed '     "$BUILD_LOG" 2>/dev/null) || _pip_gem=0
+            _cargo=$(grep -cE '^[[:space:]]*Installing /'     "$BUILD_LOG" 2>/dev/null) || _cargo=0
+            _git=$(grep -cE 'Resolving deltas: 100%'          "$BUILD_LOG" 2>/dev/null) || _git=0
+            _done=$(( _apt + _npm + _pip_gem + _cargo + _git ))
+            pct=$(( _done * 100 / _total_pkgs ))
+            [ "$pct" -gt 99 ] && pct=99
         fi
         # Clamp to monotonic: never regress. If a tick underestimates (e.g.
         # regex races a partial log write), keep the last displayed value.
@@ -812,6 +843,78 @@ setup_image() {
     _log_docker_exec docker build "${build_args[@]}" \
         --build-arg "TOOL=${tool}" \
         -t "$build_tag" "$SCRIPT_DIR"
+}
+
+# setup_image_incremental [TOOL] — smart rebuild that re-runs install_cli.sh
+# and install_devpack.sh INSIDE an existing image, then `docker commit`s the
+# result. Skips the heavy stuff that's already installed (Go binaries, cargo
+# crates, ferox/nikto/codeman, npm globals) thanks to the idempotency guards
+# in those scripts. Falls back to a full `setup_image` if the image is missing
+# or the in-place run fails.
+#
+# Trade-off vs `setup_image`: layered commits accumulate cruft over many smart
+# rebuilds (removed packages don't free disk). Periodically run --rebuild-force
+# (cld/ocd) to start fresh.
+setup_image_incremental() {
+    local tool="${1:-both}"
+    local build_tag="llm-docker:latest"
+    [ "$tool" != "both" ] && build_tag="llm-docker-${tool}:latest"
+
+    if ! docker image inspect "$build_tag" >/dev/null 2>&1; then
+        _log SETUP "No existing $build_tag — falling back to full build."
+        setup_image "$tool"
+        return $?
+    fi
+
+    _log SETUP "Smart rebuild: updating $build_tag in place (skip-if-installed)."
+    _log SETUP "For details run: tail logs/llm-docker.log"
+
+    local container="llm-docker-update-$$"
+    _log_ensure_dir
+    # Best-effort cleanup if anything left behind.
+    docker rm -f "$container" >/dev/null 2>&1 || true
+
+    if ! docker run -d --name "$container" \
+            --entrypoint sleep \
+            -v "$SCRIPT_DIR:/build:ro" \
+            "$build_tag" 1800 >/dev/null 2>&1; then
+        _log SETUP ERROR "Failed to start update container — falling back to full build."
+        setup_image "$tool"
+        return $?
+    fi
+
+    # Run the install scripts inside the container, sourcing the latest
+    # llm-docker.conf so updated INSTALL_* flags take effect. tee the live
+    # output through _log_docker_exec's spinner just like a real build.
+    if ! _log_docker_exec docker exec "$container" bash -c "
+        set -e
+        cp /build/llm-docker.conf /tmp/llm-docker.conf
+        cp /build/docker/install_cli.sh /tmp/install_cli.sh
+        cp /build/docker/install_devpack.sh /tmp/install_devpack.sh
+        chmod +x /tmp/install_cli.sh /tmp/install_devpack.sh
+        set -a; . /tmp/llm-docker.conf; set +a
+        /tmp/install_cli.sh '$tool'
+        /tmp/install_devpack.sh
+        rm -f /tmp/llm-docker.conf /tmp/install_cli.sh /tmp/install_devpack.sh
+    "; then
+        _log SETUP ERROR "Smart rebuild failed; image left as-is."
+        docker rm -f "$container" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    # Commit in place. ENTRYPOINT/CMD/ENV/WORKDIR are preserved from the
+    # source image (we overrode entrypoint via `docker run --entrypoint sleep`,
+    # not via `docker commit --change`, so the committed image keeps the
+    # original docker-entrypoint.sh as its ENTRYPOINT).
+    if ! docker commit "$container" "$build_tag" >/dev/null; then
+        _log SETUP ERROR "docker commit failed; image left as-is."
+        docker rm -f "$container" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    _log SETUP "Smart rebuild complete: $build_tag updated."
+    return 0
 }
 
 # Run all setup steps. Called from cld/ocd at launch for first-time-ish

@@ -54,7 +54,7 @@ secondary_accent="$ORANGE"          # Claude orange
 row_selected_color="\033[1;37m"
 
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/lib/ywizz/ywizz.sh"
+source "$SCRIPT_DIR/src/lib/ywizz/ywizz.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/setup.sh"
 
@@ -488,7 +488,7 @@ header_tui "9/11  Optional devpacks (build-time)"
 info "These flags bake extra tooling into the image. Flipping them only takes"
 info "effect after ${secondary_accent}docker rmi llm-docker:latest${RESET} forces a rebuild."
 
-DEVPACK_NAMES=(INSTALL_SECURITY INSTALL_RUBY INSTALL_CPP INSTALL_LLVM_CLANG INSTALL_NS INSTALL_MEDIA)
+DEVPACK_NAMES=(INSTALL_SECURITY INSTALL_RUBY INSTALL_CPP INSTALL_LLVM_CLANG INSTALL_NS INSTALL_MEDIA INSTALL_BROWSING)
 DEVPACK_DESCS=(
   "pentest toolkit: nmap, sqlmap, nuclei, amass (go), nikto (git)"
   "Ruby stack: rbenv + ruby-build + cocoapods"
@@ -496,6 +496,7 @@ DEVPACK_DESCS=(
   "LLVM/Clang toolchain (superset of CPP)"
   "NativeScript CLI + n (Node version manager)"
   "Media tools: ffmpeg + sox + yt-dlp + pipx"
+  "Browsing: chromium-headless-shell + headful chromium + hyperframes skill"
 )
 
 # Defaults from current llm-docker.conf (only items currently set to "true").

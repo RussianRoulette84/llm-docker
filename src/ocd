@@ -43,16 +43,26 @@ if ! docker info > /dev/null 2>&1; then
     _log OCD "Docker is ready!"
 fi
 
-# Quick pre-scan: --build forces an image rebuild. run_setup only builds when
-# the image is missing, so we wipe both candidate tags first and let it rebuild.
+# Quick pre-scan for the two rebuild flags:
+#   --build         smart rebuild: re-runs install scripts inside the existing
+#                   image and `docker commit`s, skipping already-installed
+#                   tools (Go binaries, cargo crates, npm globals, etc.).
+#                   Layer-on-top — fast but accumulates cruft over time.
+#   --rebuild-force full rebuild from the Dockerfile: docker rmi + docker build.
+#                   Slow but produces a clean image.
 _user_requested_build=false
+_user_requested_force_rebuild=false
 for _arg in "$@"; do
-    if [ "$_arg" = "--build" ]; then
-        _user_requested_build=true
-        _log OCD "Rebuilding image (--build) — removing llm-docker-opencode:latest + llm-docker:latest..."
-        docker rmi llm-docker-opencode:latest llm-docker:latest 2>/dev/null || true
-        break
-    fi
+    case "$_arg" in
+        --rebuild-force)
+            _user_requested_force_rebuild=true
+            _log OCD "Force rebuild (--rebuild-force) — removing llm-docker-opencode:latest + llm-docker:latest..."
+            docker rmi llm-docker-opencode:latest llm-docker:latest 2>/dev/null || true
+            ;;
+        --build)
+            _user_requested_build=true
+            ;;
+    esac
 done
 unset _arg
 
@@ -82,12 +92,12 @@ done
 unset _arg
 
 if [ -n "$_tmux_flip_kvs" ]; then
-    if [ "$_user_requested_build" = true ]; then
-        _log OCD "Enabling for --build: ${_tmux_flip_labels}"
+    if [ "$_user_requested_build" = true ] || [ "$_user_requested_force_rebuild" = true ]; then
+        _log OCD "Enabling: ${_tmux_flip_labels}"
     else
         _log OCD "Tmux flag(s) requested but not baked into the image: ${_tmux_flip_labels}"
         if [ -t 0 ]; then
-            printf "  [ocd] Enable and rebuild image now? [Y/n] "
+            printf "  [ocd] Enable and rebuild image now (smart)? [Y/n] "
             read -r _ans
         else
             _ans="y"
@@ -98,6 +108,7 @@ if [ -n "$_tmux_flip_kvs" ]; then
                 exit 1
                 ;;
         esac
+        _user_requested_build=true
     fi
     for _kv in $_tmux_flip_kvs; do
         _k="${_kv%%=*}"; _v="${_kv#*=}"
@@ -111,19 +122,23 @@ if [ -n "$_tmux_flip_kvs" ]; then
             printf "\n%s=%s\n" "$_k" "$_v" >> "$SCRIPT_DIR/llm-docker.conf"
         fi
     done
-    if [ "$_user_requested_build" != true ]; then
-        _log OCD "llm-docker.conf updated — rebuilding image..."
-        docker rmi llm-docker-opencode:latest llm-docker:latest 2>/dev/null || true
-    fi
     unset _ans _kv _k _v
 fi
-unset _tmux_flip_kvs _tmux_flip_labels _user_requested_build
+unset _tmux_flip_kvs _tmux_flip_labels
 
 # Auto-setup on first run (dirs, .env, image).
 # Build the opencode-only image (llm-docker-opencode:latest). If install.sh
 # has already produced the combined llm-docker:latest, that's reused —
 # otherwise we skip the claude-code install entirely.
 run_setup opencode
+
+# Smart rebuild (--build): re-run install scripts inside the existing image
+# and commit. No-op when --rebuild-force already triggered a full build via
+# run_setup, since the image is now fresh.
+if [ "$_user_requested_build" = true ] && [ "$_user_requested_force_rebuild" != true ]; then
+    setup_image_incremental opencode || _log OCD ERROR "Smart rebuild reported errors — see logs/llm-docker.log"
+fi
+unset _user_requested_build _user_requested_force_rebuild
 
 # DOCKER_DIR = container-side parent for every mount (default /root).
 # WORKSPACE_DIR = optional host dir persistently mirrored at DOCKER_DIR/basename.
@@ -194,8 +209,8 @@ while [[ $# -gt 0 ]]; do
             CLEAN_CONTAINERS=true
             shift
             ;;
-        --build)
-            # Already handled by the pre-scan above (wipes image pre-run_setup).
+        --build|--rebuild-force)
+            # Already handled by the pre-scan above (smart rebuild / docker rmi).
             shift
             ;;
         -tt|--tmux-team)
@@ -279,10 +294,18 @@ CONTAINER LIFECYCLE
   --clean               Stop + remove any leftover llm-docker containers
                         before launching (filters on label
                         com.docker.compose.project=llm-docker).
-  --build               Force an image rebuild. Removes llm-docker-opencode:latest
-                        and llm-docker:latest, then run_setup rebuilds from
-                        Dockerfile. Use after editing Dockerfile / devpack /
-                        INSTALL_* flags in llm-docker.conf.
+  --build               Smart rebuild — re-runs the install scripts INSIDE the
+                        existing image and `docker commit`s the result. Skips
+                        already-installed tools (Go binaries, cargo crates, npm
+                        globals, ferox/nikto/codeman). Fast; use after flipping
+                        an INSTALL_* flag or editing install_devpack.sh /
+                        install_cli.sh. Falls back to a full build when no
+                        image exists yet.
+  --rebuild-force       Full rebuild from the Dockerfile — removes
+                        llm-docker-opencode:latest + llm-docker:latest, then
+                        rebuilds from scratch. Slow but clean. Use when --build
+                        cruft is bothering you, or when you've edited the
+                        Dockerfile itself.
 
 PASSTHROUGH
   --                    Everything after `--` is forwarded to opencode verbatim.

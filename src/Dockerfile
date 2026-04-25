@@ -97,18 +97,26 @@ RUN date -u +%Y-%m-%dT%H:%M:%SZ > /IMAGE_BUILD_DATE
 # NOTE: this MUST run before install_devpack.sh — Codeman's installer scans
 # PATH for claude/opencode and re-installs them from scratch if missing.
 ARG TOOL=both
+COPY llm-docker.conf /tmp/llm-docker.conf
 COPY docker/install_cli.sh /tmp/install_cli.sh
-RUN chmod +x /tmp/install_cli.sh && /tmp/install_cli.sh "$TOOL" && rm /tmp/install_cli.sh
+RUN chmod +x /tmp/install_cli.sh \
+    && set -a && . /tmp/llm-docker.conf && set +a \
+    && /tmp/install_cli.sh "$TOOL" \
+    && rm /tmp/install_cli.sh
 
 # Optional software groups — toggled via INSTALL_* in llm-docker.conf.
 # Must run AFTER the CLI install so Codeman's installer sees the existing
 # claude/opencode binaries and skips its own reinstall.
-COPY llm-docker.conf /tmp/llm-docker.conf
 COPY docker/install_devpack.sh /tmp/install_devpack.sh
 RUN chmod +x /tmp/install_devpack.sh \
     && set -a && . /tmp/llm-docker.conf && set +a \
     && /tmp/install_devpack.sh \
     && rm -f /tmp/install_devpack.sh /tmp/llm-docker.conf
+
+# Point HyperFrames at the headless-shell binary installed by INSTALL_BROWSING.
+# Harmless when the flag is off — env var just points at a non-existent path
+# and HyperFrames isn't installed either.
+ENV HYPERFRAMES_BROWSER_PATH=/usr/bin/chromium-headless-shell
 
 # SSH configuration script
 COPY docker/setup-ssh.sh /setup-ssh.sh

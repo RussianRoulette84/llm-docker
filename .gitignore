@@ -5,6 +5,7 @@
 # Build / test artifacts
 *.log
 logs/
+logs/
 dist/
 build/
 node_modules/

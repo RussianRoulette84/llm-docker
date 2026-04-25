@@ -24,14 +24,14 @@
 ## ASCI Art here
 ## ---------------------------------------------------------------------------------------
 # IFS= read -r -d '' var <<'EOF' ||:
-# ... 
+# ...
 # EOF cls; printf '%s' "$var";
 
 
 ##########################################################################################
 ## System Paths
 ##########################################################################################
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/bin:$HOME/.local/bin:$PATH"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME"
 
 ##########################################################################################
 ## Language
@@ -237,40 +237,6 @@ function dex() {
     docker exec -it "$container" bash 2>/dev/null || docker exec -it "$container" sh
 }
 
-##########################################################################################
-## SSH wrapper — auto-prepends root@ to bare hostnames
-##########################################################################################
-ssh() {
-    local args=()
-    local host_set=false
-
-    for arg in "$@"; do
-        if [[ "$host_set" == false && "$arg" != -* ]]; then
-            local prev=""
-            [[ ${#args[@]} -gt 0 ]] && prev="${args[-1]}"
-
-            local flag_takes_value=false
-            case "$prev" in
-                -p|-i|-l|-o|-F|-J|-L|-R|-D|-W|-b|-c|-e|-m|-S|-w|-E|-B|-I|-Q|-O)
-                    flag_takes_value=true ;;
-            esac
-
-            if $flag_takes_value; then
-                args+=("$arg")
-            elif [[ "$arg" != *@* ]]; then
-                args+=("root@$arg")
-                host_set=true
-            else
-                args+=("$arg")
-                host_set=true
-            fi
-        else
-            args+=("$arg")
-        fi
-    done
-
-    command ssh "${args[@]}"
-}
 
 ##########################################################################################
 ## fz — fuzzy file finder with preview

@@ -29,13 +29,13 @@ wait_for_condition_tui() {
     local timeout="${3:-60}"
     local fail_message="${4:-$message}"
     local acc=$(get_accent)
-    
+
     # Hide cursor
     printf "\033[?25l"
     trap 'printf "\033[?25h"' EXIT
 
     local start_time=$(date +%s)
-    
+
     # Animation Config: spinning wheel (◐◑◒◓) bouncing left-right (bar from progress_bar.sh)
     local width=$PROGRESS_BAR_WIDTH_DEFAULT
     local i=0
@@ -45,7 +45,7 @@ wait_for_condition_tui() {
     while true; do
         local now_ts=$(date +%s)
         local elapsed=$((now_ts - start_time))
-        
+
         # 1. Check Timeout
         if [ "$elapsed" -ge "$timeout" ]; then
              printf "\r\033[K"
@@ -85,7 +85,7 @@ wait_for_condition_tui() {
 
         # 4. Print: │  [ INFO ] Message... [···∙◦⊙◑·····] 9s/60s
         printf "\r%b %b %s %b[%b%b]" "$TUI_PREFIX" "${CYAN}[INFO]${RESET}" "$message" "$RESET" "$bar_str" "$RESET"
-        
+
         sleep 0.06
         i=$((i + 1))
     done
@@ -134,7 +134,7 @@ run_with_progress_bar() {
         if [[ -n "$_label" ]]; then
             printf "\r%b %b[%s]%b %b[%b%b] %s" "${TUI_PREFIX:-$(get_accent)}" "${_label_color}" "$_label" "$RESET" "$RESET" "$bar_str" "$RESET" "$message"
         else
-            printf "\r%b %b[%b%b] %s" "${TUI_PREFIX:-$(get_accent)}" "$RESET" "$bar_str" "$RESET" "$message"
+            printf "\r%b %b[%b%b] %s" "$x`{TUI_PREFIX:-$(get_accent)}" "$RESET" "$bar_str" "$RESET" "$message"
         fi
         sleep 0.06
         i=$((i + 1))

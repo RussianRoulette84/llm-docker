@@ -172,7 +172,8 @@ cld ./my-project 4 -c --slot 1 --delay 0.3 -a -- --permission-mode plan
 | `-tc` / `--tmux-codeman` | Launch the [Ark0N/Codeman](https://github.com/Ark0N/Codeman) web UI on `http://localhost:3000` — session management + real-time xterm.js terminals for Claude/OpenCode. Opt-in via `INSTALL_TMUX_CODEMAN`; the container auto-publishes port `3000` when this flag is used. |
 | `-tcl` / `--tmux-claude` | **cld only.** Launch [nielsgroen/claude-tmux](https://github.com/nielsgroen/claude-tmux) — a tmux popup session manager for Claude Code. Starts `claude` in a tmux session and pre-binds `Ctrl+b Ctrl+c` to the popup. Opt-in via `INSTALL_TMUX_CLAUDE`. |
 | `--clean` | Stop + remove any leftover `llm-docker` containers before launching. |
-| `--build` | Force an image rebuild — removes `llm-docker[-tool]:latest`, then `run_setup` rebuilds from Dockerfile. One-command version of `docker rmi … && cld`. |
+| `--build` | Smart rebuild — re-runs the install scripts INSIDE the existing image and `docker commit`s the result. Skips already-installed tools (Go binaries, cargo crates, npm globals, ferox/nikto/codeman). Falls back to full build when no image exists. |
+| `--rebuild-force` | Full rebuild from the Dockerfile — `docker rmi llm-docker[-tool]:latest` then a fresh `docker build`. Use when `--build` cruft is bothering you, or when you've edited the Dockerfile itself (smart can only re-run the install scripts). |
 | `--` | Everything after `--` passes through to the underlying tool verbatim. Example: `cld -- --permission-mode plan` → `claude --permission-mode plan`. |
 | `-h` / `--help` | Show command help. |
 
@@ -261,6 +262,7 @@ Config splits across two files in `src/`. Secrets live in `.env` (gitignored); e
 | `INSTALL_NS`                    | Build-time: NativeScript CLI + `n` node version manager                 | `false`                   |
 | `INSTALL_MEDIA`                 | Build-time: ffmpeg + sox + yt-dlp + pipx                                | `false`                   |
 | `INSTALL_QUAKE`                 | Build-time: Clang + make + SDL2 for the Quake port                      | `false`                   |
+| `INSTALL_BROWSING`              | Build-time: chromium-headless-shell + headful chromium + auto-installs heygen-com/hyperframes Claude skill | `true`        |
 | `INSTALL_TMUX_VANILLA`          | Build-time: bakes `apt tmux` — required for any `-t*` flag              | `true`                    |
 | `INSTALL_TMUX_TEAM`             | Build-time: team-mode helper scripts (`cld -tt` multi-pane layouts)     | `true`                    |
 | `INSTALL_TMUX_RECON`            | Build-time: gavraz/recon (`cld -tr`)                                    | `false`                   |
