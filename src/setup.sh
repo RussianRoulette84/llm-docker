@@ -902,11 +902,15 @@ setup_image_incremental() {
         return 1
     fi
 
-    # Commit in place. ENTRYPOINT/CMD/ENV/WORKDIR are preserved from the
-    # source image (we overrode entrypoint via `docker run --entrypoint sleep`,
-    # not via `docker commit --change`, so the committed image keeps the
-    # original docker-entrypoint.sh as its ENTRYPOINT).
-    if ! docker commit "$container" "$build_tag" >/dev/null; then
+    # Commit in place. The container was started with `--entrypoint sleep`,
+    # and docker commit inherits that override into the new image — so we
+    # MUST restore the original ENTRYPOINT (and clear the stray `1800` CMD)
+    # via --change, otherwise the next `cld`/`ocd` launch runs `sleep <args>`
+    # and dies with `sleep: invalid time interval '<INIT_PROMPT>'`.
+    if ! docker commit \
+            --change 'ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]' \
+            --change 'CMD []' \
+            "$container" "$build_tag" >/dev/null; then
         _log SETUP ERROR "docker commit failed; image left as-is."
         docker rm -f "$container" >/dev/null 2>&1 || true
         return 1

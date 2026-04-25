@@ -1,6 +1,5 @@
 {
   "permissions": {
-    "defaultMode": "default",
     "allow": [
       "Read(/**)",
       "Edit(/**)",
@@ -9,11 +8,15 @@
       "WebFetch(domain:opencode.ai)",
       "WebFetch(domain:claude.com)",
       "WebFetch(domain:github.com/sst/opencode)",
+      "Bash(*)",
       "Bash(sed *)",
       "Bash(trash *)",
       "Bash(trash-put *)",
-      "Bash(gtrash *)"
+      "Bash(gtrash *)",
+      "Bash(git stash *)",
+      "Bash(git add *)"
     ],
-    "deny": []
+    "deny": [],
+    "defaultMode": "default"
   }
 }

@@ -8,10 +8,10 @@
   - `cld --build` / `ocd --build` no longer wipes the image. Instead it spins a temp container off the existing image, copies the latest `install_cli.sh` + `install_devpack.sh` + `llm-docker.conf` in, re-runs them with skip-if-installed guards, and `docker commit`s the result. Heavy stuff (5×Go installs for security tooling, recon/claude-tmux cargo builds, codeman, omz/p10k clones, ferox/nikto, npm globals) gets skipped when already present — so flipping a single `INSTALL_*` flag rebuilds in seconds instead of half an hour.
   - `cld --rebuild-force` / `ocd --rebuild-force` is the old `--build` behavior: `docker rmi` + full `docker build` from the Dockerfile. Use when smart-rebuild cruft is piling up or you've edited the Dockerfile itself.
   - `install_cli.sh` and `install_devpack.sh` are now idempotent: every Go install / cargo install / curl|bash installer / git clone / npm-global / hyperframes skill add checks for an existing binary, marker file, or directory before doing work.
-- **Honest build progress bar**: the docker-build spinner's percentage is now driven by counting actual completion markers in the build log (apt's `Setting up <pkg>`, npm's `added N packages`, pip/gem's `Successfully installed`, cargo's `Installing /…`, git's `Resolving deltas: 100%`) divided by a pre-computed total of install ops parsed from the Dockerfile + `SW_*_APT` arrays + the enabled `INSTALL_*` flags. No more wall-time guesses; no more "90% then back to 60%" jumps.
 
 ## Bug fixes
 - `llm-docker/src/llm-container-claude-settings.json` was for my local setup accidentally. Now it's no restrictions.
+- **Honest build progress bar**: the docker-build spinner's percentage is now driven by counting actual completion markers in the build log (apt's `Setting up <pkg>`, npm's `added N packages`, pip/gem's `Successfully installed`, cargo's `Installing /…`, git's `Resolving deltas: 100%`) divided by a pre-computed total of install ops parsed from the Dockerfile + `SW_*_APT` arrays + the enabled `INSTALL_*` flags. No more wall-time guesses; no more "90% then back to 60%" jumps.
 
 # v2.0 (2026-04-24)
 
