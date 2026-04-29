@@ -6,6 +6,7 @@
 ![Docker](https://img.shields.io/badge/Docker-Isolated-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![Security](https://img.shields.io/badge/Security-Sandboxed-8A2BE2?style=for-the-badge&logo=lock&logoColor=white)
 ![Shell](https://img.shields.io/badge/Shell-Automated-4EAA25?style=for-the-badge&logo=gnu-bash&logoColor=white)
+
 ![Logo](logo.png)
 
 ---
@@ -34,6 +35,7 @@ Then just run:
 *   **OpenCode**: `ocd`
 
 ![OpenCode](docs/llm-docker-screenshots/scr-ocd.png)
+
 ![Claude Code](docs/llm-docker-screenshots/scr-cld-tt.png)
 
 ---
