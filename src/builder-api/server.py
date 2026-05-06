@@ -38,9 +38,12 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import banner as _banner                       # noqa: E402
 import config as _config                       # noqa: E402
 from build_queue import BuildQueue, QueueFull  # noqa: E402
 from events import EventStore                  # noqa: E402
+from hot_reload import ConfigWatcher           # noqa: E402
+import jobs as _jobs                           # noqa: E402
 from logs import LogStore                      # noqa: E402
 from plugin import load as load_plugin         # noqa: E402
 from runtime import RuntimeManager             # noqa: E402
@@ -92,7 +95,37 @@ class AppContext:
 
         self.plugin_handlers = self.plugin.handlers()
 
+        # Live event tail: every EventStore.append() surfaces as one
+        # colored line on stderr. Subscribed BEFORE the first event so
+        # `server_started` lands in the user's view too.
+        self.events.subscribe(_banner.event_line)
+
+        # Hot-reload watcher. Started in main() after binding, so initial
+        # boot failures still surface as a normal SystemExit rather than
+        # a daemon thread eating the error.
+        self.config_watcher = ConfigWatcher(on_reload=self._apply_reload)
+
+    def _apply_reload(self, new_cfg) -> None:
+        """Atomic-swap callback for ConfigWatcher. Runs on the watcher
+        thread. Pushes the new cfg into every subsystem that supports
+        in-place reload; logs subsystems that don't (runtime, plugin)
+        as 'unchanged'."""
+        old = self.cfg
+        self.cfg = new_cfg
+        self.build_queue.update_cfg(new_cfg)
+        self.log_store.update_aliases(new_cfg.log_aliases)
+        self.events.append(
+            "config_reloaded",
+            {
+                "jobs": list(new_cfg.jobs.keys()),
+                "log_aliases": sorted(new_cfg.log_aliases.keys()),
+                "config_mtime": new_cfg.config_mtime,
+                "previous_mtime": old.config_mtime,
+            },
+        )
+
     def shutdown(self) -> None:
+        self.config_watcher.stop()
         self.build_queue.shutdown()
         self.runtime.shutdown()
 
@@ -149,10 +182,25 @@ class BuilderHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def log_message(self, fmt: str, *args) -> None:
+        # Dim every HTTP access line so it falls into the visual background
+        # behind the colored event tail. 4xx / 5xx surface in red. The
+        # interesting state changes (build_*, config_reloaded) come through
+        # banner.event_line via the EventStore subscription, so we don't
+        # repeat ourselves here.
         agent = self.headers.get("X-Agent-ID") or "-"
         ip = self.client_address[0] if self.client_address else "?"
+        line = fmt % args
+        # `args` for a request line is (request, status, size); status is the
+        # second token in args[1]. We sniff it once for color choice.
+        try:
+            code = int(args[1])
+        except (IndexError, ValueError, TypeError):
+            code = 200
+        c = _banner.GREY if code < 400 else _banner.RED
         sys.stderr.write(
-            f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {ip} {agent} {fmt % args}\n"
+            f"  {_banner.DIM}{time.strftime('%H:%M:%S')}{_banner.RST}  "
+            f"{c}{_banner.DIM}· http{' ':<19}{_banner.RST}  "
+            f"{_banner.GREY}{ip} {agent}  {line}{_banner.RST}\n"
         )
 
     # ------------------------------------------------------------------
@@ -201,12 +249,23 @@ class BuilderHandler(BaseHTTPRequestHandler):
         if route == ("POST", "/build"):
             if not self._maybe_auth(read=False):
                 return
-            self._serve_json(*self._ep_build_post())
+            self._serve_json(*self._ep_build_post(query))
             return
         if route == ("GET", "/build_status"):
             if not self._maybe_auth(read=True):
                 return
             self._serve_json(*self._ep_build_status(query))
+            return
+        if method == "POST" and path.startswith("/job/"):
+            if not self._maybe_auth(read=False):
+                return
+            job_name = path[len("/job/"):]
+            self._serve_json(*self._ep_job_post(job_name, query))
+            return
+        if route == ("GET", "/jobs"):
+            if not self._maybe_auth(read=True):
+                return
+            self._serve_json(200, self._ep_jobs())
             return
         if route == ("GET", "/queue"):
             if not self._maybe_auth(read=True):
@@ -292,13 +351,28 @@ class BuilderHandler(BaseHTTPRequestHandler):
             "current_build": current.to_public() if current else None,
         }
 
-    def _ep_build_post(self) -> tuple[int, dict]:
+    def _ep_build_post(self, query: dict) -> tuple[int, dict]:
         body = self._read_json_body()
         if body is None:
             return 400, {"error": "invalid JSON body"}
 
         args = body.get("args", [])
         agent_id = body.get("agent_id") or self.headers.get("X-Agent-ID") or ""
+
+        # Dryrun: validate the args against the whitelist but don't enqueue.
+        # Returns the resolved argv that WOULD run.
+        if _is_truthy_query(query, "dryrun"):
+            try:
+                validated = self.app.build_queue._validate_args(args)
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, {
+                "dryrun": True,
+                "would_run": [self.app.cfg.build.command, *validated],
+                "cwd": str(self.app.cfg.project_root),
+                "timeout_s": self.app.cfg.build.timeout_s,
+            }
+
         try:
             entry = self.app.build_queue.enqueue(
                 args=args,
@@ -309,6 +383,82 @@ class BuilderHandler(BaseHTTPRequestHandler):
         except QueueFull as e:
             return 429, {"error": str(e)}
         return 202, {"queue_id": entry.id, **entry.to_public()}
+
+    def _ep_job_post(self, job_name: str, query: dict) -> tuple[int, dict]:
+        cfg = self.app.cfg
+        job = cfg.jobs.get(job_name)
+        if job is None:
+            return 404, {
+                "error": "unknown_job",
+                "name": job_name,
+                "available": sorted(cfg.jobs.keys()),
+            }
+
+        body = self._read_json_body()
+        if body is None:
+            return 400, {"error": "invalid JSON body"}
+
+        params = body.get("params") or {}
+        agent_id = body.get("agent_id") or self.headers.get("X-Agent-ID") or ""
+
+        # 1. Param validation against placeholders.
+        try:
+            argv, normalized = _jobs.validate_and_substitute(job, params)
+        except _jobs.ValidationError as e:
+            return 400, e.to_response(f"/job/{job_name}")
+
+        # 2. Resolve command + verify sha256 (if pinned). Both faults are
+        # 412 Precondition Failed — distinct status from validation 400 so
+        # MCP clients can render an integrity violation differently.
+        try:
+            resolved = _jobs.verify_command_hash(job, cfg.project_root)
+        except _jobs.CommandHashMismatch as e:
+            return 412, e.to_response()
+        except _jobs.CommandNotFound as e:
+            return 412, e.to_response()
+
+        # 3. Dryrun shortcut: report what WOULD run without enqueueing.
+        if _is_truthy_query(query, "dryrun"):
+            return 200, {
+                "dryrun": True,
+                "job": job_name,
+                "would_run": [str(resolved), *argv],
+                "cwd": str(cfg.project_root),
+                "timeout_s": job.timeout_s,
+                "matched_placeholders": normalized,
+            }
+
+        # 4. Enqueue (or get existing entry under dedupe window).
+        try:
+            entry = self.app.build_queue.enqueue_job(
+                args=argv,
+                command=str(resolved),
+                timeout_s=job.timeout_s,
+                job_name=job_name,
+                params=normalized,
+                agent_id=str(agent_id),
+            )
+        except QueueFull as e:
+            return 429, {"error": str(e)}
+        return 202, {"queue_id": entry.id, **entry.to_public()}
+
+    def _ep_jobs(self) -> dict:
+        cfg = self.app.cfg
+        out: dict = {
+            "jobs": {name: job.to_public() for name, job in cfg.jobs.items()},
+            "config_version": "0.2",
+            "config_mtime": cfg.config_mtime,
+        }
+        # Expose the legacy [build] config in the same response so MCP
+        # clients can offer both old and new project shapes from one
+        # introspection call.
+        out["build"] = {
+            "command": cfg.build.command,
+            "allowed_args": list(cfg.build.allowed_args),
+            "timeout_s": cfg.build.timeout_s,
+            "dedupe_window_s": cfg.build.dedupe_window_s,
+        }
+        return out
 
     def _ep_build_status(self, query: dict) -> tuple[int, dict]:
         ids = query.get("id") or []
@@ -495,6 +645,16 @@ class BuilderHandler(BaseHTTPRequestHandler):
             pass
 
 
+def _is_truthy_query(query: dict, name: str) -> bool:
+    """`?dryrun=1` style flag check. Accepts 1/true/yes/on (case-insensitive)
+    and bare `?dryrun` (zero-length value). Anything else is falsy."""
+    vals = query.get(name)
+    if not vals:
+        return False
+    v = (vals[0] or "").strip().lower()
+    return v in ("", "1", "true", "yes", "on")
+
+
 # ---------------------------------------------------------------------------
 # main()
 # ---------------------------------------------------------------------------
@@ -514,15 +674,17 @@ def main() -> int:
     server_holder: dict = {}
 
     def _graceful_exit(signum, frame):  # type: ignore[no-untyped-def]
-        sys.stderr.write(f"\n[builder-api] received signal {signum}, shutting down...\n")
-        try:
-            if "server" in server_holder:
-                server_holder["server"].shutdown()
-        except Exception:
-            pass
-        app.shutdown()
-        # os._exit to ensure we're out before any daemon thread hangs on a
-        # socket. Our critical state (runtime kill, build cancel) already ran.
+        # Signal handlers run on the main thread, which is also the thread
+        # blocked in `serve_forever()`. Calling `server.shutdown()` here
+        # deadlocks (shutdown waits for serve_forever to return, which can't
+        # because the main thread is stuck in the signal handler). Same for
+        # `app.shutdown()` if any subsystem joins on the main thread.
+        # So: just `os._exit(0)` immediately. Daemon threads (build worker,
+        # config watcher, runtime) die with the process; in-flight subprocs
+        # were spawned with `start_new_session=True` so they're in their
+        # own process group and survive briefly until docker compose / make
+        # / etc. finish naturally.
+        sys.stderr.write(f"\n[builder-api] received signal {signum}, exiting.\n")
         os._exit(0)
 
     signal.signal(signal.SIGINT, _graceful_exit)
@@ -535,6 +697,9 @@ def main() -> int:
         return 1
     server_holder["server"] = server
 
+    # Banner first, then the event — otherwise `server_started` would
+    # print on top of the ASCII art via the live subscription.
+    _banner.show_banner(cfg.name, cfg.bind, cfg.port, len(cfg.jobs))
     app.events.append(
         "server_started",
         {
@@ -546,10 +711,10 @@ def main() -> int:
             "has_plugin": cfg.plugin_path is not None,
         },
     )
-    sys.stderr.write(
-        f"[builder-api] {cfg.name!r} listening on {cfg.bind}:{cfg.port} "
-        f"(auth_reads={cfg.auth_reads}, plugin={cfg.plugin_path})\n"
-    )
+
+    # Start the hot-reload watcher AFTER bind succeeded. If we'd started
+    # earlier and the bind failed, the daemon thread would linger.
+    app.config_watcher.start(cfg)
 
     try:
         server.serve_forever()

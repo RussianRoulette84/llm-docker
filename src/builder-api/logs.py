@@ -32,6 +32,11 @@ class LogStore:
     def alias_names(self) -> Iterable[str]:
         return self._aliases.keys()
 
+    def update_aliases(self, aliases: dict[str, Path]) -> None:
+        """Swap the alias map at hot-reload. New aliases are visible
+        immediately; removed aliases start returning KeyError on next call."""
+        self._aliases = dict(aliases)
+
     def path_for(self, alias: str) -> Path:
         if alias not in self._aliases:
             raise KeyError(alias)

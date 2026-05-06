@@ -2,15 +2,21 @@
 
 set -e
 
-# --- Yaro-only hack: inject KeePassXC secrets via env-gorilla before launch.
+# --- env-gorilla integration: inject KeePassXC-backed secrets before launch.
 # Re-execs self through `env-gorilla llm-docker --` so API keys live in the
-# keystore, not in .env. Guard var prevents an infinite re-exec loop.
-if [ "${USER:-}" = "yaro" ] \
-   && [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
-   && command -v env-gorilla >/dev/null 2>&1; then
+# keystore instead of (or alongside) .env. Triggers when env-gorilla is on
+# PATH AND either:
+#   - USER=yaro  → always inject (Yaro's machine; gorilla overrides .env), OR
+#   - .env missing → fallback for any user who hasn't seeded .env locally.
+# Guard var prevents an infinite re-exec loop.
+_self_dir="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
+if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
+   && command -v env-gorilla >/dev/null 2>&1 \
+   && { [ "${USER:-}" = "yaro" ] || [ ! -f "$_self_dir/.env" ]; }; then
     export LLM_DOCKER_ENV_GORILLA=1
     exec env-gorilla llm-docker -- "$0" "$@"
 fi
+unset _self_dir
 
 SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
 
@@ -178,7 +184,8 @@ WINDOW_DELAY=0.5
 CONTINUE_SESSION=false
 RESUME_SESSION=""
 SLOT=""
-START_API=false   # --api / -a toggle; see _maybe_start_api below
+START_API=false           # --api / -a toggle; see _maybe_start_api below
+START_API_EXPLICIT=false  # set by -a/--api so a missing flag falls back to conf's BUILDER_API_AUTOSTART
 CLEAN_CONTAINERS=false   # --clean: stop/remove leftover llm-docker containers
 USE_TMUX=false    # -t / --tmux: wrap claude launch inside a tmux session
 TMUX_TEAM=false   # -tt / --tmux-team: multi-pane tmux layout inside one container
@@ -257,6 +264,7 @@ while [[ $# -gt 0 ]]; do
         -a|--api)
             # -a alone = true. -a true/false = explicit. Anything else after
             # the flag is treated as the next arg (bare -a means "on").
+            START_API_EXPLICIT=true
             if [[ -n "$2" && "$2" =~ ^(true|false|yes|no|on|off|1|0)$ ]]; then
                 case "$2" in
                     true|yes|on|1) START_API=true ;;
@@ -768,6 +776,15 @@ run_claude_container() {
 
 # --api: start the builder-api BEFORE fan-out so we spawn it exactly once
 # (multi-llm-docker.applescript's children don't inherit START_API).
+# When -a/--api wasn't given, fall back to BUILDER_API_AUTOSTART from
+# llm-docker.conf so users can opt in once instead of typing -a every launch.
+if [ "$START_API_EXPLICIT" = false ]; then
+    _autostart="$(_read_env_var BUILDER_API_AUTOSTART "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
+    case "$(printf '%s' "$_autostart" | tr '[:upper:]' '[:lower:]')" in
+        true|yes|on|1) START_API=true ;;
+    esac
+    unset _autostart
+fi
 _maybe_start_api "$CURRENT_DIR"
 
 # If WINDOW_COUNT > 1 and we're on macOS, use multi-llm-docker layout

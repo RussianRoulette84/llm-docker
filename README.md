@@ -451,11 +451,10 @@ Optional host-side daemon the Docker container can call to build code, run/resta
 * ✅ **Optional plugin** - drop a `builder_plugin.py` in the project root and reference it with `plugin = "…"` in config. Plugins run unrestricted in the server process; this is a trust boundary.
 
 ## 🚧 Roadmap
-
-* **Server Mode**: SSH -> Run OpenCode/Claude Code as a server for IDE integration (port 49455)
+* **Server Mode**: TEST: SSH -> Run OpenCode/Claude Code as a server for IDE integration (port 49455)
+* Add `hyperframes` support :D
 * "Claude Team" support
 * encrypt/decrypt ~/llm-docker
 * switch to `node` user in `/home/node`
-* **GIT (optional)**: Securely forward your Git credentials to the container
 * HTTPS / TLS
-* **KeepPassXC support**: documentate
+* **GIT (optional)**: Securely forward your Git credentials to the container

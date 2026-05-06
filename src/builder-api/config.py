@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from jobs import Job, JobConfigError, parse_jobs
+
 
 CONFIG_NAMES = [
     ".builder-api.toml",
@@ -40,6 +42,8 @@ class BuildCfg:
     allowed_args: tuple[str, ...] = ()
     timeout_s: int = 900          # per-build subprocess kill deadline
     max_pending: int = 32         # deque cap; enqueue beyond returns 429
+    dedupe_window_s: float = 5.0  # same-fingerprint enqueues inside window
+                                  # collapse onto the existing queue_id
 
 
 @dataclass
@@ -89,6 +93,16 @@ class Config:
 
     # Plugin file (absolute path) if declared; else None.
     plugin_path: Optional[Path] = None
+
+    # `[jobs.<name>]` template registry. Empty dict = no templates declared
+    # (the project uses only legacy `[build]`). Populated at load.
+    jobs: dict[str, Job] = field(default_factory=dict)
+
+    # mtime of the source config file at load time. Hot-reload uses this
+    # as the "last seen" stamp; clients can inspect it via GET /jobs to
+    # detect when their cached schemas are stale.
+    config_path: Optional[Path] = None
+    config_mtime: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -231,12 +245,30 @@ def _build_config(raw: dict, root: Path, path: Path) -> Config:
         raise ConfigError(
             f"{path.name}: [build].allowed_args must be a list of strings"
         )
+    dedupe_window_raw = build_raw.get("dedupe_window_s", 5.0)
+    try:
+        dedupe_window_s = float(dedupe_window_raw)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"{path.name}: [build].dedupe_window_s must be a number"
+        )
+    if dedupe_window_s < 0:
+        raise ConfigError(
+            f"{path.name}: [build].dedupe_window_s must be >= 0"
+        )
     build = BuildCfg(
         command=command,
         allowed_args=tuple(allowed_args_raw),
         timeout_s=int(build_raw.get("timeout_s") or 900),
         max_pending=max(1, int(build_raw.get("max_pending") or 32)),
+        dedupe_window_s=dedupe_window_s,
     )
+
+    # --- jobs (optional) ---
+    try:
+        jobs_table = parse_jobs(raw.get("jobs"), file_label=path.name)
+    except JobConfigError as e:
+        raise ConfigError(str(e))
 
     # --- runtime (optional) ---
     runtime_raw = raw.get("runtime") or {}
@@ -309,6 +341,11 @@ def _build_config(raw: dict, root: Path, path: Path) -> Config:
             must_exist=True,
         )
 
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+
     return Config(
         name=name,
         bind=bind,
@@ -322,6 +359,9 @@ def _build_config(raw: dict, root: Path, path: Path) -> Config:
         security=security,
         log_aliases=log_aliases,
         plugin_path=plugin_path,
+        jobs=jobs_table,
+        config_path=path,
+        config_mtime=mtime,
     )
 
 

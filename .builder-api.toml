@@ -1,0 +1,36 @@
+# builder-api config for the llm-docker repo itself.
+# Lets you boot the daemon from this dir (`cld -a` or `python3 src/builder-api/server.py`)
+# and gives you a few sanity-check jobs while developing builder-api / launchers.
+
+name = "llm-docker"
+bind = "127.0.0.1"
+port = 6666
+password = "${BUILDER_API_PASSWORD}"
+
+[build]
+command         = "/bin/true"
+allowed_args    = []
+timeout_s       = 5
+dedupe_window_s = 5
+
+# ─── Dev jobs ───────────────────────────────────────────────────────────
+
+[jobs.lint-shell]
+command     = "/bin/bash"
+args        = ["-n", "{file}"]
+timeout_s   = 10
+description = "Bash -n syntax check on a tracked shell script"
+[jobs.lint-shell.placeholders.file]
+regex       = "^src/(cld|ocd|install\\.sh|setup\\.sh|builder-api/run-local\\.sh|docker/docker-entrypoint\\.sh|docker/zprofile|docker/install_cli\\.sh|docker/install_devpack\\.sh)$"
+required    = true
+description = "One of the tracked shell scripts under src/"
+
+[jobs.syntax-py]
+command     = "python3"
+args        = ["-m", "py_compile", "{file}"]
+timeout_s   = 10
+description = "Byte-compile a builder-api Python file (catches syntax errors)"
+[jobs.syntax-py.placeholders.file]
+regex       = "^src/builder-api/(server|config|build_queue|jobs|hot_reload|banner|events|logs|runtime|security|plugin|ws|client)\\.py$"
+required    = true
+description = "Path to a builder-api .py file under src/"

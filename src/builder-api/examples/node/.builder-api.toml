@@ -1,0 +1,73 @@
+# Example builder-api config for a Node.js / TypeScript project.
+# Copy to your project root (alongside package.json), then start the
+# daemon with `cld -a` or `python3 server.py`.
+
+name = "node-app"
+bind = "127.0.0.1"
+port = 6666
+password = "${BUILDER_API_PASSWORD}"
+
+[build]
+command         = "npm"
+allowed_args    = ["run", "build", "test", "lint", "ci"]
+timeout_s       = 300
+dedupe_window_s = 5
+
+[logs]
+build = "logs/build.log"
+test  = "logs/test.log"
+
+# ─── Jobs ───────────────────────────────────────────────────────────────
+
+[jobs.test]
+command     = "npm"
+args        = ["test"]
+timeout_s   = 300
+description = "Run the full test suite"
+
+[jobs.test-pattern]
+command     = "npx"
+args        = ["jest", "-t", "{pattern}"]
+timeout_s   = 300
+description = "Run jest tests whose name matches a substring"
+[jobs.test-pattern.placeholders.pattern]
+regex       = "^[A-Za-z0-9 _-]{1,80}$"
+max_len     = 80
+required    = true
+description = "Substring matched against test names (safe charset only)"
+
+[jobs.build]
+command     = "npm"
+args        = ["run", "build"]
+timeout_s   = 300
+description = "Build for production"
+
+[jobs.lint]
+command     = "npm"
+args        = ["run", "lint"]
+timeout_s   = 60
+description = "Run the linter"
+
+[jobs.lint-fix]
+command     = "npm"
+args        = ["run", "lint", "--", "--fix"]
+timeout_s   = 60
+description = "Run the linter and apply auto-fixes"
+
+[jobs.dev]
+command     = "npm"
+args        = ["run", "dev"]
+timeout_s   = 5
+description = "Sanity-launch the dev server (short timeout — use [runtime] for long-running)"
+
+# Run a single test file. Path validated against project subdirs.
+[jobs.test-file]
+command     = "npx"
+args        = ["jest", "{file}"]
+timeout_s   = 300
+description = "Run all tests in a specific file"
+[jobs.test-file.placeholders.file]
+regex       = "^(src|test|tests|__tests__)/[A-Za-z0-9_./-]{1,200}\\.(test|spec)\\.(ts|tsx|js|jsx)$"
+max_len     = 240
+required    = true
+description = "Path under src/ or test/ ending in .test.{ts,tsx,js,jsx}"

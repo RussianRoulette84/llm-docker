@@ -1,3 +1,34 @@
+# v2.2 (2026-05-06)
+
+## Builder API 
+
+Tested and works with Job templates. You can connect this API to your project MCP that Claude Code uses.
+
+- **`[jobs.<name>]` blocks** with pattern-validated parameters, length caps, optional integrity pin.
+- **Hot-reload**: edit config, daemon picks it up in ~1.5s.
+- **Dedupe window**: same op twice in 5s collapses onto one job.
+- **`?dryrun=1`**: returns what would run, without running.
+- **`GET /jobs`** introspection with `config_mtime` for cache invalidation.
+- **Locked error shapes** (400 / 404 / 412).
+- Examples bundled: Node, PHP+compose, sample game project.
+
+# MiSC
+- [BUG FIX] launchers crashed on default macOS bash with `bad substitution`. Swapped for portable.
+- [NEW/OPTIONAL] **env-gorilla auto-injection**: no local secrets file → reach for `env-gorilla` if installed. Works
+for `cld`, `ocd`, and the builder-api launcher.
+
+## Daemon stability
+
+- [BUG FIX] Ctrl-C now actually exits (was deadlocking).
+- [BUG FIX] finished builds crashed the response (deep-copy on a lock).
+- [BUG FIX] empty argument whitelist now means "none allowed", not "any allowed".
+
+## Onboarding doc + examples + repo-level config
+
+- **`docs/00-LLM-DOCKER.md`**: read-this-first doc.
+- Per-stack example configs (Node / PHP+compose / sample game).
+- Repo-level config with two dev sanity-check jobs.
+
 # v2.1 (2026-04-25)
 
 ## New

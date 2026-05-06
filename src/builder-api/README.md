@@ -34,7 +34,9 @@ print(res["log_tail"])              # last 40 lines of build.log
 |--------|---------------------------------|---------|
 | GET    | `/`                             | Health + name + bind + port |
 | GET    | `/status`                       | Runtime PID, uptime, current build |
-| POST   | `/build`                        | Enqueue a build, returns `queue_id` |
+| GET    | `/jobs`                         | Job catalog for MCP / client introspection |
+| POST   | `/build[?dryrun=1]`             | Enqueue a legacy `[build]` run, returns `queue_id` |
+| POST   | `/job/<name>[?dryrun=1]`        | Enqueue a `[jobs.<name>]` template invocation |
 | GET    | `/build_status?id=&wait=N`      | Long-poll status (up to 60s), `log_tail` on finish |
 | GET    | `/queue`                        | `{current, pending[], history[]}` |
 | DELETE | `/queue/<id>`                   | Cancel a pending build |
@@ -100,9 +102,11 @@ Core keys:
 | `port`              | TCP port (default 6666) |
 | `password`          | API password. **Required** when `bind != 127.0.0.1`. Use `${BUILDER_API_PASSWORD}` to pull from env. |
 | `auth_reads`        | Require auth on GETs too. Defaults `true` when bound non-loopback, else `false` |
-| `[build].command`   | The one command the API is allowed to run for builds |
+| `[build].command`   | The one command the API is allowed to run for builds (legacy single-command shape) |
 | `[build].allowed_args` | Closed whitelist of flag strings `[build].command` may receive from the API |
 | `[build].timeout_s` | Hard kill after this many seconds (default 900) |
+| `[build].dedupe_window_s` | Same fingerprint within this window collapses onto the existing `queue_id` (default 5; 0 disables) |
+| `[jobs.<name>]`     | Recommended shape for multi-operation projects — see [Job templates](#job-templates) below |
 | `[logs].<alias>`    | Maps an alias name to a file path under the project root |
 | `[runtime].enabled` | Turn `/run` and `/stop` on |
 | `[runtime].start_command` | The runtime process to launch (e.g. `"./my-app --server"`) |
@@ -114,6 +118,182 @@ Core keys:
 
 Every path in the config is resolved against the project root at boot and
 the server refuses to start if any of them escape the project tree.
+
+### Hot-reload
+
+The daemon polls `.builder-api.toml`'s mtime every ~1.5s. When it changes,
+the file is re-parsed and (on success) atomically swapped into place. The
+following take effect for **new** enqueues:
+
+- `[jobs.*]` — new templates available immediately via `POST /job/<name>`
+- `[build].command`, `[build].allowed_args`, `[build].timeout_s`,
+  `[build].max_pending`, `[build].dedupe_window_s`
+- `[logs].*` — new aliases reachable, removed aliases start returning 404
+
+Already-running builds keep their snapshotted command + timeout — a hot
+reload won't yank a build mid-flight. If the new file fails to parse,
+the daemon logs the error and keeps the previous config in place.
+
+The following **require a daemon restart** (won't hot-reload):
+
+- `[runtime]`  — already-running processes can't be retroactively rebound
+- `[security]` — auth lockout state and rate limiters are in-memory
+- `[events].path` — opening a different jsonl midway corrupts ordering
+- `plugin = "..."` — plugin imports register state at load time
+
+`config_mtime` is exposed via `GET /jobs` so MCP clients can cheaply
+detect when their cached schema is stale.
+
+## Job templates
+
+`[jobs.<name>]` is the recommended shape for projects with more than one
+operation. Each block declares one named job with its own command, argv
+template, placeholder regex/length caps, optional sha256 pin, and per-job
+timeout. Same closed-whitelist security model as `[build]` — argv form
+only, no shell, placeholders fully validated before execvp.
+
+### Schema
+
+```toml
+[jobs.<name>]
+command     = "vendor/bin/phpunit"   # executable, resolved at request time
+args        = ["--filter", "{test}"] # argv tail; "{name}" must be a STANDALONE element
+timeout_s   = 60                     # default 60 (lower than build's 900 because most jobs are short)
+description = "..."                  # optional; surfaces in /jobs and MCP tool docs
+sha256      = "<64-char hex>"        # optional; integrity check on the resolved command file
+
+[jobs.<name>.placeholders.<key>]
+regex       = "^[A-Za-z0-9_]+$"      # required; Python regex, must fullmatch the value
+max_len     = 200                    # default 200
+required    = true                   # default true; false → omitting drops the corresponding argv slot
+description = "..."                  # optional; flows into MCP per-param docs
+```
+
+### Constraints enforced at config load
+
+The daemon refuses to start if any of these are violated:
+
+- placeholder names match `^[A-Za-z_][A-Za-z0-9_]*$`
+- every `{name}` reference in `args` resolves to a declared placeholder
+- placeholders are **standalone array elements** — `args = ["--filter={test}"]`
+  or `args = ["pre-{test}-suf"]` are rejected. This forces the argv-form
+  pattern that prevents accidental shell-style interpolation
+- every declared placeholder is referenced (no dead schema entries)
+- every placeholder regex compiles
+- if `sha256` is set, it's exactly 64 chars of lowercase hex
+- `timeout_s >= 1`
+
+### Calling a job
+
+```bash
+curl -X POST http://127.0.0.1:6666/job/phpunit \
+  -H "X-Builder-API-Password: $BUILDER_API_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -d '{"params": {"test": "PinCreateTest"}, "agent_id": "my-mcp"}'
+```
+
+Response: `202 Accepted` with the queue entry, including `queue_id`,
+`job_name`, the validated `params`, the resolved `command`, and the
+snapshotted `timeout_s`. Poll `GET /build_status?id=<queue_id>&wait=30`
+to long-poll for completion.
+
+Add `?dryrun=1` to validate + return what would run, without enqueueing:
+
+```bash
+curl -X POST 'http://127.0.0.1:6666/job/phpunit?dryrun=1' \
+  -H "X-Builder-API-Password: $BUILDER_API_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -d '{"params":{"test":"PinCreateTest"}}'
+# {"dryrun": true, "job": "phpunit", "would_run": ["vendor/bin/phpunit", "--filter", "PinCreateTest"], ...}
+```
+
+### Validation error shapes (locked)
+
+The `POST /job/<name>` endpoint returns one of these structured errors.
+MCP clients should pin against these shapes — they're stable.
+
+**HTTP 400 — placeholder validation failed:**
+```json
+{
+  "error":         "validation_failed",
+  "endpoint":      "/job/phpunit",
+  "field":         "test",
+  "reason":        "regex_mismatch",
+  "expected":      "^[A-Za-z][A-Za-z0-9_]*$",
+  "value_preview": "'Pin Create...'"
+}
+```
+`reason` is one of `regex_mismatch | max_len_exceeded | missing_required
+| wrong_type | unknown_param`. `expected` is the regex string, the
+integer cap, the type name, or the list of valid param names depending
+on `reason`. `value_preview` is omitted for `missing_required`; otherwise
+a 64-char repr-truncation of the offending value.
+
+**HTTP 404 — unknown job name:**
+```json
+{"error": "unknown_job", "name": "phpnit", "available": ["build", "compose-ps", "phpunit"]}
+```
+
+**HTTP 412 — sha256 hash mismatch:**
+```json
+{
+  "error":           "command_hash_mismatch",
+  "job":             "phpunit",
+  "command":         "/abs/path/vendor/bin/phpunit",
+  "expected_sha256": "abc123...",
+  "actual_sha256":   "def456..."
+}
+```
+
+**HTTP 412 — command not found:**
+```json
+{"error": "command_not_found", "job": "phpunit", "command": "vendor/bin/phpunit"}
+```
+
+**HTTP 429 — pending queue at capacity** (existing shape):
+```json
+{"error": "pending queue at capacity (32)"}
+```
+
+### Introspection: `GET /jobs`
+
+```json
+{
+  "jobs": {
+    "phpunit": {
+      "command":       "vendor/bin/phpunit",
+      "args_template": ["--filter", "{test}"],
+      "timeout_s":     60,
+      "description":   "Run a PHPUnit class by name",
+      "sha256_pinned": true,
+      "placeholders": {
+        "test": {
+          "regex":       "^[A-Za-z][A-Za-z0-9_]*$",
+          "max_len":     200,
+          "required":    true,
+          "description": "PHPUnit test class name"
+        }
+      }
+    }
+  },
+  "build": { "command": "...", "allowed_args": [...], "timeout_s": 900, "dedupe_window_s": 5 },
+  "config_version": "0.2",
+  "config_mtime":   1715000000.0
+}
+```
+
+`sha256_pinned` is a bool — the actual hash is never returned. `config_mtime`
+is exposed so consumers can cheaply detect hot-reloads (compare on each tool
+call; refresh schema only when mtime changes).
+
+### Per-stack examples
+
+Bundled under `examples/`:
+
+- [`.builder-api.toml`](examples/.builder-api.toml) — the annotated reference
+- [`quake/.builder-api.toml`](examples/quake/.builder-api.toml) — Quake make/test/rcon
+- [`node/.builder-api.toml`](examples/node/.builder-api.toml) — npm test/build/lint with jest pattern + path placeholders
+- [`php-docker-compose/.builder-api.toml`](examples/php-docker-compose/.builder-api.toml) — full docker-compose verb set with whitelisted artisan/composer subcommands
 
 ## Security model — read this
 

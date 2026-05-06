@@ -1,0 +1,69 @@
+# Example builder-api config for a Quake-based project.
+# Copy alongside your Quake source tree (where Makefile lives), then
+# launch the daemon with `cld -a` from inside the container — or
+# `python3 server.py` directly on the host.
+
+name = "quake"
+bind = "127.0.0.1"
+port = 6666
+password = "${BUILDER_API_PASSWORD}"
+
+[build]
+command         = "make"
+allowed_args    = ["clean", "release", "debug", "all"]
+timeout_s       = 600
+dedupe_window_s = 5
+
+[logs]
+build = "logs/build.log"
+game  = "logs/quake.log"
+
+# ─── Jobs ───────────────────────────────────────────────────────────────
+
+[jobs.build-debug]
+command     = "make"
+args        = ["debug"]
+timeout_s   = 600
+description = "Build the debug binary (with symbols)"
+
+[jobs.build-release]
+command     = "make"
+args        = ["release"]
+timeout_s   = 600
+description = "Build the optimised release binary"
+
+[jobs.clean]
+command     = "make"
+args        = ["clean"]
+timeout_s   = 30
+description = "Remove all build artefacts"
+
+# Run a single test by name. Your project's test runner takes a -t flag
+# that matches a registered test; we constrain it to a safe identifier.
+[jobs.test-one]
+command     = "./scripts/run_tests.sh"
+args        = ["-t", "{test}"]
+timeout_s   = 120
+description = "Run a single named test"
+[jobs.test-one.placeholders.test]
+regex       = "^[a-z][a-z0-9_]*$"
+max_len     = 64
+required    = true
+description = "Test name (snake_case identifier)"
+
+# rcon command pinned to a small whitelist (no free-form shell chars).
+# The wrapper script is sha-pinned because rcon is a privileged
+# operation and we don't want a tampered script silently widening
+# what gets sent. Compute the hash with `sha256sum scripts/rcon_send.sh`
+# and paste it below — keep it in sync when you intentionally edit
+# the script.
+[jobs.rcon]
+command     = "scripts/rcon_send.sh"
+args        = ["{verb}"]
+timeout_s   = 10
+description = "Send a whitelisted rcon command to the running server"
+# sha256    = "<run sha256sum scripts/rcon_send.sh and paste here>"
+[jobs.rcon.placeholders.verb]
+regex       = "^(map|kick|status|restart|nextmap)$"
+required    = true
+description = "rcon verb (must be one of: map kick status restart nextmap)"

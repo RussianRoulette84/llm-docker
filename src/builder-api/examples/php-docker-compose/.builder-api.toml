@@ -1,0 +1,101 @@
+# Example builder-api config for a PHP project driven by docker compose.
+# Reference shape — projects with their own service set should swap the
+# regex in [jobs.compose-*.placeholders.service] for their actual list.
+#
+# This template is bundled as a starting point. PurpleTECH-Claude is
+# expected to send back a canonical version covering its full stack
+# (workspace, php-fpm, mysql, redis, rabbitmq, nginx, etc.) — when that
+# arrives, it'll replace this file.
+
+name = "php-docker-compose"
+bind = "127.0.0.1"
+port = 6666
+password = "${BUILDER_API_PASSWORD}"
+
+[build]
+command         = "docker"
+allowed_args    = ["compose", "build", "up", "down", "ps", "logs", "restart", "exec", "pull"]
+timeout_s       = 1800
+dedupe_window_s = 5
+
+[logs]
+build = "logs/build.log"
+
+# ─── Jobs ───────────────────────────────────────────────────────────────
+# All compose verbs run with cwd = project_root (where docker-compose.yml
+# lives). If your compose file lives in a subdir, point `command` at a
+# wrapper script that does `cd docker && docker compose ...` and adjust
+# the args accordingly.
+
+[jobs.compose-ps]
+command     = "docker"
+args        = ["compose", "ps"]
+timeout_s   = 10
+description = "List the project's compose services"
+
+[jobs.compose-up]
+command     = "docker"
+args        = ["compose", "up", "-d"]
+timeout_s   = 300
+description = "Start all services in detached mode"
+
+[jobs.compose-down]
+command     = "docker"
+args        = ["compose", "down"]
+timeout_s   = 60
+description = "Stop and remove all services"
+
+[jobs.compose-build]
+command     = "docker"
+args        = ["compose", "build"]
+timeout_s   = 1800
+description = "Rebuild service images"
+
+[jobs.compose-pull]
+command     = "docker"
+args        = ["compose", "pull"]
+timeout_s   = 600
+description = "Pull latest images for all services"
+
+[jobs.compose-restart]
+command     = "docker"
+args        = ["compose", "restart", "{service}"]
+timeout_s   = 60
+description = "Restart a single service"
+[jobs.compose-restart.placeholders.service]
+# REPLACE the alternation with your project's actual service names.
+regex       = "^(workspace|php-fpm|mysql|redis|rabbitmq|nginx)$"
+required    = true
+description = "Compose service name"
+
+[jobs.compose-logs]
+command     = "docker"
+args        = ["compose", "logs", "--tail=200", "{service}"]
+timeout_s   = 30
+description = "Tail the last 200 log lines of a service"
+[jobs.compose-logs.placeholders.service]
+regex       = "^(workspace|php-fpm|mysql|redis|rabbitmq|nginx)$"
+required    = true
+description = "Compose service name"
+
+# compose exec — runs a *whitelisted* subcommand. Free-form shell exec is
+# rejected by design. If you need new verbs, add a job per verb instead.
+[jobs.compose-exec-artisan]
+command     = "docker"
+args        = ["compose", "exec", "-T", "workspace", "php", "artisan", "{cmd}"]
+timeout_s   = 120
+description = "Run an artisan subcommand in the workspace container"
+[jobs.compose-exec-artisan.placeholders.cmd]
+regex       = "^(migrate|migrate:fresh|migrate:status|cache:clear|config:clear|route:list|tinker)$"
+required    = true
+description = "Whitelisted artisan subcommand"
+
+[jobs.compose-exec-composer]
+command     = "docker"
+args        = ["compose", "exec", "-T", "workspace", "composer", "{cmd}"]
+timeout_s   = 600
+description = "Run a composer subcommand in the workspace container"
+[jobs.compose-exec-composer.placeholders.cmd]
+regex       = "^(install|update|dump-autoload|outdated)$"
+required    = true
+description = "Whitelisted composer subcommand"

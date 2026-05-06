@@ -51,16 +51,49 @@ class BuildEntry:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     log_tail: str = ""
+    # Per-entry command + timeout snapshot. Set at enqueue time so a
+    # hot-reload of `.builder-api.toml` between enqueue and execute can't
+    # change what's running. Legacy [build] callers fill these from
+    # cfg.build; job callers fill them from the resolved Job.
+    command: str = ""
+    timeout_s: int = 0
+    # Set when this entry came from POST /job/<name>; None for legacy /build.
+    # Surfaces in to_public() so /queue and /build_status callers can tell
+    # which job a build came from.
+    job_name: Optional[str] = None
+    # Echo of validated placeholder values (jobs only) — useful for audit
+    # trail and debugging. None for legacy build.
+    params: Optional[dict] = None
+    # Stable fingerprint for the dedupe window. Derived from job_name+args
+    # at enqueue time. Internal; not exposed in to_public().
+    fingerprint: str = field(default="", repr=False)
     _done: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def to_public(self) -> dict:
-        """Serialisable view, dropping the Event object."""
-        d = asdict(self)
-        d.pop("_done", None)
-        d["elapsed_s"] = _elapsed(self)
-        d["queued_at_iso"] = _iso(self.queued_at)
-        d["started_at_iso"] = _iso(self.started_at)
-        d["finished_at_iso"] = _iso(self.finished_at)
+        """Serialisable view. Built explicitly rather than via asdict()
+        because asdict() deep-copies every field, and threading.Event
+        contains a non-picklable Lock — it crashes before we get a chance
+        to drop the field."""
+        d: dict = {
+            "id": self.id,
+            "agent_id": self.agent_id,
+            "args": list(self.args),
+            "status": self.status,
+            "returncode": self.returncode,
+            "queued_at": self.queued_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "log_tail": self.log_tail,
+            "command": self.command,
+            "timeout_s": self.timeout_s,
+            "elapsed_s": _elapsed(self),
+            "queued_at_iso": _iso(self.queued_at),
+            "started_at_iso": _iso(self.started_at),
+            "finished_at_iso": _iso(self.finished_at),
+        }
+        if self.job_name is not None:
+            d["job_name"] = self.job_name
+            d["params"] = self.params or {}
         return d
 
 
@@ -109,34 +142,148 @@ class BuildQueue:
         self._shutdown = True
         self._signal.set()
 
+    def update_cfg(self, new_cfg) -> None:
+        """Swap the queue's cfg reference at hot-reload. New cfg's
+        `[build]` settings (allowed_args, max_pending, dedupe_window_s,
+        command) apply to subsequent enqueues. In-flight entries keep
+        their snapshotted command + timeout — they're not retroactively
+        re-validated."""
+        with self._lock:
+            self._cfg = new_cfg
+            self._build_cfg = new_cfg.build
+
     def enqueue(self, *, args: list[str], agent_id: str) -> BuildEntry:
         """
-        Validate args against the whitelist, add the entry to the queue,
-        return it.
+        Validate args against the legacy `[build].allowed_args` whitelist,
+        add the entry to the queue, return it.
+
+        Use `enqueue_job()` for `[jobs.<name>]` templates instead — the two
+        paths share a queue but validate differently.
 
         Raises:
             ValueError  — whitelist violation (caller maps to HTTP 400)
             QueueFull   — pending deque at build.max_pending (caller → 429)
         """
         validated = self._validate_args(args)
-        entry = BuildEntry(
-            id=_short_id(),
-            agent_id=str(agent_id or ""),
+        fp = _fingerprint(job_name=None, args=validated)
+        return self._enqueue_internal(
             args=tuple(validated),
+            command=self._build_cfg.command,
+            timeout_s=self._build_cfg.timeout_s,
+            agent_id=str(agent_id or ""),
+            job_name=None,
+            params=None,
+            fingerprint=fp,
         )
+
+    def enqueue_job(
+        self,
+        *,
+        args: list[str],
+        command: str,
+        timeout_s: int,
+        job_name: str,
+        params: dict,
+        agent_id: str,
+    ) -> BuildEntry:
+        """
+        Add a [jobs.<name>] entry to the queue. Caller is responsible for
+        having already validated `params` against the Job's placeholders
+        and substituted them into `args` (see jobs.validate_and_substitute).
+        Caller is also responsible for sha256 verification (see
+        jobs.verify_command_hash) — those failures map to 412, not to a
+        queue entry.
+
+        Raises:
+            QueueFull — pending deque at build.max_pending (caller → 429)
+        """
+        fp = _fingerprint(job_name=job_name, args=args)
+        return self._enqueue_internal(
+            args=tuple(args),
+            command=command,
+            timeout_s=timeout_s,
+            agent_id=str(agent_id or ""),
+            job_name=job_name,
+            params=dict(params) if params else {},
+            fingerprint=fp,
+        )
+
+    def _enqueue_internal(
+        self,
+        *,
+        args: tuple[str, ...],
+        command: str,
+        timeout_s: int,
+        agent_id: str,
+        job_name: Optional[str],
+        params: Optional[dict],
+        fingerprint: str,
+    ) -> BuildEntry:
         with self._lock:
+            # Dedupe window: an in-flight or recently-enqueued entry with
+            # the same fingerprint reuses its queue_id instead of stacking
+            # a duplicate. Defends against AI clients retrying on a flaky
+            # poll and accidentally double-running a long build.
+            existing = self._find_dedupe(fingerprint)
+            if existing is not None:
+                return existing
+
             if len(self._pending) >= self._build_cfg.max_pending:
                 raise QueueFull(
                     f"pending queue at capacity ({self._build_cfg.max_pending})"
                 )
+
+            entry = BuildEntry(
+                id=_short_id(),
+                agent_id=agent_id,
+                args=args,
+                command=command,
+                timeout_s=timeout_s,
+                job_name=job_name,
+                params=params,
+                fingerprint=fingerprint,
+            )
             self._pending.append(entry)
             self._by_id[entry.id] = entry
+
         self._signal.set()
-        self._events.append(
-            "build_enqueued",
-            {"id": entry.id, "agent_id": entry.agent_id, "args": list(entry.args)},
-        )
+        event_payload = {
+            "id": entry.id,
+            "agent_id": entry.agent_id,
+            "args": list(entry.args),
+        }
+        if job_name is not None:
+            event_payload["job"] = job_name
+        self._events.append("build_enqueued", event_payload)
         return entry
+
+    def _find_dedupe(self, fingerprint: str) -> Optional[BuildEntry]:
+        """Locate any pending/current/recent-history entry with the same
+        fingerprint inside the dedupe window. Caller must hold _lock."""
+        if not fingerprint:
+            return None
+        window = self._build_cfg.dedupe_window_s
+        if window <= 0:
+            return None
+        now = time.time()
+        # Check pending (always candidates regardless of window — they
+        # haven't run yet).
+        for e in self._pending:
+            if e.fingerprint == fingerprint:
+                return e
+        # Check the currently-running build.
+        if self._current is not None and self._current.fingerprint == fingerprint:
+            return self._current
+        # Check recent history within the window. If the same args finished
+        # less than `window` seconds ago, return that finished entry — the
+        # caller will see status=done|failed and not re-run.
+        for e in self._history:
+            if e.fingerprint != fingerprint:
+                continue
+            stamp = e.finished_at or e.queued_at
+            if stamp and (now - stamp) <= window:
+                return e
+        return None
 
     def cancel(self, build_id: str) -> bool:
         """
@@ -225,8 +372,11 @@ class BuildQueue:
             {"id": entry.id, "agent_id": entry.agent_id, "args": list(entry.args)},
         )
 
-        cmd = [self._build_cfg.command, *entry.args]
-        timeout = self._build_cfg.timeout_s
+        # Snapshot at enqueue time. We never re-resolve at execute time, so
+        # a hot-reload of `.builder-api.toml` between enqueue and execute
+        # can't change what's already in flight.
+        cmd = [entry.command or self._build_cfg.command, *entry.args]
+        timeout = entry.timeout_s or self._build_cfg.timeout_s
 
         # Open the build log for append; subprocess writes stdout+stderr there.
         self._build_log.parent.mkdir(parents=True, exist_ok=True)
@@ -317,7 +467,11 @@ class BuildQueue:
         for a in args:
             if not isinstance(a, str):
                 raise ValueError("args must be strings")
-            if allowed and a not in allowed:
+            # Strict whitelist: empty `allowed_args = []` means NO args
+            # allowed (not "any args allowed"). This is the safer default
+            # — projects that want unrestricted args should use [jobs.*]
+            # with explicit placeholder regexes instead.
+            if a not in allowed:
                 raise ValueError(
                     f"arg {a!r} not in whitelist. Allowed: "
                     f"{sorted(allowed) or '[]'}"
@@ -334,6 +488,22 @@ class BuildQueue:
 def _short_id() -> str:
     # 8 hex chars is plenty for "recent build" cardinality; avoids full uuids.
     return secrets.token_hex(4)
+
+
+def _fingerprint(*, job_name: Optional[str], args) -> str:
+    """Stable hash of the request shape, used as the dedupe key. We hash
+    rather than concatenate so the key length is bounded regardless of how
+    long the args end up. agent_id is intentionally excluded — two agents
+    racing to enqueue the same operation should collapse onto one queue_id,
+    not run twice."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update((job_name or "__build__").encode("utf-8"))
+    h.update(b"\0")
+    for a in args:
+        h.update(a.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()[:16]
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
