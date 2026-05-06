@@ -19,21 +19,34 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="${1:-$(pwd)}"
 
-# --- env-gorilla integration: inject KeePassXC-backed secrets when .env is
-# missing. The Terminal/iTerm window osascript spawns this script in does NOT
-# inherit cld's env, so we re-check independently here. Same trigger as
-# cld/ocd: USER=yaro always, OR .env missing for any user.
-#
-# We re-exec through `bash "$0"` (not bare "$0") because run-local.sh is
-# intentionally non-executable (mode 0644) — the applescript invokes it as
-# `bash run-local.sh ...` for the same reason. Handing the path straight to
-# env-gorilla makes it `exec()` the file directly, which fails with
-# `Permission denied` on a non-executable script.
-if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
-   && command -v env-gorilla >/dev/null 2>&1 \
-   && { [ "${USER:-}" = "yaro" ] || [ ! -f "$SCRIPT_DIR/../.env" ]; }; then
+# --- env-gorilla integration ---
+# Goal: ZERO extra fingerprints when this script is launched from an already-
+# env-gorilla'd shell (e.g. `cld -c -a` already loaded both llm-docker and
+# project secrets and propagated them to the Terminal we're running in).
+# Otherwise: chain two env-gorilla calls so llm-docker + project secrets both
+# land in this process. Keychain TouchID caches across back-to-back invocations,
+# so the chain typically fingerprints exactly once.
+PROJECT_DIR_RAW="${1:-$(pwd)}"
+PROJECT_NAME="$(basename "$(cd "$PROJECT_DIR_RAW" 2>/dev/null && pwd)" 2>/dev/null || basename "$PROJECT_DIR_RAW")"
+
+# Skip the whole env-gorilla dance if the parent already loaded our secrets
+# (e.g. `cld -c -a` env-gorilla'd the shell + Terminal). BUILDER_API_PASSWORD
+# is the telltale — it only ends up in env via env-gorilla pulling
+# ENV/llm-docker/.env. Project-specific secrets get inherited automatically.
+if [ -n "${BUILDER_API_PASSWORD:-}" ]; then
     export LLM_DOCKER_ENV_GORILLA=1
-    exec env-gorilla llm-docker -- bash "$0" "$@"
+    echo "[run-local] env already loaded by parent — skipping env-gorilla (no fingerprint)"
+elif [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
+     && command -v env-gorilla >/dev/null 2>&1 \
+     && { [ "${USER:-}" = "yaro" ] || [ ! -f "$SCRIPT_DIR/../.env" ]; }; then
+    export LLM_DOCKER_ENV_GORILLA=1
+
+    # Chain: env-gorilla llm-docker → env-gorilla <project> → bash this script.
+    # Two env-gorilla calls — Keychain TouchID caches between them so it's
+    # one fingerprint in practice. We do NOT pre-check via `env-gorilla --list`
+    # because that itself prompts TouchID, defeating the whole point.
+    echo "[run-local] env-gorilla chain: llm-docker → ${PROJECT_NAME}"
+    exec env-gorilla llm-docker -- env-gorilla "$PROJECT_NAME" -- bash "$0" "$@"
 fi
 
 if [ ! -d "$PROJECT_DIR" ]; then
@@ -42,16 +55,17 @@ if [ ! -d "$PROJECT_DIR" ]; then
 fi
 cd "$PROJECT_DIR"
 
-# Config + secrets both live one level up (alongside cld/ocd in src/).
-# Order matters: conf first (defaults), .env second (wins on conflicts).
+# Plain-file fallbacks — the canonical way to inject secrets when env-gorilla
+# isn't available (production server, other developers, CI).
+# Order: llm-docker.conf (non-secret defaults) → llm-docker/.env (BUILDER_API_*
+# etc.) → <project>/.env (MCP_BEARER_TOKEN_* etc.). Later files win on conflict.
 #
 # Per-line read instead of `source` because .env may contain multi-line
-# values (e.g. an SSH key pasted with literal newlines) — the old
-# `source <(... | sed 's/^/export /')` choked on the second line of
-# such values with `export: 'AAAAB3...': not a valid identifier`.
+# values (e.g. an SSH key with literal newlines) — `source` chokes on those.
 # Lines that aren't valid `KEY=value` are silently skipped.
-for CONF_FILE in "$SCRIPT_DIR/../llm-docker.conf" "$SCRIPT_DIR/../.env"; do
+for CONF_FILE in "$SCRIPT_DIR/../llm-docker.conf" "$SCRIPT_DIR/../.env" "./.env"; do
     [ -f "$CONF_FILE" ] || continue
+    echo "[run-local] loading env: $CONF_FILE"
     while IFS= read -r line || [ -n "$line" ]; do
         [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
