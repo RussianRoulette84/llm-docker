@@ -130,6 +130,7 @@ Optionally it bind-mounts your `~/Projects` workspace folder into Docker as work
 * ✅ **No docker socket access** - `/var/run/docker.sock` is NOT bind-mounted. The container cannot escape via the Docker API.
 * ✅ **Claude agent permission hardening** - `.claude/settings.local.json` ships with ~200 deny rules: secret reads, install scripts, shell-exec escape hatches, chain-operator variants, path-traversal patterns, and explicit container-escape guards (`*docker.sock*`, `nsenter`, `--privileged`, kernel namespace tools).
 * ✅ **Config self-unlock protection** - Claude cannot edit its own `.claude/settings*.json`, `.git/hooks/`, `.github/workflows/`, or `.vscode/tasks.json` — no prompt-injection path to loosen its own rules.
+* ✅ **Builder API plugin gate** - The Builder API loads `plugin = "..."` from a project's `.builder-api.toml` only when `BUILDER_API_ALLOW_PLUGINS=1` is exported in the daemon's environment. Plugins run unrestricted Python in the daemon process on the host; the env-gate forces a deliberate human step before any project (or a prompt-injected agent inside one) can drop a `builder_plugin.py` and pivot to host code execution via the bind-mount.
 * ✅ **SSH key-only authentication** - When SSH is enabled, passwords are disabled (`PasswordAuthentication no`). Root login requires a matching key in `LLM_DOCKER_SSH_AUTHORIZED_KEYS`. Host keys persist across rebuilds for stable fingerprint.
 * ✅ **Graceful cleanup** - Background watchdog kills containers on terminal close, CMD+Q, or crash.
 

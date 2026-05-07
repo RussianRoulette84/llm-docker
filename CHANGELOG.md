@@ -1,3 +1,18 @@
+# v2.3 (2026-05-07)
+
+## Security
+
+Hardening pass focused on closing two bind-mount escape paths a compromised or prompt-injected project could otherwise walk into:
+
+- **Builder API plugin gate** (`src/builder-api/config.py`): declaring `plugin = "..."` in a project's `.builder-api.toml` now requires `BUILDER_API_ALLOW_PLUGINS=1` in the daemon's environment. Without it, the daemon refuses to start with a `ConfigError` pointing to the variable. Plugins run unrestricted Python in the daemon process on the host — this forces a deliberate human step before any project (or a Claude inside one) can pivot to host code execution by dropping a `builder_plugin.py` and editing the toml. Existing users with a plugin: export the env var in `run-local.sh`'s shell or in `.env`.
+- Added `deny`: `Read/Edit/Write(**/llm-docker/**)` so projects can't read or modify the cage source from inside the container.
+- Added container-escape denies: `*nsenter*`, `*docker.sock*`.
+- Fixed malformed `WebFetch(domain:github.com/sst/opencode)` → `WebFetch(domain:github.com)` — domain patterns ignore the path component,
+so the `/sst/opencode` part was silently doing nothing.
+- Added `Monitor`, `Task*`, `ToolSearch` to the default allow list.
+- **Repo's own `.claude/settings.local.json`** got the same hardening so working in this repo follows the same boundary the template ships
+to projects.
+
 # v2.2 (2026-05-06)
 
 ## Builder API 

@@ -1,22 +1,31 @@
 {
   "permissions": {
-    "defaultMode": "default",
     "allow": [
       "Read(/**)",
       "Edit(/**)",
       "Write(/**)",
       "WebSearch",
       "WebFetch(domain:opencode.ai)",
+      "WebFetch(domain:opencode.ai)",
       "WebFetch(domain:claude.com)",
-      "WebFetch(domain:github.com/sst/opencode)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:developers.google.com)",
+      "WebFetch(domain:packagist.org)",
+      "WebFetch(domain:hub.docker.com)",
       "Bash(*)",
+      "Bash(curl *)",
       "Bash(sed *)",
       "Bash(trash *)",
       "Bash(trash-put *)",
       "Bash(gtrash *)",
-      "Read(~/.llm-docker/**)",
-      "Edit(~/.llm-docker/**)",
-      "Write(~/.llm-docker/**)"
+      "Monitor",
+      "TaskCreate",
+      "TaskUpdate",
+      "TaskStop",
+      "TaskList",
+      "TaskGet",
+      "ToolSearch"
     ],
     "deny": [
       "Bash(# ========== 1. DATA EXFILTRATION — READS / WRITES ==========)",

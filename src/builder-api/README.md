@@ -335,6 +335,11 @@ Anything less than careful thinking here turns it into an escape vector.
   the server process.** Copying a project directory from the internet
   with an unfamiliar `builder_plugin.py` is the same as running
   unknown Python with write access to your home directory.
+- Plugins are env-gated: declaring `plugin = "..."` in config raises
+  `ConfigError` at startup unless `BUILDER_API_ALLOW_PLUGINS=1` is
+  exported in the daemon's environment. This forces a deliberate human
+  step before any project's plugin file can run host-side code, so a
+  malicious or compromised project can't silently load one.
 
 ## Plugin API (optional)
 

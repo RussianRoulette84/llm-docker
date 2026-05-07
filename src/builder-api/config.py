@@ -330,10 +330,20 @@ def _build_config(raw: dict, root: Path, path: Path) -> Config:
             must_exist=False,
         )
 
-    # --- plugin (optional) ---
+    # --- plugin (optional, env-gated) ---
+    # A plugin runs unrestricted Python in the daemon's own process — same
+    # blast radius as anything with shell access on this host. Refuse to load
+    # one unless the operator explicitly opts in via BUILDER_API_ALLOW_PLUGINS=1.
     plugin_rel = raw.get("plugin")
     plugin_path: Optional[Path] = None
     if plugin_rel:
+        if os.environ.get("BUILDER_API_ALLOW_PLUGINS") != "1":
+            raise ConfigError(
+                f"{path.name}: plugin = {plugin_rel!r} declared but "
+                "BUILDER_API_ALLOW_PLUGINS=1 is not set. Plugins run "
+                "unrestricted code in this process; export the env var "
+                "explicitly to allow it."
+            )
         plugin_path = _resolve_in_root(
             str(plugin_rel),
             root,

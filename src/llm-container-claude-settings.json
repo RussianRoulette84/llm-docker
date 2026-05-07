@@ -1,28 +1,45 @@
 {
   "permissions": {
-    "defaultMode": "default",
     "allow": [
       "Read(/**)",
       "Edit(/**)",
       "Write(/**)",
       "WebSearch",
       "WebFetch(domain:opencode.ai)",
+      "WebFetch(domain:opencode.ai)",
       "WebFetch(domain:claude.com)",
-      "WebFetch(domain:github.com/sst/opencode)",
-      "WebFetch(domain:github.com/RussianRoulette84)",
-      "WebFetch(domain:gitlab.com/RussianRoulette84)",
+      "WebFetch(domain:github.com)",
       "WebFetch(domain:www.npmjs.com)",
       "WebFetch(domain:developers.google.com)",
       "WebFetch(domain:packagist.org)",
       "WebFetch(domain:hub.docker.com)",
       "Bash(*)",
+      "Bash(curl *)",
       "Bash(sed *)",
       "Bash(trash *)",
       "Bash(trash-put *)",
       "Bash(gtrash *)",
-      "Bash(git stash *)",
-      "Bash(git add *)"
+      "Monitor",
+      "TaskCreate",
+      "TaskUpdate",
+      "TaskStop",
+      "TaskList",
+      "TaskGet",
+      "ToolSearch"
     ],
-    "deny": []
+    "deny": [
+      "Read(**/llm-docker/**)",
+      "Edit(**/llm-docker/**)",
+      "Write(**/llm-docker/**)",
+      "Bash(rm *)",
+      "Bash(rm)",
+      "Bash(unlink *)",
+      "Bash(dd *)",
+      "Bash(find * -delete*)",
+      "Bash(find * -exec rm*)",
+      "Bash(*nsenter*)",
+      "Bash(*docker.sock*)"
+    ],
+    "defaultMode": "default"
   }
 }
