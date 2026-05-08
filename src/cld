@@ -22,31 +22,58 @@ SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
 
 source "$SCRIPT_DIR/setup.sh"
 
-# Check if Docker is running
+# Serialize Docker Desktop launches across parallel cld sessions. Without this
+# lock, N terminals all firing `open -a Docker` simultaneously deliver stray
+# NSEvents into a Docker Desktop that's already mid-launch — Docker Desktop
+# crashes with "NSInternalInconsistencyException: Unrecognized event type 0"
+# on macOS Sequoia 15.6+ (and likely earlier). flock(1) on /tmp ensures only
+# the first cld actually launches Docker; the rest wait, then no-op when they
+# re-check inside the critical section.
 if ! docker info > /dev/null 2>&1; then
-    _log CLD WARNING "Docker is not running — starting Docker Desktop..."
-
-    # Start Docker Desktop on macOS
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        open -a Docker
-    else
-        _log CLD ERROR "Please start Docker manually on your system"
-        exit 1
+    _cld_have_flock=true
+    if ! command -v flock > /dev/null 2>&1; then
+        _cld_have_flock=false
+        _log CLD WARNING "flock not found — running without launch-race protection. Install with: brew install flock"
     fi
 
-    _log CLD "Waiting for Docker to start (this may take a minute)..."
-    max_wait=60
-    waited=0
-    until docker info > /dev/null 2>&1; do
-        if [ $waited -ge $max_wait ]; then
-            _log CLD ERROR "Docker did not start within $max_wait seconds"
+    if $_cld_have_flock; then
+        exec 9> "/tmp/cld-docker-start.lock"
+        if ! flock -n 9; then
+            _log CLD "Another cld is starting Docker — waiting..."
+            flock 9
+        fi
+    fi
+
+    # Re-check inside the lock: an earlier holder may have already started Docker.
+    if ! docker info > /dev/null 2>&1; then
+        _log CLD WARNING "Docker is not running — starting Docker Desktop..."
+
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            open -a Docker
+        else
+            _log CLD ERROR "Please start Docker manually on your system"
             exit 1
         fi
-        echo -n "."
-        sleep 2
-        waited=$((waited + 2))
-    done
-    _log CLD "Docker is ready!"
+
+        _log CLD "Waiting for Docker to start (this may take a minute)..."
+        max_wait=60
+        waited=0
+        until docker info > /dev/null 2>&1; do
+            if [ $waited -ge $max_wait ]; then
+                _log CLD ERROR "Docker did not start within $max_wait seconds"
+                exit 1
+            fi
+            echo -n "."
+            sleep 2
+            waited=$((waited + 2))
+        done
+        _log CLD "Docker is ready!"
+    fi
+
+    if $_cld_have_flock; then
+        exec 9>&-
+    fi
+    unset _cld_have_flock
 fi
 
 # Quick pre-scan for the two rebuild flags:

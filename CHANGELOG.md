@@ -1,5 +1,9 @@
 # v2.3 (2026-05-07)
 
+## Stability
+
+- **`cld` no longer crashes Docker Desktop when launched in many terminals at once.** With 30+ open terminals, parallel `cld` calls were all firing `open -a Docker` simultaneously. The second/third launch event arrives mid-startup and Docker Desktop dies with `NSInternalInconsistencyException: Unrecognized event type 0` (an AppKit thread-safety bug in Docker's Go bridge, hits hardest on macOS Sequoia 15.6+). Wrapped the whole "is Docker up? if not, start it and wait" block in a `flock` on `/tmp/cld-docker-start.lock` so only one `cld` ever launches Docker; the rest wait, then no-op when they re-check inside the lock. Requires `flock` (`brew install flock`); without it `cld` warns once and falls back to the old racy behavior so it still runs.
+
 ## Security
 
 Hardening pass focused on closing two bind-mount escape paths a compromised or prompt-injected project could otherwise walk into:

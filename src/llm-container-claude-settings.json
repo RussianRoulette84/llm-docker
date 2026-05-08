@@ -6,7 +6,6 @@
       "Write(/**)",
       "WebSearch",
       "WebFetch(domain:opencode.ai)",
-      "WebFetch(domain:opencode.ai)",
       "WebFetch(domain:claude.com)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:www.npmjs.com)",
@@ -18,14 +17,7 @@
       "Bash(sed *)",
       "Bash(trash *)",
       "Bash(trash-put *)",
-      "Bash(gtrash *)",
-      "Monitor",
-      "TaskCreate",
-      "TaskUpdate",
-      "TaskStop",
-      "TaskList",
-      "TaskGet",
-      "ToolSearch"
+      "Bash(gtrash *)"
     ],
     "deny": [
       "Read(**/llm-docker/**)",
