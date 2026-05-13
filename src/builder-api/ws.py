@@ -19,14 +19,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import queue as _queue
 import select
 import socket
 import struct
 import threading
-import time
-from typing import Iterable, Optional
+from typing import Optional
 
 from logs import LogWatcher
 

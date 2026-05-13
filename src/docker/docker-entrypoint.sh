@@ -283,6 +283,17 @@ if [ "${UPDATE_ON_START:-false}" = "true" ] && [ "${INTERNET_ACCESS:-true}" = "t
     fi
 fi
 
+# Source /root/.zprofile so PATH (composer/vendor/bin, go/bin, GOPATH/bin,
+# anything else the user has wired in) is set for the launched tool AND
+# for every `bash -c "..."` spawned by it (Claude Code's Bash tool, agent
+# shell-outs, scripted invocations). The entrypoint runs as a plain bash
+# script — not a login shell — so /root/.zprofile is NOT auto-sourced.
+# This catches it once at process start and lets every child inherit.
+if [ -f /root/.zprofile ]; then
+    # shellcheck disable=SC1091
+    . /root/.zprofile 2>/dev/null || true
+fi
+
 # Determine which tool to run (default to opencode for backward compatibility)
 TOOL=${TOOL:-opencode}
 

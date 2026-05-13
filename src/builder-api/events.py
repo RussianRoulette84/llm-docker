@@ -15,7 +15,6 @@ behavior, which is fine because they typically batch small records.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from pathlib import Path

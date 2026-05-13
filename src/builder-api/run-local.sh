@@ -73,6 +73,7 @@ for CONF_FILE in "$SCRIPT_DIR/../llm-docker.conf" "$SCRIPT_DIR/../.env" "./.env"
     done < "$CONF_FILE"
 done
 
-echo "[builder-api/run-local] project: $PROJECT_DIR"
+echo "[builder-api/run-local] project: $PROJECT_DIR ($PROJECT_NAME)"
+echo "[builder-api/run-local] config:  ${BUILDER_API_CONFIG:-~/.llm-docker/builder-api.toml}"
 echo "[builder-api/run-local] starting server.py..."
-exec python3 "$SCRIPT_DIR/server.py"
+exec python3 "$SCRIPT_DIR/server.py" --project "$PROJECT_NAME"

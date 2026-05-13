@@ -118,6 +118,12 @@ RUN chmod +x /tmp/install_devpack.sh \
 # and HyperFrames isn't installed either.
 ENV HYPERFRAMES_BROWSER_PATH=/usr/bin/chromium-headless-shell
 
+# Tell Playwright where to find its browser binaries. The path is populated
+# by install_devpack.sh's INSTALL_BROWSING block (`npx playwright install
+# chromium`). Setting it unconditionally is harmless — Playwright just
+# falls back to its own default lookup if the dir is missing.
+ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+
 # SSH configuration script
 COPY docker/setup-ssh.sh /setup-ssh.sh
 RUN chmod +x /setup-ssh.sh

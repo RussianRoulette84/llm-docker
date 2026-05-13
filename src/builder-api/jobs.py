@@ -4,7 +4,7 @@ substitution, and command-file sha256 pinning.
 
 Generic across projects: the daemon doesn't care whether you're driving
 docker compose, PHPUnit, a Quake build, npm test, or a custom Make. Drop
-your jobs into `.builder-api.toml`; the daemon serves them via
+your jobs into `~/.llm-docker/builder-api.toml`; the daemon serves them via
 `POST /job/<name>` and exposes their schema via `GET /jobs` for
 auto-generated MCP tools.
 
@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -32,6 +33,17 @@ from typing import Optional
 # at config-load so the substitution path can never see surprise text.
 _PLACEHOLDER_REF = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _STANDALONE_PLACEHOLDER = re.compile(r"^\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+# Reserved daemon-side substitution tokens — double-curly, distinct from
+# single-curly user placeholders. Resolved at job-dispatch time by the
+# build queue, never user-supplied. Not subject to the [placeholders]
+# table check. Adding a new token: extend _KNOWN_RESERVED_TOKENS AND
+# add the dispatch-time substitution branch in build_queue._execute.
+_RESERVED_TOKEN = re.compile(r"^\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}$")
+_KNOWN_RESERVED_TOKENS = frozenset({
+    "{{container}}",   # resolves to ID of container labelled
+                       # llm-docker-project=<this-project>
+})
 _PLACEHOLDER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Default cap for placeholder values. Override per-placeholder via max_len.
@@ -116,8 +128,8 @@ class CommandHashMismatch(Exception):
             "error": "command_hash_mismatch",
             "job": self.job,
             "command": self.command,
-            "expected_sha256": self.expected,
-            "actual_sha256": self.actual,
+            "expected_hash": self.expected,
+            "actual_hash": self.actual,
         }
 
 
@@ -170,8 +182,34 @@ class Job:
     command: str
     args_template: tuple[str, ...]
     timeout_s: int = 60
+    # SIGTERM→SIGKILL grace window. 0 means "use the daemon's default" (3s).
+    # Set higher for jobs that need extra time to clean up (large data
+    # flushes, network teardown). Set lower (e.g. 1) for jobs that hang
+    # forever and need a fast hard kill — chromium downloads, npm installs
+    # behind a proxy, etc.
+    kill_after_s: int = 0
+    # Subdir (relative to project_root) where the subprocess runs. Default
+    # "." = project root. Useful for monorepos: a frontend job that needs
+    # to run from `angular/` so it sees `package.json`, while the rest of
+    # the repo's jobs stay at root. Validated to stay under project_root
+    # (no `..` escape) at config-load time in config.py.
+    cwd: str = "."
     description: str = ""
-    sha256: Optional[str] = None  # lowercase hex digest, or None
+    # File-integrity pin: hash the file at `command_hash_path` (relative to
+    # project_root) and verify against `command_hash` (bare hex) before
+    # every execvp. Both None = no pin. The path-explicit form lets wrapper
+    # jobs (command = "docker", args = [..., "<script>"]) pin the SCRIPT
+    # being executed inside the container, not the docker binary itself.
+    command_hash: Optional[str] = None        # 64-char lowercase hex, or None
+    command_hash_path: Optional[str] = None   # rel-to-project_root, or None
+    # Write-in-place gate. When true, POST /job/<name> rejects with 428
+    # unless the caller sends `X-Mutation-Confirmed: yes`. Stops carpet-test
+    # patterns (POST + race-to-DELETE) from accidentally firing destructive
+    # jobs like `prettier --write`, `pint` (no --test), `ruff format`, etc.
+    # The cancel race is unwinnable for fast file mutators (Prettier finished
+    # 326 files before SIGTERM landed), so the only safe fix is to refuse
+    # the request unless the operator explicitly opted in.
+    mutates_filesystem: bool = False
     placeholders: dict[str, Placeholder] = field(default_factory=dict)
 
     def to_public(self) -> dict:
@@ -179,7 +217,11 @@ class Job:
             "command": self.command,
             "args_template": list(self.args_template),
             "timeout_s": self.timeout_s,
-            "sha256_pinned": self.sha256 is not None,
+            "kill_after_s": self.kill_after_s,
+            "cwd": self.cwd,
+            "command_hash_pinned": self.command_hash is not None,
+            "command_hash_path": self.command_hash_path,
+            "mutates_filesystem": self.mutates_filesystem,
             "placeholders": {
                 n: p.to_public() for n, p in self.placeholders.items()
             },
@@ -269,8 +311,19 @@ def _parse_one_job(name: str, raw: dict, *, file_label: str) -> Job:
     # placeholders, AND every reference is a standalone array element.
     # Also verify every declared placeholder is referenced (warn-by-error
     # so dead placeholders don't sit around polluting the schema).
+    # Reserved daemon-side tokens (e.g. `{{container}}`) skip validation
+    # entirely — they're not user placeholders, they get resolved at
+    # job-dispatch time in build_queue._execute.
     referenced: set[str] = set()
     for i, arg in enumerate(args_raw):
+        if _RESERVED_TOKEN.match(arg):
+            if arg not in _KNOWN_RESERVED_TOKENS:
+                raise JobConfigError(
+                    f"{file_label}: [jobs.{name}].args[{i}]={arg!r} is an "
+                    f"unknown reserved token. Known: "
+                    f"{sorted(_KNOWN_RESERVED_TOKENS)}"
+                )
+            continue
         m = _STANDALONE_PLACEHOLDER.match(arg)
         if m:
             ref = m.group(1)
@@ -304,18 +357,47 @@ def _parse_one_job(name: str, raw: dict, *, file_label: str) -> Job:
             f"the block or wire it into `args`."
         )
 
-    sha256 = raw.get("sha256")
-    if sha256 is not None:
-        if not isinstance(sha256, str):
+    # `command_hash` is a table: { path = "<rel>", sha256 = "sha256:<hex>" }.
+    # `path` is the file to hash, relative to project_root. Typically EQUAL
+    # to `command` (pin the binary you run), but for wrapper-style jobs
+    # (command = "docker" args = [..., "<script>"]) set path = "<script>"
+    # to pin the wrapped target instead. ONE shape only — bare-string form
+    # is gone.
+    ch_raw = raw.get("command_hash")
+    command_hash = None
+    command_hash_path = None
+    if ch_raw is not None:
+        if not isinstance(ch_raw, dict):
             raise JobConfigError(
-                f"{file_label}: [jobs.{name}].sha256 must be a hex string"
+                f"{file_label}: [jobs.{name}].command_hash must be a table: "
+                f"command_hash = {{ path = \"<rel-path>\", "
+                f"sha256 = \"sha256:<64-char hex>\" }}"
             )
-        sha256 = sha256.strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        p = ch_raw.get("path")
+        s = ch_raw.get("sha256")
+        if not isinstance(p, str) or not p:
             raise JobConfigError(
-                f"{file_label}: [jobs.{name}].sha256 must be a 64-char "
-                f"lowercase hex sha256 digest (got {sha256!r})"
+                f"{file_label}: [jobs.{name}].command_hash.path must be a "
+                f"non-empty string (relative to project_root)"
             )
+        if p.startswith("/") or ".." in p.split("/"):
+            raise JobConfigError(
+                f"{file_label}: [jobs.{name}].command_hash.path must be "
+                f"relative and stay under project_root (got {p!r})"
+            )
+        if not isinstance(s, str):
+            raise JobConfigError(
+                f"{file_label}: [jobs.{name}].command_hash.sha256 must be a string"
+            )
+        s = s.strip().lower()
+        m = re.fullmatch(r"sha256:([0-9a-f]{64})", s)
+        if not m:
+            raise JobConfigError(
+                f"{file_label}: [jobs.{name}].command_hash.sha256 must be "
+                f"`sha256:<64-char lowercase hex>` (got {s!r})"
+            )
+        command_hash_path = p
+        command_hash = m.group(1)
 
     timeout_s = raw.get("timeout_s")
     timeout_s = int(timeout_s) if timeout_s is not None else 60
@@ -324,13 +406,59 @@ def _parse_one_job(name: str, raw: dict, *, file_label: str) -> Job:
             f"{file_label}: [jobs.{name}].timeout_s must be >= 1"
         )
 
+    kill_after_s_raw = raw.get("kill_after_s")
+    kill_after_s = int(kill_after_s_raw) if kill_after_s_raw is not None else 0
+    if kill_after_s < 0:
+        raise JobConfigError(
+            f"{file_label}: [jobs.{name}].kill_after_s must be >= 0"
+        )
+
+    cwd_raw = raw.get("cwd")
+    cwd = str(cwd_raw) if cwd_raw is not None else "."
+    if cwd.startswith("/") or ".." in cwd.split("/"):
+        # Absolute or parent-escape paths are out — cwd must resolve under
+        # project_root. Final resolution happens in config.py with the
+        # actual root in hand.
+        raise JobConfigError(
+            f"{file_label}: [jobs.{name}].cwd must be relative and stay "
+            f"under project_root (got {cwd!r})"
+        )
+
+    mutates_raw = raw.get("mutates_filesystem")
+    if mutates_raw is None:
+        mutates_filesystem = False
+    elif isinstance(mutates_raw, bool):
+        mutates_filesystem = mutates_raw
+    else:
+        raise JobConfigError(
+            f"{file_label}: [jobs.{name}].mutates_filesystem must be a boolean"
+        )
+
+    # WARN on unknown job fields so silent-ignore can't trip up users
+    # again (the v2.4.x command_hash rename bit purpletech-claude this way).
+    known = {
+        "command", "args", "cwd", "timeout_s", "kill_after_s",
+        "command_hash", "mutates_filesystem", "description", "placeholders",
+    }
+    unknown = set(raw.keys()) - known
+    for k in sorted(unknown):
+        sys.stderr.write(
+            f"[builder-api] CONFIG WARN: [jobs.{name}].{k} = "
+            f"{raw[k]!r} — unknown field, ignored. Known fields: "
+            f"{sorted(known)}\n"
+        )
+
     return Job(
         name=name,
         command=cmd,
         args_template=tuple(args_raw),
         timeout_s=timeout_s,
+        kill_after_s=kill_after_s,
+        cwd=cwd,
         description=str(raw.get("description") or ""),
-        sha256=sha256,
+        command_hash=command_hash,
+        command_hash_path=command_hash_path,
+        mutates_filesystem=mutates_filesystem,
         placeholders=placeholders,
     )
 
@@ -469,12 +597,24 @@ _HASH_CACHE: dict[tuple[str, float, int], str] = {}
 _HASH_CACHE_CAP = 64
 
 
-def resolve_command(command: str, project_root: Path) -> Optional[Path]:
+def resolve_command(
+    command: str, project_root: Path, cwd: str = "."
+) -> Optional[Path]:
     """
     Resolve `command` to an absolute Path:
-      - absolute path  → use as-is (must exist)
-      - starts with ./ or ../ or contains a /  → relative to project_root
-      - bare name      → shutil.which() lookup on PATH
+      - absolute path                          → use as-is (must exist)
+      - contains a "/" (relative path)         → try project_root/cwd/command
+                                                 first; fall back to
+                                                 project_root/command
+      - bare name                              → shutil.which() lookup on PATH
+
+    The cwd-first lookup is what lets a monorepo job declare
+    `command = "vendor/bin/phpunit"` + `cwd = "api"` and have the daemon
+    find the binary at `<root>/api/vendor/bin/phpunit` — without it,
+    callers had to wrap with `bash -c "cd api && exec vendor/bin/phpunit"`
+    to dodge a 412 command_not_found at request time. Both lookups are
+    resolve()d and constrained to stay under project_root (symlink-escape
+    check) so a wayward `cwd` can't widen the surface.
 
     Returns the Path if found and is a regular file; None otherwise.
     """
@@ -484,8 +624,20 @@ def resolve_command(command: str, project_root: Path) -> Optional[Path]:
     if p.is_absolute():
         return p if p.is_file() else None
     if "/" in command:
-        candidate = (project_root / command).resolve()
-        return candidate if candidate.is_file() else None
+        # Try cwd-relative first (covers the monorepo case), then
+        # project-root-relative (covers the "binary at repo root" case).
+        candidates = []
+        if cwd and cwd not in ("", "."):
+            candidates.append((project_root / cwd / command).resolve())
+        candidates.append((project_root / command).resolve())
+        for cand in candidates:
+            try:
+                cand.relative_to(project_root)
+            except ValueError:
+                continue  # escape attempt — skip, don't return
+            if cand.is_file():
+                return cand
+        return None
     found = shutil.which(command)
     return Path(found) if found else None
 
@@ -518,23 +670,48 @@ def compute_command_sha256(path: Path) -> str:
 
 def verify_command_hash(job: Job, project_root: Path) -> Path:
     """
-    Resolve `job.command` and (if `job.sha256` is set) check the file hash
-    against it. Returns the resolved Path on success.
+    Resolve `job.command`, then (if `job.command_hash` is set) hash the
+    file at `job.command_hash_path` (relative to project_root) and verify
+    against `job.command_hash`. Returns the resolved command Path on success.
+
+    `command_hash_path` decouples WHAT-WE-RUN from WHAT-WE-HASH: a wrapper
+    job whose command is "docker exec llm-docker /path/to/script.sh" sets
+    path = "<script.sh>" to pin the script (which lives in the bind-mount
+    and is the actual attack surface), not the docker binary (which
+    changes on every Docker Desktop update).
 
     Raises:
-        CommandNotFound      — resolution failed
-        CommandHashMismatch  — sha256 declared but actual differs
+        CommandNotFound      — `command` resolution failed
+        CommandHashMismatch  — hash declared but actual mismatches, OR
+                               path escapes project_root, OR path missing
     """
-    resolved = resolve_command(job.command, project_root)
+    resolved = resolve_command(job.command, project_root, cwd=job.cwd)
     if resolved is None:
         raise CommandNotFound(job=job.name, command=job.command)
-    if job.sha256 is not None:
-        actual = compute_command_sha256(resolved)
-        if actual != job.sha256:
+    if job.command_hash is not None:
+        target = (project_root / job.command_hash_path).resolve()
+        try:
+            target.relative_to(project_root)
+        except ValueError:
             raise CommandHashMismatch(
                 job=job.name,
                 command=str(resolved),
-                expected=job.sha256,
+                expected=job.command_hash,
+                actual=f"<path escapes project_root: {job.command_hash_path}>",
+            )
+        if not target.is_file():
+            raise CommandHashMismatch(
+                job=job.name,
+                command=str(resolved),
+                expected=job.command_hash,
+                actual=f"<file not found: {job.command_hash_path}>",
+            )
+        actual = compute_command_sha256(target)
+        if actual != job.command_hash:
+            raise CommandHashMismatch(
+                job=job.name,
+                command=str(resolved),
+                expected=job.command_hash,
                 actual=actual,
             )
     return resolved

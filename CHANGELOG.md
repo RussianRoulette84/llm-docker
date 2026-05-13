@@ -1,3 +1,80 @@
+# v2.4 (2026-05-13)
+
+Builder API tightened so a project can't author its own host commands anymore. Plus the chromium-leak fix, a working monorepo story, and a pile of small polish.
+
+## Builder API — security
+
+- [CHANGE] Every command Claude can run on your Mac now lives in a single host file: `~/.llm-docker/builder-api.toml`. Per-project tomls are no longer read. One file to audit, no project can sneak a new command past you.
+- [CHANGE] The plugin feature is gone. It let a project drop a Python file that ran with full host access — too much trust for a sandbox. No replacement; the surface is closed.
+- [CHANGE] Editing the host toml no longer takes effect automatically — kill the daemon and `cld` will relaunch it. Why: an in-container agent could otherwise talk you into running a script that silently widened what it's allowed to run.
+- [NEW] Mark destructive jobs with `mutates_filesystem = true`. Callers then have to send an explicit confirmation header on top of the password — so a contract-test loop can't accidentally fire `prettier --write` and reformat 300 files before you can cancel.
+- [NEW] Pin a script's sha256 in the toml with `command_hash`. The daemon refuses to run it if anyone touches the file.
+- [NEW] `{{container}}` token in job args — resolves at request time to whichever Docker container belongs to this project. Lets `docker exec` wrapper jobs survive container restarts.
+- [NEW] Per-job `cwd = "<subdir>"` for monorepos. Frontend in `angular/`, api in `api/`, both share the same daemon.
+- [NEW] Unknown fields or stale `plugin = ...` keys in the toml now warn loudly at startup instead of being silently ignored. Catches typos the moment the daemon boots.
+
+## Builder API — reliability
+
+- [BUG] Killed browser jobs no longer leave a 1 GB chromium running. The whole bash → node → chromium chain dies together.
+- [BUG] Cancelling a build now waits until the job has actually stopped before replying, instead of returning the moment the kill signal was sent. The reply also tells you how it exited.
+- [BUG] Cancelled jobs were showing as "failed" in the history. Now they show as "cancelled".
+- [BUG] Jobs running in a subdir (`cwd = "api"` + `command = "vendor/bin/phpunit"`) were failing with "command not found". They find the binary now.
+- [NEW] Cancel the running job without killing the daemon.
+
+## Builder API — visuals
+
+- [BUG] Builder-api pane was blank in narrow iTerm splits. Now shows a compact ASCII frame.
+- [BUG] After exiting Claude and relaunching, `cld -a` was opening a fresh builder-api pane instead of reusing the existing one. Now finds the pane by which port the daemon is on.
+- [NEW] Daemon prints every job it knows about at startup, right under the banner. First thing you see when it boots.
+- [TWEAK] Project name highlighted in pink so two projects' panes are easy to tell apart at a glance.
+
+## llm-docker cage
+
+- [BUG] After `cld --build`, the next launch was crashing with `sleep: invalid time interval`. The smart-rebuild was accidentally baking the build's temporary entrypoint into the image. Fixed.
+- [NEW] `cld --rebuild-force` — full rebuild from the Dockerfile when you want a clean slate. `--build` is now the fast smart-rebuild.
+- [TWEAK] First time you use a tmux flag (`-tr`, `-tc`, `-tcl`), the matching install flag flips on in your config and the image smart-rebuilds. No more full rebuild for a tmux flavor switch.
+
+## Browsing
+
+- [NEW] Chromium is now pre-installed in the image, so Playwright works on first launch without a 60-second download. Also works on Linux arm64 (which Playwright's default channel doesn't support).
+- [TWEAK] Headful + headless chromium are gated behind `INSTALL_BROWSING=true` in `llm-docker.conf`.
+
+## PHP toolchain
+
+- [NEW] PHP 8.3, Composer, and Laravel Envoy now ship in the image (`INSTALL_PHP=true` + `INSTALL_PHP_ENVOY=true`, both on by default). Run `envoy run deploy` from inside the container with nothing installed on the Mac. ~80 MB on the image.
+
+## Shell & UX
+
+- [NEW] True-color terminals: `COLORTERM=truecolor` is set on every container launch, so claude / opencode / any modern TUI gets the 24-bit palette.
+- [BUG] Commands installed under `~/.config/composer/vendor/bin` (Envoy, etc.) were "command not found" in Claude's Bash tool even though they worked in interactive shells. Every child shell now inherits the full PATH.
+
+## Examples / templates
+
+- [CHANGE] Old bundled examples replaced with two clean public starters: `python-example/` (FastAPI + pytest) and `php-example/` (PHP built-in + PHPUnit). Both ship with the 5 standard MCP servers pre-wired and a README walking the integration.
+
+### Dev logs
+
+- [TWEAK] `src/builder-api/config.py` rewritten — drops per-repo file discovery, parses the layered host schema, resolves `[jobs.*]` ∪ `[language.<lang>.jobs.*]` ∪ `[project.<name>.jobs.*]` for the daemon's project at boot.
+- [TWEAK] Hot-reload subsystem deleted: `src/builder-api/hot_reload.py` trashed, `ConfigWatcher` import + `_apply_reload` callback + watcher start/stop removed from `server.py`. Daemon's `Config` is immutable for the process lifetime.
+- [TWEAK] `server.py main()` parses `--project <name>` / `--config <path>`; `run-local.sh` derives `<name>` from `$(basename "$project_dir")`; `cld` / `ocd` pass it through.
+- [TWEAK] `cld` / `ocd` read project port from `[project.<name>].port` in the host toml via an inline awk parser, falling back to `llm-docker.conf` then 6666.
+- [TWEAK] `cld` / `ocd` add `--label "llm-docker-project=$CWD_BASE"` on every `docker run` so the daemon's `{{container}}` substitution can find the per-project container via `docker ps --filter label=...`.
+- [TWEAK] `builder_api.applescript` gained `findSessionByPort()` (lsof → ps → match iTerm tty); old title-only lookup kept as fallback.
+- [TWEAK] Deleted `src/builder-api/plugin.py`, the dead `.builder-api.toml` at repo root, and `src/builder-api/examples/*`; migrated `lint-shell` + `syntax-py` into the starter template's `[project.llm-docker]` block.
+- [TWEAK] `command_hash` is now a table — `{ path = "<rel-path>", sha256 = "sha256:<64-hex>" }` — so wrapper jobs (`command = "docker"`, `args = [..., "<script>"]`) pin the wrapped script, not the volatile docker binary.
+- [TWEAK] `POST /build` returns 410 Gone with a pointer to `POST /job/<name>`. Legacy `enqueue()` + `_validate_args()` removed from `build_queue.py`; `BuildCfg.command` + `allowed_args` dropped from `config.py`.
+- [TWEAK] `/queue` history shrunk from ~3 KB per entry to ~200 B by dropping log tails (full log still at `/build_status?id=<id>`); added `total_history` count.
+- [TWEAK] `resolve_command()` now tries `<project_root>/<cwd>/<command>` first, then `<project_root>/<command>`, with `resolve()`-based symlink-escape rejection on both. `verify_command_hash()` passes `job.cwd` through.
+- [TWEAK] `cancel_current()` blocks on `entry._done.wait(timeout=15.0)` after `_kill_process_group`, so the API contract matches reality.
+- [TWEAK] `mutates_filesystem` gate enforced in `server._ep_job_post` between dryrun and enqueue; returns 428 + `{error, job, reason, fix}` when the header is missing.
+- [TWEAK] `banner.show_banner()` signature accepts the job-name list (was: count); wraps to terminal width with 4-space hang for continuation lines.
+- [TWEAK] New starter template at `src/builder-api/builder-api.host.toml.example`.
+- [TWEAK] `src/docker/docker-entrypoint.sh` sources `/root/.zprofile` before the `TOOL=` dispatch, so claude / opencode and every spawned shell start with the full PATH.
+- [TWEAK] `install_devpack.sh` PHP block: PHP 8.3 from packages.sury.org, Composer via upstream installer, Envoy via `composer global require laravel/envoy` with `COMPOSER_ALLOW_SUPERUSER=1` + post-condition check. `src/docker/zprofile` adds `$HOME/.config/composer/vendor/bin` to PATH.
+- [TWEAK] Added `PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright` to Dockerfile + idempotent install in `install_devpack.sh`.
+- [TWEAK] Added `.Trash-*` to `.gitignore`.
+- [TWEAK] Imported develop branch into master (merge of sleep-bug fix + v2.3 security pass).
+
 # v2.3 (2026-05-07)
 
 ## Stability

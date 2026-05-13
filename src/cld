@@ -212,7 +212,8 @@ CONTINUE_SESSION=false
 RESUME_SESSION=""
 SLOT=""
 START_API=false           # --api / -a toggle; see _maybe_start_api below
-START_API_EXPLICIT=false  # set by -a/--api so a missing flag falls back to conf's BUILDER_API_AUTOSTART
+START_API_BG=false        # -ab / --api-bg: skip the window, background only
+START_API_EXPLICIT=false  # set by -a/-ab/--api so a missing flag falls back to conf's BUILDER_API_AUTOSTART
 CLEAN_CONTAINERS=false   # --clean: stop/remove leftover llm-docker containers
 USE_TMUX=false    # -t / --tmux: wrap claude launch inside a tmux session
 TMUX_TEAM=false   # -tt / --tmux-team: multi-pane tmux layout inside one container
@@ -302,6 +303,15 @@ while [[ $# -gt 0 ]]; do
                 START_API=true
                 shift
             fi
+            ;;
+        -ab|--api-bg)
+            # Background-only variant — no new terminal window, log to /tmp.
+            # Useful when you don't want a second window cluttering things,
+            # or when macOS AppleScript permissions are denied.
+            START_API=true
+            START_API_BG=true
+            START_API_EXPLICIT=true
+            shift
             ;;
         -h|--help)
             cat <<'HELP'
@@ -464,13 +474,14 @@ if [ "$CLEAN_CONTAINERS" = true ]; then
     fi
 fi
 
-# Colors
-C1='\033[38;5;209m'  # orange
-C2='\033[38;5;214m'  # light orange
-DIM='\033[2m'
-RST='\033[0m'
-GRN='\033[38;5;82m'
-CYN='\033[38;5;81m'
+# Colors. Use $'…' so escapes are interpreted at definition time — _log's
+# printf '%s\n' would otherwise print '\033[…m' literally.
+C1=$'\033[38;5;209m'  # orange
+C2=$'\033[38;5;214m'  # light orange
+DIM=$'\033[2m'
+RST=$'\033[0m'
+GRN=$'\033[38;5;82m'
+CYN=$'\033[38;5;81m'
 
 _spin() {
     local msg="$1" frames=("◐" "◑" "◒" "◓") i=0
@@ -483,24 +494,54 @@ _spin() {
 
 _status() { printf "  ${C1}%s${RST} %s\n" "$1" "$2"; }
 
-# _maybe_start_api — spawn the builder-api server in a separate window if
-# --api was passed AND one isn't already listening on the configured port.
-# macOS: osascript opens a new Terminal tab. Otherwise: background + log.
+# Background the daemon with a log file. Used by the `-ab` path and as
+# the final macOS fallback when no terminal app cooperates.
+_spawn_api_bg() {
+    local launcher="$1" project_dir="$2"
+    local log="/tmp/builder-api-$$.log"
+    nohup bash "$launcher" "$project_dir" >"$log" 2>&1 &
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+    _log CLD "builder-api in background — PID $pid  ·  log: ${C2}$log${RST}"
+}
+
+# _maybe_start_api — spawn the builder-api server if --api / -a was passed
+# AND one isn't already on the configured port. macOS spawn chain:
+# AppleScript (positioned) → `open -a iTerm <.command>` (unpositioned) →
+# `open -a Terminal` → background-with-log. `-ab` skips straight to last.
 _maybe_start_api() {
     [ "$START_API" = true ] || return 0
 
     local project_dir="$1"
+    local project_name
+    project_name="$(basename "$project_dir")"
     local port
-    port="$(_read_env_var BUILDER_API_PORT "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
+    # Port precedence: host's ~/.llm-docker/builder-api.toml under
+    # [project.<name>].port → llm-docker.conf → default 6666. Per-project
+    # .builder-api.toml files are NO LONGER read (security: jobs/commands
+    # must be host-defined; nothing inside a container-writable path is
+    # trusted by the daemon).
+    local host_toml="${HOME}/.llm-docker/builder-api.toml"
+    if [ -f "$host_toml" ]; then
+        port=$(awk -v p="project.$project_name" '
+            $0 ~ "^\\[" p "\\]" { in_block=1; next }
+            in_block && /^\[/ { in_block=0 }
+            in_block && /^[[:space:]]*port[[:space:]]*=/ {
+                gsub(/^[[:space:]]*port[[:space:]]*=[[:space:]]*/, "")
+                gsub(/[^0-9].*$/, "")
+                print; exit
+            }
+        ' "$host_toml")
+    fi
+    if [ -z "${port:-}" ]; then
+        port="$(_read_env_var BUILDER_API_PORT "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
+    fi
     port="${port:-6666}"
 
-    # Quick TCP probe — if the port accepts a connection, assume a daemon
-    # is already running and bail out instead of spawning a duplicate.
-    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
-        exec 3<&- 2>/dev/null || true
-        _status "api" "builder-api already running on :$port — not spawning a new one"
-        return 0
-    fi
+    # Note: TCP-probe dedup removed; the applescript's per-project pane
+    # reuse handles "is a daemon already running for this project" by
+    # finding the iTerm session named `builder-api: <project>`. The kill
+    # in the reuse path targets only that project's port, not all daemons.
 
     local launcher="$SCRIPT_DIR/builder-api/run-local.sh"
     if [ ! -f "$launcher" ]; then
@@ -509,8 +550,50 @@ _maybe_start_api() {
     fi
 
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" >/dev/null
-        _status "api" "builder-api spawned in new Terminal window (port $port)"
+        if [ "$START_API_BG" = true ]; then
+            _spawn_api_bg "$launcher" "$project_dir"
+            return 0
+        fi
+
+        # 1a) Already inside iTerm? Split the current window left/right.
+        # Right pane = 43 cols of builder-api, left pane = whatever the
+        # user was running (their main cld/ocd session, untouched).
+        if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
+            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" >/dev/null 2>&1; then
+                _status "api" "builder-api split into right pane (port $port)"
+                return 0
+            fi
+        fi
+
+        # 1b) Not in iTerm, or split denied: positioned new window.
+        if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" new-window "$port" >/dev/null 2>&1; then
+            _status "api" "builder-api spawned in positioned iTerm window (port $port)"
+            return 0
+        fi
+
+        # 2) AppleScript denied (macOS TCC). Open a .command file via
+        # LaunchServices instead — no AppleEvents permission needed,
+        # but loses window positioning.
+        local cmd_file
+        cmd_file=$(mktemp -t builder-api.XXXXXX).command
+        cat >"$cmd_file" <<EOF
+#!/bin/bash
+cd "$project_dir"
+exec bash "$launcher" "$project_dir"
+EOF
+        chmod +x "$cmd_file"
+        if [ -d "/Applications/iTerm.app" ] && open -a iTerm "$cmd_file" 2>/dev/null; then
+            _log CLD WARNING "AppleScript blocked by macOS — opened iTerm without positioning. Enable iTerm in Settings → Privacy → Automation to restore."
+            return 0
+        fi
+        if open -a Terminal "$cmd_file" 2>/dev/null; then
+            _log CLD WARNING "Opened Terminal.app instead of iTerm."
+            return 0
+        fi
+
+        # 3) No terminal cooperated — background it.
+        _log CLD WARNING "No terminal app available. Backgrounding."
+        _spawn_api_bg "$launcher" "$project_dir"
     else
         # Linux/other: no universal terminal, so background it.
         local log="/tmp/builder-api-$$.log"
@@ -751,6 +834,7 @@ run_claude_container() {
 
     docker run --rm -it \
         --label com.docker.compose.project=llm-docker \
+        --label "llm-docker-project=$CWD_BASE" \
         --hostname llm-docker \
         --name "$CONTAINER_NAME" \
         -w "$DOCKER_WORKDIR" \
@@ -775,6 +859,7 @@ run_claude_container() {
         -e TERM \
         -e COLUMNS \
         -e LINES \
+        -e COLORTERM=truecolor \
         -e TOOL=claude \
         -e NEW_CLAUDE_SESSION="$NEW_CLAUDE_SESSION" \
         -e USE_TMUX="$USE_TMUX" \

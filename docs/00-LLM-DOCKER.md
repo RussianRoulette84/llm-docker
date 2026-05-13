@@ -188,61 +188,87 @@ border) — the cheap/fast runner slot for grep, lint, log-tails.
 
 The host-side daemon at `src/builder-api/` lets the container spawn host
 processes (builds, tests, restarts) without baking your toolchain into the
-image. Lives at `host.docker.internal:6666` by default.
+image. One daemon per project, each on its own port from `[project.<n>].port`
+in the host config; reachable from inside the container at
+`host.docker.internal:<port>`.
 
-**Two consumption shapes:**
+**Config lives on the host only** at `~/.llm-docker/builder-api.toml`.
+Per-project `.builder-api.toml` files are NOT read — the daemon refuses
+to load anything from a project's working tree (security boundary).
+
+**Schema:** three layers compose into the daemon's effective job table.
 
 ```toml
-# Legacy [build] — one command per project
-[build]
-command      = "./build.sh"
-allowed_args = ["--clean", "--fast"]
-timeout_s    = 900
+# 1. Global — every project sees these
+[jobs.git-status]
+command = "git"
+args    = ["status", "--short"]
 
-# Modern [jobs.<name>] — one block per operation, regex-validated placeholders
-[jobs.phpunit]
-command   = "vendor/bin/phpunit"
-args      = ["--filter", "{test}"]
-timeout_s = 60
-[jobs.phpunit.placeholders.test]
-regex     = "^[A-Za-z][A-Za-z0-9_]*$"
-required  = true
+# 2. Language pack — opted into via `languages = [...]` in the project block
+[language.php.jobs.phpunit-filter]
+command = "vendor/bin/phpunit"
+args    = ["--filter", "{test}"]
+[language.php.jobs.phpunit-filter.placeholders.test]
+regex   = "^[A-Za-z][A-Za-z0-9_:]*$"
+required = true
+
+# 3. Project — overrides + extras
+[project.my-app]
+root      = "~/Projects/my-app"
+port      = 6701
+languages = ["php", "compose"]
+  [project.my-app.runtime]
+    enabled       = true
+    start_command = "php -S 0.0.0.0:8000 -t public"
+  [project.my-app.jobs.deploy]
+    command = "scripts/deploy.sh"
 ```
+
+Resolution: later layers replace earlier ones by job name. `GET /jobs` returns
+only the resolved set for THIS daemon's project. Copy
+`src/builder-api/builder-api.host.toml.example` to get started.
 
 **Endpoints (locked):**
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/jobs` | Job catalog for MCP introspection (incl. `config_mtime`) |
-| POST | `/job/<name>` | Run a `[jobs.<name>]` template; `{params, agent_id}` body |
-| POST | `/build` | Legacy single-command path |
+| GET | `/jobs` | Job catalog for this project (incl. `config_mtime`, `project`, `languages`) |
+| POST | `/job/<name>` | Run a resolved job; `{params, agent_id}` body |
 | GET | `/build_status?id=&wait=N` | Long-poll status (max 60s), `log_tail` on finish |
-| GET | `/queue` | `{current, pending[], history[]}` |
+| GET | `/queue` | `{current, pending[], history[], total_history}` |
 | DELETE | `/queue/<id>` | Cancel a pending build |
+| DELETE | `/current/cancel` | Cancel the running build (kills entire process group) |
+| POST | `/run` / `/stop` | Start/restart or stop the `[project.<n>.runtime]` process |
+| GET | `/status` | Runtime PID + uptime + current build snapshot |
 | GET | `/logs?file=&n=` | Tail an alias |
 | GET | `/events?type=&since=&n=` | JSONL event feed |
 | GET | `/ws` | Live event WebSocket |
+| POST | `/log` | Browser-console tunnel (CORS-allowed) |
+| POST | `/build` | **Removed** (410 Gone). Use `/job/<name>`. |
 
-`?dryrun=1` on `POST /build` and `POST /job/<name>` returns what would run
-without enqueueing. Auth: `X-Builder-API-Password: <pw>` header OR
-`?key=<pw>` query string. Loopback bind reads are unauthenticated by default.
+`?dryrun=1` on `POST /job/<name>` returns the resolved argv without
+enqueueing. Auth: `X-Builder-API-Password: <pw>` header OR `?key=<pw>`
+query string. Loopback bind reads are unauthenticated by default; non-loopback
+forces password + `auth_reads = true`. Plugin support was removed entirely.
 
 **Validation error shapes (locked):** 400 `validation_failed`, 404
-`unknown_job`, 412 `command_hash_mismatch`, 412 `command_not_found`. See
-`src/builder-api/README.md` for full schema.
+`unknown_job`, 410 endpoint removed, 412 `command_hash_mismatch`, 412
+`command_not_found`. See `src/builder-api/README.md` for full schema.
 
-**Per-stack examples:** `src/builder-api/examples/quake/`,
-`.../node/`, `.../php-docker-compose/`, plus the annotated reference at
-`examples/.builder-api.toml`.
+**Starter template:** `src/builder-api/builder-api.host.toml.example` —
+global jobs + python/php/node/compose language packs + sample
+`[project.<name>]` blocks. Copy to `~/.llm-docker/builder-api.toml` and
+edit; the daemon reads only that host file.
 
 **Cool boot output:** the daemon's terminal renders an ASCII banner +
 color-coded event tail (▲ server_started, + build_enqueued, ▸ build_started,
 ✓ build_finished, ↻ config_reloaded). HTTP access logs dim into the
 background; 4xx/5xx surface in red.
 
-**Hot-reload:** the daemon polls `.builder-api.toml` mtime every ~1.5s. New
-jobs/aliases/build settings apply to next enqueue. In-flight builds keep
-their snapshotted command + timeout.
+**Hot-reload:** the daemon polls `~/.llm-docker/builder-api.toml` mtime
+every ~1.5s and re-resolves THIS daemon's project view. New jobs/aliases
+apply to next enqueue. In-flight builds keep their snapshotted command +
+timeout. Bind / port / runtime changes require a daemon restart.
 
 ## 8. env-gorilla integration
 
@@ -272,7 +298,6 @@ llm-docker/
 │   ├── anthropic/                  ← upstream Claude Code reference
 │   ├── opencode/                   ← upstream OpenCode reference
 │   └── tmux/                       ← tmux-specific docs
-├── .builder-api.toml               ← *this repo's own* builder-api config
 └── src/
     ├── cld                         ← HOST script: claude launcher
     ├── ocd                         ← HOST script: opencode launcher
@@ -289,7 +314,7 @@ llm-docker/
     │   └── colorize.sh             ← banner gradient renderer
     ├── builder-api/                ← HOST-side Python daemon
     │   ├── server.py               ← HTTP routing + AppContext
-    │   ├── config.py               ← .builder-api.toml parsing
+    │   ├── config.py               ← host-toml schema loader + project view resolver
     │   ├── jobs.py                 ← [jobs.*] templates + validation + sha256
     │   ├── build_queue.py          ← FIFO worker, dedupe, snapshot-per-entry
     │   ├── hot_reload.py           ← mtime watcher
@@ -299,8 +324,8 @@ llm-docker/
     │   ├── security.py             ← AuthGate + rate limit + size caps
     │   ├── ws.py                   ← WebSocket
     │   ├── client.py               ← Python helper for in-container callers
-    │   ├── run-local.sh            ← per-project launcher
-    │   └── examples/               ← per-stack .builder-api.toml templates
+    │   ├── run-local.sh            ← per-project launcher (passes --project)
+    │   └── builder-api.host.toml.example  ← starter host config template
     ├── ascii/llm-docker.txt        ← shared banner art
     ├── lib/ywizz/                  ← TUI helpers (theme, prompts, animations)
     └── multi-llm-docker.applescript ← macOS multi-window grid layout
@@ -351,11 +376,11 @@ Save → daemon hot-reloads within ~2s → `POST /job/<name>` is live.
 |---|---|---|
 | `sleep: invalid time interval 'Read ./CLAUDE.md...'` on launch | Smart rebuild committed an image with `ENTRYPOINT=["sleep"]` (pre-fix bug, fixed in v2.2). | `cld --rebuild-force` once. |
 | `Permission denied` exec'ing `run-local.sh` via env-gorilla | Script is 0644 (non-executable). | Already fixed: re-exec uses `bash "$0" "$@"`. |
-| `[builder-api] CONFIG ERROR: no config file found` | No `.builder-api.toml` in CWD. | Drop one from `src/builder-api/examples/`. |
+| `[builder-api] CONFIG ERROR: host config not found` | No `~/.llm-docker/builder-api.toml`. | `cp src/builder-api/builder-api.host.toml.example ~/.llm-docker/builder-api.toml` and edit. |
+| `[builder-api] CONFIG ERROR: no [project.<name>]` | Daemon launched with `--project <X>` but the host toml has no matching block. | Add `[project.<X>] root=... port=...` to the host toml. |
 | `cld --tt 3` does nothing useful | `--tt` (double dash) doesn't match the case statement. | Use `-tt 3` (single dash). |
 | Smart rebuild's "fallback to full build" is silently a no-op | Pre-existing bug: `setup_image` skips when image exists. | If `cld --build` fails, run `cld --rebuild-force`. |
-| `POST /build` accepts any arg even with `allowed_args = []` | Pre-existing bug, fixed in v2.2 — empty list now means "no args allowed". | Restart the daemon to pick up. |
-| Mac daemon doesn't pick up Python edits | Hot-reload only handles `.builder-api.toml`, not Python source. | `pkill -f builder-api/server.py && python3 src/builder-api/server.py` (or `cld -a`). |
+| Mac daemon doesn't pick up Python edits | Hot-reload only watches `~/.llm-docker/builder-api.toml`, not Python source. | `pkill -f builder-api/server.py` then re-launch via `cld -a` (or `python3 src/builder-api/server.py --project <name>`). |
 
 ## 12. Hard rules (from project CLAUDE.md)
 

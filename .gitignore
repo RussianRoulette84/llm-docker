@@ -2,20 +2,45 @@
 .env
 .env.local
 
-# Build / test artifacts
+# Logs
 *.log
 logs/
-logs/
+
+# Build / dist
 dist/
 build/
-node_modules/
+*.egg-info/
+
+# Python caches
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
+.tox/
+
+# Python virtualenvs
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
 
 # OS metadata
 .DS_Store
+.Trash-*
+Thumbs.db
 
 # Private agent notes / scratch
 .agents/
@@ -23,3 +48,10 @@ AGENTS.md
 
 # Quake reference implementation — never committed, wherever it ends up in the tree.
 quake_api/
+
+# Private user slash commands (carry private project refs)
+.claude/commands/SHAKETREE.md
+.claude/commands/SYNC_CLAUDE.md
+
+# Local audit artifacts (per-session reports, may quote private context)
+audits/

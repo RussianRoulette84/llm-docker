@@ -4,16 +4,16 @@ builder-api — a project-agnostic HTTP daemon for build / run / logs /
 events, designed to be called by the Docker container (Claude, OpenCode)
 running on the host via host.docker.internal.
 
-Boot flow (`python3 server.py` inside the project root):
+Boot flow (`python3 server.py --project <name>`):
 
-    1. config.load()            → read .builder-api.{toml,yml,json}
+    1. config.load(project)     → read ~/.llm-docker/builder-api.toml,
+                                  resolve global + language + project view
     2. events.EventStore(...)   → open jsonl feed (or no-op if disabled)
-    3. plugin.load(...)         → dynamic-import optional plugin file
-    4. BuildQueue(...).start()  → spawn worker thread
-    5. RuntimeManager(...)      → track /run process
-    6. SizeLimits + AuthGate    → per-request clamps + auth
-    7. ThreadingHTTPServer(...) → bind and serve_forever
-    8. SIGINT/SIGTERM handler  → shut down queue + runtime, exit clean
+    3. BuildQueue(...).start()  → spawn worker thread
+    4. RuntimeManager(...)      → track /run process
+    5. SizeLimits + AuthGate    → per-request clamps + auth
+    6. ThreadingHTTPServer(...) → bind and serve_forever
+    7. SIGINT/SIGTERM handler   → shut down queue + runtime, exit clean
 
 The handler is intentionally flat: one `dispatch()` per method, one
 small per-endpoint function. No decorators, no framework magic.
@@ -25,7 +25,6 @@ import json
 import os
 import signal
 import sys
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,13 +41,19 @@ import banner as _banner                       # noqa: E402
 import config as _config                       # noqa: E402
 from build_queue import BuildQueue, QueueFull  # noqa: E402
 from events import EventStore                  # noqa: E402
-from hot_reload import ConfigWatcher           # noqa: E402
 import jobs as _jobs                           # noqa: E402
 from logs import LogStore                      # noqa: E402
-from plugin import load as load_plugin         # noqa: E402
 from runtime import RuntimeManager             # noqa: E402
 from security import AuthGate, HTTPReject, SizeLimits  # noqa: E402
 from ws import handle_ws_upgrade               # noqa: E402
+
+
+# No-op lifecycle callbacks. The plugin feature was dropped (security: a
+# plugin file in container-writable paths was a host-exec escape vector).
+# Build/runtime callbacks remain in the API for future use but default to
+# no-ops; nothing in the host config can register handlers.
+def _noop(*_args, **_kwargs) -> None:
+    return None
 
 
 # Paths for which we emit CORS headers. Anything else gets bare responses so
@@ -75,57 +80,34 @@ class AppContext:
             drop_bytes=cfg.events.drop_bytes,
         )
         self.log_store = LogStore(cfg.log_aliases)
-        self.plugin = load_plugin(cfg.plugin_path)
         self.size_limits = SizeLimits(cfg)
         self.auth = AuthGate(cfg, self.events.append)
 
         self.runtime = RuntimeManager(
-            cfg,
-            self.events,
-            on_run_start=self.plugin.on_run_start,
-            on_run_exit=self.plugin.on_run_exit,
+            cfg, self.events,
+            on_run_start=_noop, on_run_exit=_noop,
         )
         self.build_queue = BuildQueue(
-            cfg,
-            self.events,
-            on_build_start=self.plugin.on_build_start,
-            on_build_finish=self.plugin.on_build_finish,
+            cfg, self.events,
+            on_build_start=_noop, on_build_finish=_noop,
         )
         self.build_queue.start()
-
-        self.plugin_handlers = self.plugin.handlers()
 
         # Live event tail: every EventStore.append() surfaces as one
         # colored line on stderr. Subscribed BEFORE the first event so
         # `server_started` lands in the user's view too.
         self.events.subscribe(_banner.event_line)
 
-        # Hot-reload watcher. Started in main() after binding, so initial
-        # boot failures still surface as a normal SystemExit rather than
-        # a daemon thread eating the error.
-        self.config_watcher = ConfigWatcher(on_reload=self._apply_reload)
-
-    def _apply_reload(self, new_cfg) -> None:
-        """Atomic-swap callback for ConfigWatcher. Runs on the watcher
-        thread. Pushes the new cfg into every subsystem that supports
-        in-place reload; logs subsystems that don't (runtime, plugin)
-        as 'unchanged'."""
-        old = self.cfg
-        self.cfg = new_cfg
-        self.build_queue.update_cfg(new_cfg)
-        self.log_store.update_aliases(new_cfg.log_aliases)
-        self.events.append(
-            "config_reloaded",
-            {
-                "jobs": list(new_cfg.jobs.keys()),
-                "log_aliases": sorted(new_cfg.log_aliases.keys()),
-                "config_mtime": new_cfg.config_mtime,
-                "previous_mtime": old.config_mtime,
-            },
-        )
+        # NO hot-reload of the host toml. v2.4.x removed the
+        # ConfigWatcher subsystem entirely. The cage's job surface only
+        # grows on a deliberate operator action (kill + relaunch the
+        # daemon) — never silently via a file write. Rationale: an
+        # in-container agent that gets a splice script run on the host
+        # would otherwise widen the exec surface mid-session. With no
+        # hot-reload, the banner's startup job list IS the audit
+        # checkpoint; nothing new can sneak in between restarts.
 
     def shutdown(self) -> None:
-        self.config_watcher.stop()
         self.build_queue.shutdown()
         self.runtime.shutdown()
 
@@ -190,18 +172,23 @@ class BuilderHandler(BaseHTTPRequestHandler):
         agent = self.headers.get("X-Agent-ID") or "-"
         ip = self.client_address[0] if self.client_address else "?"
         line = fmt % args
-        # `args` for a request line is (request, status, size); status is the
-        # second token in args[1]. We sniff it once for color choice.
         try:
             code = int(args[1])
         except (IndexError, ValueError, TypeError):
             code = 200
         c = _banner.GREY if code < 400 else _banner.RED
-        sys.stderr.write(
-            f"  {_banner.DIM}{time.strftime('%H:%M:%S')}{_banner.RST}  "
-            f"{c}{_banner.DIM}· http{' ':<19}{_banner.RST}  "
-            f"{_banner.GREY}{ip} {agent}  {line}{_banner.RST}\n"
-        )
+        if _banner._is_narrow():
+            # Narrow window: just the request + code, no ip/agent padding.
+            sys.stderr.write(
+                f"{_banner.DIM}{time.strftime('%H:%M')}{_banner.RST} "
+                f"{c}{_banner.DIM}· {line}{_banner.RST}\n"
+            )
+        else:
+            sys.stderr.write(
+                f"  {_banner.DIM}{time.strftime('%H:%M:%S')}{_banner.RST}  "
+                f"{c}{_banner.DIM}· http{' ':<19}{_banner.RST}  "
+                f"{_banner.GREY}{ip} {agent}  {line}{_banner.RST}\n"
+            )
 
     # ------------------------------------------------------------------
     # Core dispatch
@@ -225,15 +212,6 @@ class BuilderHandler(BaseHTTPRequestHandler):
         self._cors_allowed = split.path in _CORS_ALLOWED_PATHS
         path = split.path
         query = parse_qs(split.query, keep_blank_values=False)
-
-        # -------- Plugin-registered endpoints --------
-        # Plugins can define any path that isn't owned by core; we check
-        # their registry before falling through to core routes so they can
-        # shadow extension points if desired.
-        plugin_route = self.app.plugin_handlers.get(path, {}).get(method)
-        if plugin_route is not None:
-            self._serve_plugin(plugin_route, method, query)
-            return
 
         # -------- Core routing table --------
         route = (method, path)
@@ -277,6 +255,11 @@ class BuilderHandler(BaseHTTPRequestHandler):
                 return
             build_id = path[len("/queue/"):]
             self._serve_json(*self._ep_queue_delete(build_id))
+            return
+        if route == ("DELETE", "/current/cancel"):
+            if not self._maybe_auth(read=False):
+                return
+            self._serve_json(*self._ep_current_cancel())
             return
         if route == ("GET", "/logs"):
             if not self._maybe_auth(read=True):
@@ -352,37 +335,16 @@ class BuilderHandler(BaseHTTPRequestHandler):
         }
 
     def _ep_build_post(self, query: dict) -> tuple[int, dict]:
-        body = self._read_json_body()
-        if body is None:
-            return 400, {"error": "invalid JSON body"}
-
-        args = body.get("args", [])
-        agent_id = body.get("agent_id") or self.headers.get("X-Agent-ID") or ""
-
-        # Dryrun: validate the args against the whitelist but don't enqueue.
-        # Returns the resolved argv that WOULD run.
-        if _is_truthy_query(query, "dryrun"):
-            try:
-                validated = self.app.build_queue._validate_args(args)
-            except ValueError as e:
-                return 400, {"error": str(e)}
-            return 200, {
-                "dryrun": True,
-                "would_run": [self.app.cfg.build.command, *validated],
-                "cwd": str(self.app.cfg.project_root),
-                "timeout_s": self.app.cfg.build.timeout_s,
-            }
-
-        try:
-            entry = self.app.build_queue.enqueue(
-                args=args,
-                agent_id=str(agent_id),
-            )
-        except ValueError as e:
-            return 400, {"error": str(e)}
-        except QueueFull as e:
-            return 429, {"error": str(e)}
-        return 202, {"queue_id": entry.id, **entry.to_public()}
+        # Legacy single-`[build]` endpoint. Removed when the config layer
+        # moved to host-only ~/.llm-docker/builder-api.toml — projects no
+        # longer declare a `[build]` block. Everything goes through
+        # POST /job/<name>, which has the same security model.
+        return 410, {
+            "error": "endpoint removed",
+            "use": "POST /job/<name>",
+            "note": "Per-project [build] tables are gone. Declare your "
+                    "commands as [jobs.X] in ~/.llm-docker/builder-api.toml.",
+        }
 
     def _ep_job_post(self, job_name: str, query: dict) -> tuple[int, dict]:
         cfg = self.app.cfg
@@ -418,6 +380,9 @@ class BuilderHandler(BaseHTTPRequestHandler):
             return 412, e.to_response()
 
         # 3. Dryrun shortcut: report what WOULD run without enqueueing.
+        # Dryrun bypasses the mutation gate below since nothing actually
+        # runs — a carpet-test wanting to verify the contract can still
+        # do `POST /job/<name>?dryrun=1` safely.
         if _is_truthy_query(query, "dryrun"):
             return 200, {
                 "dryrun": True,
@@ -425,15 +390,37 @@ class BuilderHandler(BaseHTTPRequestHandler):
                 "would_run": [str(resolved), *argv],
                 "cwd": str(cfg.project_root),
                 "timeout_s": job.timeout_s,
+                "mutates_filesystem": job.mutates_filesystem,
                 "matched_placeholders": normalized,
             }
 
-        # 4. Enqueue (or get existing entry under dedupe window).
+        # 4. Mutation gate. Jobs declared `mutates_filesystem = true` need
+        # the caller to opt in via `X-Mutation-Confirmed: yes`. Stops a
+        # carpet-test pattern (POST + race-to-DELETE) from accidentally
+        # firing destructive in-place rewrites (prettier --write, pint
+        # without --test, ruff format, etc.) — the cancel race is
+        # unwinnable on fast file walkers, so the only safe answer is to
+        # refuse the request. 428 Precondition Required is the right
+        # semantic ("you need to send more headers").
+        if job.mutates_filesystem:
+            confirmed = (self.headers.get("X-Mutation-Confirmed") or "").strip().lower()
+            if confirmed != "yes":
+                return 428, {
+                    "error": "mutation_confirmation_required",
+                    "job": job_name,
+                    "reason": "this job is declared `mutates_filesystem = true`",
+                    "fix": "send header `X-Mutation-Confirmed: yes` to confirm "
+                           "intent to run a write-in-place job",
+                }
+
+        # 5. Enqueue (or get existing entry under dedupe window).
         try:
             entry = self.app.build_queue.enqueue_job(
                 args=argv,
                 command=str(resolved),
                 timeout_s=job.timeout_s,
+                kill_after_s=job.kill_after_s,
+                cwd=job.cwd,
                 job_name=job_name,
                 params=normalized,
                 agent_id=str(agent_id),
@@ -444,21 +431,13 @@ class BuilderHandler(BaseHTTPRequestHandler):
 
     def _ep_jobs(self) -> dict:
         cfg = self.app.cfg
-        out: dict = {
+        return {
             "jobs": {name: job.to_public() for name, job in cfg.jobs.items()},
-            "config_version": "0.2",
+            "config_version": "0.3",
             "config_mtime": cfg.config_mtime,
+            "project": cfg.name,
+            "languages": list(cfg.languages),
         }
-        # Expose the legacy [build] config in the same response so MCP
-        # clients can offer both old and new project shapes from one
-        # introspection call.
-        out["build"] = {
-            "command": cfg.build.command,
-            "allowed_args": list(cfg.build.allowed_args),
-            "timeout_s": cfg.build.timeout_s,
-            "dedupe_window_s": cfg.build.dedupe_window_s,
-        }
-        return out
 
     def _ep_build_status(self, query: dict) -> tuple[int, dict]:
         ids = query.get("id") or []
@@ -467,6 +446,12 @@ class BuilderHandler(BaseHTTPRequestHandler):
         wait_s = float((query.get("wait") or ["0"])[0] or "0")
         wait_s = max(0.0, min(wait_s, 60.0))
         return 200, self.app.build_queue.wait(ids[0], wait_s)
+
+    def _ep_current_cancel(self) -> tuple[int, dict]:
+        result = self.app.build_queue.cancel_current()
+        if result is None:
+            return 404, {"error": "no_current_build"}
+        return 200, {"ok": True, **result}
 
     def _ep_queue_delete(self, build_id: str) -> tuple[int, dict]:
         if not build_id:
@@ -573,38 +558,6 @@ class BuilderHandler(BaseHTTPRequestHandler):
         return 200, self.app.runtime.stop()
 
     # ------------------------------------------------------------------
-    # Plugin dispatch: plugin handlers get (body, handler), return a dict.
-    # ------------------------------------------------------------------
-
-    def _serve_plugin(self, fn, method: str, query: dict) -> None:
-        # Plugins get their own auth decision — they're the escape hatch.
-        # To avoid defaulting them open, we treat plugin routes like POSTs
-        # unless the plugin explicitly marks a handler with `.open = True`.
-        require = True
-        if getattr(fn, "open", False):
-            require = False
-        if not self.app.auth.check(self, require_auth=require):
-            return
-
-        body = None
-        if method in ("POST", "PUT", "PATCH", "DELETE"):
-            body = self._read_json_body()
-            if body is None:
-                self._serve_json(400, {"error": "invalid JSON body"})
-                return
-
-        try:
-            result = fn(body, self, query=query)
-        except Exception as e:
-            self._serve_json(500, {"error": f"plugin handler raised: {e!r}"})
-            return
-
-        if not isinstance(result, dict):
-            self._serve_json(500, {"error": "plugin handler must return a dict"})
-            return
-        self._serve_json(200, result)
-
-    # ------------------------------------------------------------------
     # JSON I/O helpers
     # ------------------------------------------------------------------
 
@@ -660,8 +613,32 @@ def _is_truthy_query(query: dict, name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _parse_args(argv: list[str]) -> tuple[str, Optional[Path]]:
+    """Returns (project_name, config_path_override). Tiny stdlib parser
+    so we don't need argparse for two flags."""
+    project: Optional[str] = None
+    config_override: Optional[Path] = None
+    it = iter(argv)
+    for tok in it:
+        if tok == "--project":
+            project = next(it, None)
+        elif tok.startswith("--project="):
+            project = tok.split("=", 1)[1]
+        elif tok == "--config":
+            v = next(it, None)
+            config_override = Path(v).expanduser() if v else None
+        elif tok.startswith("--config="):
+            config_override = Path(tok.split("=", 1)[1]).expanduser()
+    if not project:
+        # Fallback: basename of cwd, so old `python3 server.py` invocations
+        # in a project root still work for one-off testing.
+        project = Path.cwd().name
+    return project, config_override
+
+
 def main() -> int:
-    cfg = _config.load()
+    project_name, config_override = _parse_args(sys.argv[1:])
+    cfg = _config.load(project_name, config_path=config_override)
 
     app = AppContext(cfg)
     BuilderHandler.app = app
@@ -699,7 +676,7 @@ def main() -> int:
 
     # Banner first, then the event — otherwise `server_started` would
     # print on top of the ASCII art via the live subscription.
-    _banner.show_banner(cfg.name, cfg.bind, cfg.port, len(cfg.jobs))
+    _banner.show_banner(cfg.name, cfg.bind, cfg.port, list(cfg.jobs.keys()))
     app.events.append(
         "server_started",
         {
@@ -708,13 +685,9 @@ def main() -> int:
             "port": cfg.port,
             "auth_reads": cfg.auth_reads,
             "has_password": bool(cfg.password),
-            "has_plugin": cfg.plugin_path is not None,
+            "languages": list(cfg.languages),
         },
     )
-
-    # Start the hot-reload watcher AFTER bind succeeded. If we'd started
-    # earlier and the bind failed, the daemon thread would linger.
-    app.config_watcher.start(cfg)
 
     try:
         server.serve_forever()

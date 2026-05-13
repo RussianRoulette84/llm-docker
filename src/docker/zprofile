@@ -120,6 +120,11 @@ export GOPATH="$HOME/go"
 export PATH="$PATH:$GOPATH/bin"
 
 ##########################################################################################
+## PHP / Composer global bin (envoy, etc.) — only relevant when INSTALL_PHP=true
+##########################################################################################
+export PATH="$HOME/.config/composer/vendor/bin:$PATH"
+
+##########################################################################################
 ## Rust / Cargo
 ##########################################################################################
 # export PATH="$HOME/.cargo/bin:$PATH"
@@ -704,6 +709,35 @@ function devpack() {
     printf "  %bNOTE:%b Log out and back in for docker group, nvm, cargo, go to take effect.\n\n" \
         "$YELLOW" "$RESET"
 }
+
+##########################################################################################
+## My xclip/pgclip implementation for claude
+##########################################################################################
+clip() {
+  local content
+  if [ -t 0 ]; then content="$*"; else content=$(cat); fi
+  printf "\033]52;c;%s\a" "$(printf '%s' "$content" | base64 | tr -d '\n')"
+  echo "copied to clipboard ($(printf '%s' "$content" | wc -c) bytes)" >&2
+}
+
+# zle widgets only register in interactive shells
+if [[ $- == *i* ]]; then
+    strip_paste_indent() {
+      zle .bracketed-paste
+      local nl=$'\n'
+      LBUFFER="${LBUFFER//${nl}  /${nl}}"
+      LBUFFER="${LBUFFER#  }"
+    }
+    zle -N bracketed-paste strip_paste_indent
+
+    clean_buffer_on_accept() {
+      local nl=$'\n'
+      BUFFER="${BUFFER//${nl}  /${nl}}"
+      BUFFER="${BUFFER#  }"
+      zle .accept-line
+    }
+    zle -N accept-line clean_buffer_on_accept
+fi
 
 ##########################################################################################
 ## THE END

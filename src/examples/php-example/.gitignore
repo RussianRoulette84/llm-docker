@@ -1,0 +1,21 @@
+# Composer
+/vendor/
+composer.lock
+
+# Logs (the llm-docker logs MCP reads from here)
+logs/
+
+# PHP / build artefacts
+.phpunit.cache/
+*.phar
+
+# Secrets
+.env
+
+# Node deps for the bundled MCP servers
+scripts/mcp/*/node_modules/
+scripts/mcp/*/package-lock.json
+
+# OS
+.DS_Store
+.Trash-*

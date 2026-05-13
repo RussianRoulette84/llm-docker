@@ -1,0 +1,10 @@
+{
+  "name": "llm-docker-ops-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ops MCP server — proxy to the host-side builder-api daemon.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}

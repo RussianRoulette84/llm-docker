@@ -15,6 +15,8 @@
 #   INSTALL_MEDIA       — ffmpeg + sox + yt-dlp + pipx
 #   INSTALL_QUAKE       — full C/C++ toolchain + SDL2 (for the Quake port)
 #   INSTALL_BROWSING    — chromium-headless-shell + headful chromium
+#   INSTALL_PHP         — PHP 8.3 CLI + extensions + Composer
+#                         (+ INSTALL_PHP_ENVOY=true → laravel/envoy global)
 #
 # Inspired by the macOS `devpack` script — same array-of-packages idea,
 # adapted to Linux/apt.
@@ -51,6 +53,11 @@ SW_MEDIA_PIP=(yt-dlp pipx)
 SW_QUAKE_APT=(clang clang-format clang-tools make cmake gcc g++ libc6-dev libsdl2-dev)
 
 SW_BROWSING_APT=(chromium-headless-shell chromium)
+
+# PHP 8.3 toolchain. Version hardcoded — bookworm ships 8.2 by default, so we
+# need the sury.org repo for 8.3. Composer goes in via the upstream installer
+# (apt's composer is stale). Envoy is an optional laravel/envoy install on top.
+SW_PHP_APT=(php8.3-cli php8.3-mbstring php8.3-xml php8.3-curl php8.3-zip unzip)
 
 # ── Helpers ─────────────────────────────────────────────────────────
 _apt_install() {
@@ -212,6 +219,80 @@ if _is_true "${INSTALL_BROWSING:-false}"; then
     echo 'exit 101' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
     _apt_install "${SW_BROWSING_APT[@]}"
     rm -f /usr/sbin/policy-rc.d
+
+    # Pre-cache Playwright's chromium browser so the bundled `@playwright/mcp`
+    # works on cold start without a 60s download — and on Linux arm64, where
+    # Playwright's default "chrome-for-testing" channel has no build at all.
+    # Marker check keeps smart rebuilds idempotent.
+    if [ -d /root/.cache/ms-playwright/chromium-* ] 2>/dev/null; then
+        echo "[DEVPACK] BROWSING → Playwright chromium already cached — skipping"
+    else
+        echo "[DEVPACK] BROWSING → caching Playwright chromium"
+        # Run from /tmp so npx doesn't try to install into the project tree.
+        # Failures are non-fatal — the `--executable-path /usr/bin/chromium`
+        # fallback in .mcp.python.sample keeps things working either way.
+        (cd /tmp && npx -y playwright install chromium 2>&1 | tail -3) \
+            || echo "[DEVPACK][WARNING] playwright install chromium failed — system chromium fallback still works"
+    fi
+fi
+
+# ── PHP 8.3 + Composer (+ optional Envoy) ───────────────────────────
+# Debian bookworm ships PHP 8.2 in its main repo, so we pull 8.3 from
+# the sury.org PHP repo (the de facto upstream for modern PHP on Debian).
+# Composer goes in via the upstream phar installer — apt's composer is
+# pinned years behind. Envoy installs as a composer global; its bin
+# lands at /root/.config/composer/vendor/bin (wired into PATH below).
+if _is_true "${INSTALL_PHP:-false}"; then
+    if command -v php >/dev/null 2>&1 && php -v 2>/dev/null | grep -q "PHP 8.3"; then
+        echo "[DEVPACK] PHP 8.3 already installed — skipping apt"
+    else
+        echo "[DEVPACK] PHP → adding sury.org repo + installing 8.3"
+        _apt_install ca-certificates lsb-release apt-transport-https gnupg
+        curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg \
+            https://packages.sury.org/php/apt.gpg
+        echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
+https://packages.sury.org/php/ $(lsb_release -sc) main" \
+            > /etc/apt/sources.list.d/sury-php.list
+        apt-get update -qq
+        _apt_install "${SW_PHP_APT[@]}"
+    fi
+
+    if command -v composer >/dev/null 2>&1; then
+        echo "[DEVPACK] composer already installed — skipping"
+    else
+        echo "[DEVPACK] PHP → installing Composer"
+        curl -sS https://getcomposer.org/installer \
+            | php -- --install-dir=/usr/local/bin --filename=composer
+    fi
+
+    # PATH wiring for `~/.config/composer/vendor/bin` lives in
+    # src/docker/zprofile (bind-mounted to /root/.zprofile at runtime).
+    # We can't write to /root/.zprofile here because the runtime mount
+    # overlays the image's copy.
+
+    if _is_true "${INSTALL_PHP_ENVOY:-false}"; then
+        if [ -x /root/.config/composer/vendor/bin/envoy ]; then
+            echo "[DEVPACK] PHP → envoy already installed — skipping"
+        else
+            echo "[DEVPACK] PHP → composer global require laravel/envoy"
+            # COMPOSER_ALLOW_SUPERUSER=1 silences composer's "don't run
+            # as root" guard which otherwise can return non-zero under
+            # `set -e` and kill the build with no actionable log.
+            export COMPOSER_ALLOW_SUPERUSER=1
+            export COMPOSER_HOME="/root/.config/composer"
+            composer global require laravel/envoy --no-interaction --no-progress \
+                || { echo "[DEVPACK][ERROR] composer global require laravel/envoy failed"; exit 1; }
+            # Post-condition: the binary MUST exist or the build is broken.
+            if [ ! -x /root/.config/composer/vendor/bin/envoy ]; then
+                echo "[DEVPACK][ERROR] envoy install reported success but binary missing at /root/.config/composer/vendor/bin/envoy"
+                exit 1
+            fi
+            echo "[DEVPACK] PHP → envoy installed: $(/root/.config/composer/vendor/bin/envoy --version 2>&1 | head -1)"
+        fi
+        # PATH discovery is via docker-entrypoint.sh sourcing /root/.zprofile
+        # at process start. claude/opencode (and every `bash -c` they spawn)
+        # inherit the export from there — no per-binary symlink needed.
+    fi
 fi
 
 # ── SSH (openssh-server only when user enabled SSH in llm-docker.conf) ────

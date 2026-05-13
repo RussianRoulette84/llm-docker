@@ -1,0 +1,37 @@
+{
+  "_comment": "Sample .mcp.json. Copy to your project root as .mcp.json and edit.",
+  "_playwright_note": "Uses system chromium via --executable-path because Playwright's default chrome-for-testing channel has no Linux arm64 build. --no-sandbox is safe here because the llm-docker container is already cap_drop+no-new-privileges sandboxed.",
+  "_builder_api_note": "BUILDER_API_PASSWORD is forwarded to the docker/ops/logs MCP servers so they can hit the host-side builder-api without env hunting. Pulled from your shell (env-gorilla, .env, or wherever you set it).",
+  "mcpServers": {
+    "playwright": {
+      "command": "node",
+      "args": ["./node_modules/@playwright/mcp/cli.js", "--executable-path", "/usr/bin/chromium", "--headless", "--isolated", "--no-sandbox"]
+    },
+    "filesystem": {
+      "command": "node",
+      "args": ["./node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "."]
+    },
+    "git": {
+      "command": "node",
+      "args": ["./node_modules/@cyanheads/git-mcp-server/dist/index.js"]
+    },
+    "llm-docker-logs": {
+      "command": "node",
+      "args": ["./scripts/mcp/logs-server/index.js"],
+      "env": {
+        "BUILDER_API_PASSWORD": "${BUILDER_API_PASSWORD}",
+        "BUILDER_API_HOST": "host.docker.internal",
+        "BUILDER_API_PORT": "6666"
+      }
+    },
+    "llm-docker-ops": {
+      "command": "node",
+      "args": ["./scripts/mcp/ops-server/index.js"],
+      "env": {
+        "BUILDER_API_PASSWORD": "${BUILDER_API_PASSWORD}",
+        "BUILDER_API_HOST": "host.docker.internal",
+        "BUILDER_API_PORT": "6666"
+      }
+    }
+  }
+}

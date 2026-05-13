@@ -5,28 +5,36 @@ container ask the host to build code, run a long-lived process, tail logs,
 and read structured events.
 
 It's designed for the llm-docker setup: your Claude/OpenCode container
-calls `http://host.docker.internal:6666/build` instead of trying to run
-`make` inside a container that doesn't have your toolchain.
+calls `http://host.docker.internal:<port>/job/<name>` instead of trying
+to run `make` / `pytest` / `composer install` inside a container that
+doesn't have your toolchain.
 
 ## Quick start
 
 ```sh
-cd ~/Projects/my-project
-cp /path/to/llm-docker/src/builder-api/examples/.builder-api.toml .
-vim .builder-api.toml                              # edit command, logs, port
-export BUILDER_API_PASSWORD=$(openssl rand -hex 16) # or put it in shell rc
-python3 /path/to/llm-docker/src/builder-api/server.py
+# 1. Drop the host config template into place (one-time, per host)
+mkdir -p ~/.llm-docker
+cp /path/to/llm-docker/src/builder-api/builder-api.host.toml.example \
+   ~/.llm-docker/builder-api.toml
+vim ~/.llm-docker/builder-api.toml   # add a [project.<your-project>] block
+export BUILDER_API_PASSWORD=$(openssl rand -hex 16)   # or set in shell rc
+
+# 2. Launch (cld / ocd do this for you when you pass `-a`)
+python3 /path/to/llm-docker/src/builder-api/server.py --project <name>
 ```
 
 Then from inside the container:
 
 ```python
 import client
-client.build(["--fast"])
-qid = client.build(["--clean"])["queue_id"]
-res = client.wait_build(qid)        # blocks until done
+res = client.run_job("pytest", params={})
 print(res["log_tail"])              # last 40 lines of build.log
 ```
+
+Per-project `.builder-api.toml` files in your repos are NOT read — the
+host config at `~/.llm-docker/builder-api.toml` is the only source of
+truth. A prompt-injected agent inside a project container cannot add or
+modify jobs.
 
 ## What the API exposes
 
@@ -35,24 +43,23 @@ print(res["log_tail"])              # last 40 lines of build.log
 | GET    | `/`                             | Health + name + bind + port |
 | GET    | `/status`                       | Runtime PID, uptime, current build |
 | GET    | `/jobs`                         | Job catalog for MCP / client introspection |
-| POST   | `/build[?dryrun=1]`             | Enqueue a legacy `[build]` run, returns `queue_id` |
-| POST   | `/job/<name>[?dryrun=1]`        | Enqueue a `[jobs.<name>]` template invocation |
+| POST   | `/job/<name>[?dryrun=1]`        | Run a host-defined job; placeholders regex-validated before execvp |
 | GET    | `/build_status?id=&wait=N`      | Long-poll status (up to 60s), `log_tail` on finish |
-| GET    | `/queue`                        | `{current, pending[], history[]}` |
+| GET    | `/queue`                        | `{current, pending[], history[], total_history}` |
 | DELETE | `/queue/<id>`                   | Cancel a pending build |
+| DELETE | `/current/cancel`               | Cancel the running build (SIGTERM → SIGKILL the whole process group) |
 | GET    | `/logs?file=<alias>&n=<lines>`  | Tail N lines of a declared alias |
 | GET    | `/events?type=&since=&n=&pid=`  | Filter the JSONL event feed |
 | POST   | `/log`                          | Ingest an external / browser log line (forwarded live to `/ws`) |
 | POST   | `/run`                          | Start or restart the runtime process |
 | POST   | `/stop`                         | Stop the runtime process |
 | GET    | `/ws`                           | WebSocket — live logs, events, heartbeats |
-
-Plus any paths the optional plugin registers.
+| POST   | `/build`                        | **Removed** (410 Gone). Use `/job/<name>` instead. |
 
 ### Live event stream (on `/ws`)
 
-Every successful `POST /log`, `POST /build`, `/run` / `/stop`, and every
-build/runtime lifecycle transition produces a JSONL event and is
+Every successful `POST /log`, `POST /job/<name>`, `/run` / `/stop`, and
+every build/runtime lifecycle transition produces a JSONL event and is
 **pushed live** to every connected WebSocket as:
 
 ```json
@@ -89,9 +96,21 @@ site that strangers can load.
 
 ## Configuration
 
-Every per-project setting lives in `.builder-api.toml` (or `.yml` if
-`pyyaml` is installed, or `.json`). See `examples/.builder-api.toml` for a
+The daemon reads ONE file: `~/.llm-docker/builder-api.toml`. Override the
+location with `$BUILDER_API_CONFIG` or `--config <path>`. See
+[`builder-api.host.toml.example`](builder-api.host.toml.example) for a
 heavily-commented reference.
+
+Resolution for a daemon launched as `--project <name>`:
+
+1. `[jobs.<name>]` — global jobs available to every project
+2. `[language.<lang>.jobs.<name>]` — language packs (python / php / node /
+   compose), included when the project's `languages = [...]` opts in
+3. `[project.<name>.jobs.<name>]` — explicit per-project overrides
+
+Later layers replace earlier ones by job name. Only the composed table is
+exposed via `GET /jobs`; it's the only set of commands the daemon will
+ever execute.
 
 Core keys:
 
@@ -114,21 +133,24 @@ Core keys:
 | `[events].path`     | Append-only JSONL file; API reads and rotates it |
 | `[events].max_bytes` / `drop_bytes` | Cap + drop-oldest rotation (default 200 MB / 10 MB) |
 | `[security]...`     | Rate limit knobs: `auth_failures_per_min`, `lockout_s`, body/URL size caps |
-| `plugin`            | Path to an optional Python plugin file (see below) |
 
 Every path in the config is resolved against the project root at boot and
-the server refuses to start if any of them escape the project tree.
+the server refuses to start if any of them escape the project tree. The
+plugin feature was removed — see "Removed features" below.
 
 ### Hot-reload
 
-The daemon polls `.builder-api.toml`'s mtime every ~1.5s. When it changes,
-the file is re-parsed and (on success) atomically swapped into place. The
-following take effect for **new** enqueues:
+The daemon polls `~/.llm-docker/builder-api.toml`'s mtime every ~1.5s.
+When it changes, the file is re-parsed for THIS daemon's project view
+and (on success) atomically swapped into place. The following take
+effect for **new** enqueues:
 
-- `[jobs.*]` — new templates available immediately via `POST /job/<name>`
-- `[build].command`, `[build].allowed_args`, `[build].timeout_s`,
-  `[build].max_pending`, `[build].dedupe_window_s`
-- `[logs].*` — new aliases reachable, removed aliases start returning 404
+- `[jobs.*]`, `[language.*.jobs.*]`, `[project.<n>.jobs.*]` — added or
+  edited jobs become available immediately via `POST /job/<name>`
+- `[project.<n>.logs].*` — new aliases reachable, removed aliases start
+  returning 404
+- `[defaults].password`, `[project.<n>].password` — new value enforced on
+  next request
 
 Already-running builds keep their snapshotted command + timeout — a hot
 reload won't yank a build mid-flight. If the new file fails to parse,
@@ -136,10 +158,10 @@ the daemon logs the error and keeps the previous config in place.
 
 The following **require a daemon restart** (won't hot-reload):
 
-- `[runtime]`  — already-running processes can't be retroactively rebound
+- `[project.<n>.runtime]` — already-running processes can't be retroactively rebound
 - `[security]` — auth lockout state and rate limiters are in-memory
-- `[events].path` — opening a different jsonl midway corrupts ordering
-- `plugin = "..."` — plugin imports register state at load time
+- `[project.<n>.events].path` — opening a different jsonl midway corrupts ordering
+- `[project.<n>].port` / `[project.<n>].bind` — the socket is bound at startup
 
 `config_mtime` is exposed via `GET /jobs` so MCP clients can cheaply
 detect when their cached schema is stale.
@@ -276,24 +298,30 @@ a 64-char repr-truncation of the offending value.
       }
     }
   },
-  "build": { "command": "...", "allowed_args": [...], "timeout_s": 900, "dedupe_window_s": 5 },
-  "config_version": "0.2",
-  "config_mtime":   1715000000.0
+  "project":         "my-project",
+  "languages":       ["python"],
+  "config_version":  "0.3",
+  "config_mtime":    1715000000.0
 }
 ```
 
 `sha256_pinned` is a bool — the actual hash is never returned. `config_mtime`
 is exposed so consumers can cheaply detect hot-reloads (compare on each tool
-call; refresh schema only when mtime changes).
+call; refresh schema only when mtime changes). `project` + `languages` show
+which `[project.<name>]` block resolved this view.
 
-### Per-stack examples
+### Starter template
 
-Bundled under `examples/`:
+[`builder-api.host.toml.example`](builder-api.host.toml.example) ships a
+ready-to-edit host config with:
 
-- [`.builder-api.toml`](examples/.builder-api.toml) — the annotated reference
-- [`quake/.builder-api.toml`](examples/quake/.builder-api.toml) — Quake make/test/rcon
-- [`node/.builder-api.toml`](examples/node/.builder-api.toml) — npm test/build/lint with jest pattern + path placeholders
-- [`php-docker-compose/.builder-api.toml`](examples/php-docker-compose/.builder-api.toml) — full docker-compose verb set with whitelisted artisan/composer subcommands
+- 3 global jobs (`git-status`, `git-log`, `tree`)
+- Language packs: `python` (pytest / ruff / mypy / pip-install),
+  `php` (phpunit / pint / composer), `node` (npm test / build / install,
+  tsc, jest pattern), `compose` (docker compose ps / up / down / logs)
+- Sample `[project.<name>]` blocks for `llm-docker` + two generic
+  examples showing per-project ports, language opt-in, overrides,
+  and runtime configuration
 
 ## Security model — read this
 
@@ -302,14 +330,16 @@ Anything less than careful thinking here turns it into an escape vector.
 
 **What the API cannot do via HTTP:**
 
-- Modify `.builder-api.toml`, your plugin file, or any file it hasn't
-  declared. Config is read once at startup; there is no `/reload`.
+- Add or modify jobs. The config lives at `~/.llm-docker/builder-api.toml`
+  on the host — outside every container bind-mount. No agent inside any
+  project can reach it, period.
 - Run arbitrary shell commands. The only commands ever executed are
-  `[build].command` (with whitelisted args) and `[runtime].start_command`.
+  declared `[jobs.<name>].command` (with regex-validated placeholders)
+  and `[project.<n>.runtime].start_command`.
 - Read files outside the project root. Log aliases are resolved at
   startup; any that escape the root abort the server before it binds.
 - Receive free-form arguments. Every request body is validated against
-  a fixed schema; args must be in the build whitelist.
+  the job's per-placeholder regex + max_len.
 
 **What it does to protect itself:**
 
@@ -330,41 +360,21 @@ Anything less than careful thinking here turns it into an escape vector.
   `password = "${BUILDER_API_PASSWORD}"` and export it in your shell.
 - If your build needs shell features (`cd foo && make`), wrap them in
   a script (`./build.sh`) that the API invokes. `execvp` is not a shell.
-- Only set `plugin = "builder_plugin.py"` when you wrote the plugin
-  yourself or fully trust whoever did. **A plugin runs unrestricted in
-  the server process.** Copying a project directory from the internet
-  with an unfamiliar `builder_plugin.py` is the same as running
-  unknown Python with write access to your home directory.
-- Plugins are env-gated: declaring `plugin = "..."` in config raises
-  `ConfigError` at startup unless `BUILDER_API_ALLOW_PLUGINS=1` is
-  exported in the daemon's environment. This forces a deliberate human
-  step before any project's plugin file can run host-side code, so a
-  malicious or compromised project can't silently load one.
+- Keep `~/.llm-docker/builder-api.toml` outside any container mount and
+  user-only-writable (`chmod 600`). It IS the trust boundary.
+- Audit it like sudoers — every job declared there is something Claude
+  can execute on your Mac.
 
-## Plugin API (optional)
+### Removed features
 
-Drop a `builder_plugin.py` in the project root and set `plugin =
-"builder_plugin.py"` in the config. Every symbol below is optional.
-
-```python
-def on_build_start(entry):       ...   # entry has id, args, agent_id, started_at
-def on_build_finish(entry):      ...   # entry adds returncode, status, log_tail
-def on_run_start(pid):           ...
-def on_run_exit(pid, cause):     ...   # cause: 'api_stop'|'restart'|'self_exit'|'daemon_shutdown'
-
-def handlers():
-    # Custom HTTP endpoints. Returns {path: {METHOD: fn}}.
-    # Each fn takes (body_dict, handler, query=dict) and returns a JSON-serialisable dict.
-    return {
-        '/hello': {'GET': _hello},
-    }
-
-def _hello(body, handler, query=None):
-    return {'msg': 'hi from plugin'}
-```
-
-Lifecycle hooks are fire-and-forget — exceptions are logged, never
-propagated. Handler exceptions return HTTP 500 with the error text.
+- **Plugin support** was removed (was an arbitrary-code-execution path
+  for any project that could write a `builder_plugin.py` inside its
+  container-writable root). No replacement; if you need to extend the
+  daemon, fork it.
+- **Per-project `.builder-api.toml`** files are no longer read. The
+  daemon refuses to load anything from a project's working tree.
+- **Legacy `POST /build`** endpoint is gone (410 Gone). Use
+  `POST /job/<name>`.
 
 ## Env vars the Docker client reads
 
@@ -386,9 +396,14 @@ already; you just set them in `.env`.
 There's no daemoniser — you start it in a terminal:
 
 ```sh
-python3 server.py                           # reads .builder-api.toml from cwd
-BUILDER_API_PASSWORD=secret python3 server.py
+python3 server.py --project <name>                # reads ~/.llm-docker/builder-api.toml
+BUILDER_API_PASSWORD=secret python3 server.py --project my-project
+python3 server.py --project foo --config /custom/path.toml
 ```
+
+`cld -a` / `ocd -a` handle this for you — they derive `--project` from
+the project directory's basename and spawn the daemon in a positioned
+iTerm window or pane.
 
 To keep it alive across reboots, wrap in launchd / systemd / tmux / whatever
 you already use. `SIGINT`/`SIGTERM` shut down cleanly — the build queue is
@@ -404,15 +419,17 @@ no orphans are left behind.
 ## Files
 
 ```
-server.py         Entry point, HTTP routing
-config.py         Config loader + schema validation + path scoping
-security.py       Auth gate + per-IP rate limiter + body/URL size caps
-build_queue.py    Build FIFO, worker thread, long-poll wait, log_tail
-runtime.py        /run /stop /status + process group cleanup
-logs.py           Alias-scoped log tail + live watcher
-events.py         Read-filter + rotating append for the JSONL feed
-ws.py             WebSocket handshake + per-session streaming loop
-plugin.py         Optional plugin loader (dynamic import, validated)
-client.py         Docker-side HTTP helper (import from your code)
-examples/         Starter configs + minimal Makefile project
+server.py                          Entry point, HTTP routing, --project parser
+config.py                          Layered schema loader + project-view resolver
+hot_reload.py                      Mtime-poll watcher for the host config
+banner.py                          Startup banner + colored event tail
+security.py                        Auth gate + per-IP rate limiter + body/URL size caps
+build_queue.py                     Job FIFO, worker thread, long-poll wait, log_tail
+jobs.py                            Job template parsing, placeholder validation, sha256 pinning
+runtime.py                         /run /stop /status + process group cleanup
+logs.py                            Alias-scoped log tail + live watcher
+events.py                          Read-filter + rotating append for the JSONL feed
+ws.py                              WebSocket handshake + per-session streaming loop
+client.py                          Docker-side HTTP helper (import from your code)
+builder-api.host.toml.example      Starter host config template
 ```

@@ -9,8 +9,6 @@ guarantees the security contract promised.
 
 from __future__ import annotations
 
-import io
-import os
 from pathlib import Path
 from typing import Iterable
 

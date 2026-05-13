@@ -130,7 +130,7 @@ Optionally it bind-mounts your `~/Projects` workspace folder into Docker as work
 * ✅ **No docker socket access** - `/var/run/docker.sock` is NOT bind-mounted. The container cannot escape via the Docker API.
 * ✅ **Claude agent permission hardening** - `.claude/settings.local.json` ships with ~200 deny rules: secret reads, install scripts, shell-exec escape hatches, chain-operator variants, path-traversal patterns, and explicit container-escape guards (`*docker.sock*`, `nsenter`, `--privileged`, kernel namespace tools).
 * ✅ **Config self-unlock protection** - Claude cannot edit its own `.claude/settings*.json`, `.git/hooks/`, `.github/workflows/`, or `.vscode/tasks.json` — no prompt-injection path to loosen its own rules.
-* ✅ **Builder API plugin gate** - The Builder API loads `plugin = "..."` from a project's `.builder-api.toml` only when `BUILDER_API_ALLOW_PLUGINS=1` is exported in the daemon's environment. Plugins run unrestricted Python in the daemon process on the host; the env-gate forces a deliberate human step before any project (or a prompt-injected agent inside one) can drop a `builder_plugin.py` and pivot to host code execution via the bind-mount.
+* ✅ **Builder API host-only config** - All jobs the Builder API can execute live in `~/.llm-docker/builder-api.toml` on the host — outside every bind-mount. Per-project `.builder-api.toml` files are ignored. A prompt-injected agent inside a project container CANNOT add new jobs, edit a job's command, or otherwise widen what runs on your Mac; the daemon refuses to read anything from container-writable paths. Plugin support was removed entirely (was a host-exec escape vector).
 * ✅ **SSH key-only authentication** - When SSH is enabled, passwords are disabled (`PasswordAuthentication no`). Root login requires a matching key in `LLM_DOCKER_SSH_AUTHORIZED_KEYS`. Host keys persist across rebuilds for stable fingerprint.
 * ✅ **Graceful cleanup** - Background watchdog kills containers on terminal close, CMD+Q, or crash.
 
@@ -418,41 +418,143 @@ docker rmi llm-docker:latest && cld
 
 ## 🔌 Builder API (optional)
 
-Optional host-side daemon the Docker container can call to build code, run/restart long-lived processes, tail logs, stream events, and tunnel browser console logs — without shipping the whole toolchain inside the container. Lives in [src/builder-api/](src/builder-api/); full docs in [src/builder-api/README.md](src/builder-api/README.md).
+### 🤖 Why you want this — Claude with senses
+
+By default, the Claude in your container is a **brain in a jar**. It can read the code in your project, but it can't compile it, can't run it, can't click a button in a browser, can't see a console error, can't watch a log scroll by. Every "let me try this" turns into "please run this command and paste the output." That's not autonomous development. That's stenography.
+
+The Builder API gives Claude **eyes, ears, and hands** on your Mac:
+
+- 👁️ **Eyes** — via `playwright-mcp` + Chromium it can navigate to `localhost:8080`, take screenshots, read the DOM, watch the network panel.
+- 👂 **Ears** — every `console.log`, `console.error`, and `window.onerror` from your dev app gets tunneled through `/log` straight into Claude's event stream. Claude *hears* the bug happen.
+- ✋ **Hands** — Puppeteer/Playwright via MCP lets it click, type, fill forms, drag elements. It can reproduce the bug the user described.
+- 🔨 **Toolchain** — `pytest`, `phpunit`, `npm run build`, `docker compose up`, `composer install`, anything you've declared as a job. One HTTP POST and it runs on your Mac with your tools — no need to install the universe inside the container.
+- ♻️ **Loop** — edit code (hot-reload) → run job → tail logs → click in browser → see console error → fix code → repeat. **Sub-3-second feedback cycles.** No human in the inner loop.
+
+This is what people mean when they say "agentic development." It's the difference between Claude as a fancy autocomplete and Claude as a junior dev who can actually finish a feature while you make coffee. Once you wire it up, going back to the brain-in-a-jar mode feels prehistoric.
+
+The trade-off: the API IS a privileged surface. The container is asking the host to do things on its behalf. Every "ear" and "hand" is also a way out of the cage if you're not careful. The rest of this section is about how that's contained, and where the seams still are.
+
+The daemon lives in [src/builder-api/](src/builder-api/); full developer docs in [src/builder-api/README.md](src/builder-api/README.md).
 
 ### ⚙️ Deployment shape
 
-* ✅ **Per-project daemon** - one process per project folder, launched with `python3 server.py` (or via `cld --api` / `ocd -a` to spawn in a new Terminal).
-* ✅ **Declarative config** - `.builder-api.{toml,yml,json}` (TOML + JSON native, YAML optional with `pyyaml`).
-* ✅ **Python stdlib only** - no mandatory deps, runs anywhere with Python 3.11+.
-* ✅ **Docker-side client** - tiny Python HTTP helper in [src/builder-api/client.py](src/builder-api/client.py) (auth + retry + long-poll) the container imports.
+* ✅ **Per-project daemon** — one process per project, launched with `python3 server.py --project <name>` (or via `cld --api` / `ocd -a` which spawn a positioned iTerm pane and derive `<name>` from the project dir basename). Different projects = different ports = different daemons. They never share queue state.
+* ✅ **Single host config** — `~/.llm-docker/builder-api.toml` is the only file the daemon reads. Three-layer schema: `[jobs.<name>]` (global, every project sees them) + `[language.<lang>.jobs.<name>]` (python / php / node / compose packs) + `[project.<name>.jobs.<name>]` (per-project overrides). Copy `src/builder-api/builder-api.host.toml.example` to get started.
+* ✅ **Python stdlib only** — no `pip install` dance. Runs anywhere with Python 3.11+.
+* ✅ **Docker-side client** — tiny Python HTTP helper in [src/builder-api/client.py](src/builder-api/client.py) (auth + retry + long-poll) the container imports. MCP servers wrap this for tool calls.
 
 ### 📡 What the API exposes
 
-* ✅ **Build queue** - `POST /build` with whitelisted args, FIFO, multi-agent safe. Cancel pending via `DELETE /queue/<id>`. Inspect history with `/queue`.
-* ✅ **Long-poll build status** - `/build_status?id=&wait=30` blocks until done, `log_tail` auto-attached on completion, `timed_out` flag so clients don't sleep-loop.
-* ✅ **Log tail by alias** - `/logs?file=build&n=200`; aliases declared in config and resolved to paths at startup.
-* ✅ **Structured events** - `/events?type=&since=&n=&pid=` filters a JSON-lines feed build/run processes append to.
-* ✅ **Runtime control** - `/run`, `/stop`, `/status` for a long-lived `start_command` declared in config (no API-supplied args; `/run` always restarts).
-* ✅ **Live streaming** - `/ws` WebSocket pushes log lines, events, and status heartbeats to every connected client.
-* ✅ **Browser console tunnel** - `POST /log` + `src/builder-api/browser.js` snippet forwards `console.*` and `window.onerror` into the live event stream.
-* ✅ **Agent tracking** - `X-Agent-ID` header tags each request; queue history shows who did what.
+* ✅ **Job queue** — `POST /job/<name>` runs a host-defined job. Params are regex-validated before being substituted into argv. FIFO, multi-agent safe. Cancel pending via `DELETE /queue/<id>`, cancel the running build via `DELETE /current/cancel`. Inspect history with `/queue` (includes `total_history` count). `GET /jobs` returns the resolved job set for this daemon's project. Legacy `POST /build` is gone (410).
+* ✅ **Long-poll build status** — `/build_status?id=&wait=30` blocks until done, `log_tail` auto-attached on completion, `timed_out` flag so clients don't sleep-loop themselves into a busy spin.
+* ✅ **Log tail by alias** — `/logs?file=build&n=200`. Aliases are declared in config and resolved to paths at startup; you can't ask for arbitrary files.
+* ✅ **Structured events** — `/events?type=&since=&n=&pid=` filters a JSON-lines feed that build/run processes append to. "What happened, in order, with timestamps."
+* ✅ **Runtime control** — `/run`, `/stop`, `/status` for a long-lived `start_command` declared in config (no API-supplied args; `/run` always restarts). This is how Claude bounces your dev server when it changes a config file.
+* ✅ **Live streaming** — `/ws` WebSocket pushes log lines, events, and status heartbeats to every connected client. Multi-agent: 4 Claude windows can all watch the same daemon.
+* ✅ **Browser console tunnel** — `POST /log` + the `src/builder-api/browser.js` snippet forwards `console.*` and `window.onerror` from any page (your dev app, an admin panel, anything) straight into the live event stream. This is Claude's "ears."
+* ✅ **Agent tracking** — `X-Agent-ID` header tags each request; `/queue` history shows who did what. Useful when 4 Claude windows are arguing over the same project.
 
-### 🔒 How it's locked down
+### 🔒 How it's locked down — defense in depth
 
-* ✅ **Single predefined build command** - closed `allowed_args` whitelist; off-whitelist values get 400, no free-form commands.
-* ✅ **`execvp`-only execution** - never `sh -c`; shell metacharacters inert even if they slip into a whitelisted arg.
-* ✅ **Project-root scoping** - every configured path (logs, events, runtime) resolved at boot; out-of-tree paths refuse to start the server.
-* ✅ **Password auth** - `X-Builder-API-Password` / `?key=` required on POST/DELETE; mandatory whenever `bind != 127.0.0.1`.
-* ✅ **Rate-limited auth failures** - default 10/min per IP → 5 min lockout, warning to stderr + event feed.
-* ✅ **Queue cap + request timeout** - pending builds capped (`build.max_pending`, default 32 → 429); request body read timeout `security.request_timeout_s` (default 30 s) stops slowloris ties.
-* ✅ **CORS scoped to `/log`** - only the browser-facing endpoint advertises cross-origin; `/build`, `/run`, etc. stay SOP-blocked for cross-origin callers.
-* ✅ **Drop-oldest WS back-pressure** - one slow `/ws` client can't starve the others; stuck sends drop old frames instead of blocking producers.
-* ✅ **No write endpoints** - API cannot modify the config file, the plugin file, or any file outside what the build/run subprocess writes on its own.
-* ✅ **Optional plugin** - drop a `builder_plugin.py` in the project root and reference it with `plugin = "…"` in config. Plugins run unrestricted in the server process; this is a trust boundary.
+Every layer below is enforced. Defeating one is not enough; an attacker has to get past most of them in sequence.
+
+**Config-level (the trust boundary):**
+
+* ✅ **Host-only config** — `~/.llm-docker/builder-api.toml` lives on your Mac, outside every container bind-mount. The container literally cannot see it, read it, or write it. Container-side `Read(~/.llm-docker/**)` returns "no such file."
+* ✅ **No new jobs from inside** — every job the daemon will ever run is declared in that host file. The container can NEVER add a new job, modify a `command =`, or widen `allowed_args`. The API has zero write endpoints that touch config.
+* ✅ **Per-project `.builder-api.toml` ignored** — older versions read a config file from the project's own directory (which IS in the container's bind-mount). That code is gone. The daemon explicitly does not look at any path inside a project root.
+* ✅ **No plugin support** — previous versions allowed `plugin = "builder_plugin.py"` to load arbitrary Python into the daemon process. The entire feature is deleted. There's no env-gate or "off by default"; the code path doesn't exist.
+* ✅ **`--config` arg is launcher-only** — overriding the config path is a host CLI flag (`server.py --config /alt/path.toml`), not an HTTP knob. The container can't redirect the daemon to a file it controls.
+* ✅ **Unknown projects refuse to start** — if you launch with `--project <X>` and the host file has no `[project.<X>]` block, the daemon prints an error and exits. No quietly-running-with-defaults.
+* ✅ **Path escapes refused at boot** — every path declared in the toml (logs, events, runtime cwd) is resolved against the project root and aborts startup if it points outside.
+
+**Job execution (assuming a hostile param):**
+
+* ✅ **Closed-whitelist jobs** — every `[jobs.<name>]` has one fixed `command`. The container picks a job by name; the daemon runs that command and only that command. No free-form CLI.
+* ✅ **Per-placeholder regex** — each `{param}` in argv has its own anchored regex pattern in the config. Off-pattern values get HTTP 400 before any process is spawned.
+* ✅ **Per-placeholder length cap** — every param has a `max_len` (default 200 chars). Defeats both DoS-by-megabyte and certain argv-length attacks.
+* ✅ **Required-flag checks** — `required = true` placeholders that are missing get rejected; `required = false` placeholders that are missing drop their argv slot entirely (no empty-string injection).
+* ✅ **Placeholders must be standalone argv elements** — `args = ["--filter", "{x}"]` is allowed; `args = ["--filter={x}"]` is REJECTED at config load. Means there's no way to smuggle structure into a single argv element via a placeholder.
+* ✅ **`execvp` only, never `sh -c`** — commands go through `subprocess.Popen(shell=False)`. Shell metacharacters in a placeholder value (`;`, `&&`, backticks, `$()`) are passed through as literal characters to the program, not interpreted. Even an unrestricted regex couldn't escape into a shell.
+* ✅ **Optional `command_hash`** — pin a job's `command_hash = "sha256:..."`. The daemon hashes the resolved binary every request and refuses with 412 on mismatch. Defends against in-place tampering of wrapper scripts.
+
+**Process containment (when a job is running):**
+
+* ✅ **New process group per job** — every subprocess gets `start_new_session=True`. Cancel / timeout sends SIGTERM to the **entire process group**, not just the parent. Defends against `bash → node → chromium` chains where chromium would otherwise outlive the parent.
+* ✅ **SIGTERM → grace → SIGKILL** — default 3 s grace (configurable per-job via `kill_after_s`). Then the kill cascade.
+* ✅ **Per-job timeout** — `timeout_s` per `[jobs.<name>]`; default 60 s for most jobs, longer for builds. Runaway jobs get killed automatically.
+* ✅ **Queue cap** — `build.max_pending = 32` by default. Beyond that, 429 Too Many Requests. Defends against agent loops that spam-enqueue.
+* ✅ **Dedupe window** — identical args within 5 s collapse onto one queue entry. Defends against retry storms on long-poll timeout.
+
+**HTTP layer (assuming a hostile network):**
+
+* ✅ **Password required on writes** — `X-Builder-API-Password` header (or `?key=`) is mandatory on every POST/DELETE.
+* ✅ **Password mandatory on non-loopback** — `bind = 0.0.0.0` refuses to start without a password. The daemon won't accidentally expose itself to the LAN unauthenticated.
+* ✅ **`auth_reads` auto-on for non-loopback** — when bound to non-loopback, GET endpoints also require the password by default. `/logs` and `/events` aren't passive data leaks on your LAN.
+* ✅ **`/ws` always requires auth** — even when `auth_reads = false`. The WebSocket sees everything; it doesn't get the "reads are public" exemption.
+* ✅ **Rate-limited auth failures** — 10 failed attempts per minute per IP → 5 min lockout. Logged to stderr + the event feed. No silent password-spraying.
+* ✅ **Slowloris timeout** — 30 s read timeout per socket (`security.request_timeout_s`). Bounded by config, distinct from build timeout.
+* ✅ **Body size cap** — 1 MB max per request body. Bigger gets 413.
+* ✅ **URL size cap** — 8 KB max. Bigger gets 414.
+* ✅ **CORS scoped to `/log` only** — the browser-console tunnel is the one endpoint that advertises cross-origin. Everything else stays SOP-blocked, so a malicious webpage can't drive `/job` cross-site even if the user is logged in.
+* ✅ **Drop-oldest WS back-pressure** — one slow `/ws` client can't starve the others; stuck sends drop old frames instead of blocking producers.
+
+**Bigger-picture cage (the rest of llm-docker):**
+
+* ✅ **Docker socket not mounted** — `/var/run/docker.sock` is NOT visible to the container. A compromised agent can't pivot via the Docker API to spawn privileged containers or attach `--privileged` siblings.
+* ✅ **`nsenter` / `*docker.sock*` denied** — kernel-namespace escape patterns are explicitly in the agent's deny list.
+* ✅ **`**/llm-docker/**` denied** — the cage's own source is unreadable from inside the container, so an agent can't read this README to find a CVE in its own jailer.
+
+### ⚠️ Where it can STILL escape — honest risks
+
+The Builder API is **a hole in the cage by design**. The container is asking the host to do work on its behalf. The cage controls *what* it can ask for, but the work itself runs **on your Mac, with your UID, your filesystem access, your network egress, your keychain.** That's a real attack surface. The defenses above narrow it; they don't eliminate it.
+
+Below are the seams that remain. Read them. If any of these scenarios feels unacceptable, don't enable Builder API for that project.
+
+* 🚨 **You declared a dangerous job yourself.** If `~/.llm-docker/builder-api.toml` contains:
+  ```toml
+  [project.foo.jobs.shell]
+    command = "/bin/bash"
+    args    = ["-c", "{cmd}"]
+    [project.foo.jobs.shell.placeholders.cmd]
+      regex = ".*"
+  ```
+  you handed Claude a shell. The daemon will obey. **The host toml IS the trust boundary** — audit it like `sudoers`. Treat each job like a sudo NOPASSWD line.
+
+* 🚨 **A whitelisted binary itself has dangerous flags.** Example: `command = "tar"` with `allowed_args = ["--checkpoint-action=*"]` — tar can `exec` from a checkpoint. `curl` with `-o /any/path`. `git` with `core.sshCommand`. The daemon validates *which command runs*, not whether the command's own option surface is safe. **Look up the binary's full flag set before whitelisting; ban the dangerous ones explicitly.**
+
+* 🚨 **A whitelisted binary on disk gets replaced.** A malicious agent inside the container can write to its own project tree. If a job uses `command = "vendor/bin/phpunit"` (a path inside the project), the agent can overwrite `vendor/bin/phpunit` with a malicious binary, then call `POST /job/phpunit` and the daemon will run it on the host with your UID. **Mitigation:** use `command_hash` pinning for any job whose binary lives inside a container-writable path. Or point `command` at a host-only path (`/opt/...`, `/usr/local/bin/...`).
+
+* 🚨 **Symlink games inside the project.** `command = "cat"` + `allowed_args = ["{file}"]` with `regex = "^[a-z]+$"` looks safe. But if Claude can create a symlink `foo → /Users/you/.aws/credentials` inside the project, then `POST /job/cat-foo` reads your AWS creds. **The daemon doesn't sandbox the subprocess's filesystem view.** Avoid jobs that take user-controlled file paths; if you must, point them at a fixed subdir.
+
+* 🚨 **Network egress is unrestricted.** Jobs run with full host network. A job that uses `curl`, `git push`, `npm publish`, etc. can exfiltrate anything it can read. The daemon does not isolate jobs network-wise. **If a job touches the network, assume it can leak.**
+
+* 🚨 **Filesystem access is unrestricted.** Jobs inherit your full UID. They can read/write anywhere your user can. The "project-root scoping" only applies to paths *the daemon itself* opens (log aliases, events file). Once a job starts running, the daemon doesn't restrict it.
+
+* 🚨 **The daemon process IS your user.** No setuid, no namespace, no sandbox-exec wrapper. If a binary in the job tree has an RCE, that RCE has your UID. ⛔ **Browser jobs are the worst offender here** — a host-side `node screenshot.js` or `chromium --headless` job that browses untrusted content is one Chromium 0-day away from RCE-as-you. **Browser jobs MUST run inside the container, not on the Mac.** The cage already ships `/usr/bin/chromium` and `@playwright/mcp`; route the screenshot through it. Two canonical shapes:
+  - **Via MCP (preferred):** the agent inside the container calls `browser_navigate` + `browser_take_screenshot` directly. No Builder API job needed. Zero new attack surface; Chromium is sandboxed inside the container (cap_drop, no-new-privileges); reachable URLs include `host.docker.internal:<port>` for hitting host dev servers.
+  - **Via docker exec job:** if you want queue/audit-trail integration, the host-side job is `command = "docker"`, `args = ["exec", "llm-docker", "<container-side-script>", "{params}"]`. RCE blast radius stays inside the container. The host daemon only ever execs `docker exec`; the actual browser work happens in the cage. **NEVER** put `command = "chromium"` or a host path to Chrome in a job. NEVER install Chrome on the Mac for screenshot jobs. The host-side browser binary is the regression we're closing.
+
+* 🚨 **Password leak via project file.** If you store `BUILDER_API_PASSWORD` in a project's `.env` or any file the container can read, the agent can authenticate against the API. **Keep it in `src/.env` of llm-docker** (which the container *can* read — yes, this is a known gap; if you don't trust the agent with the password, use `env-gorilla`/KeePassXC instead of `.env`).
+
+* 🚨 **Hot-reload race.** If you edit the host toml to *temporarily* add a dangerous job ("just one debug shell, I'll remove it after"), the agent has a ~1.5 s window of access. It only takes one POST. **Don't add dangerous jobs even temporarily; don't edit the toml live while paranoid Claude is running.**
+
+* 🚨 **Other host services on the same Mac.** The Builder API runs as your user, so any other service running as your user (Docker Desktop, browser, IDE) shares its trust domain. The cage doesn't protect them from each other.
+
+### 🛡️ Safe-use rules
+
+1. **Audit `~/.llm-docker/builder-api.toml` like `sudoers`**. Every job is a "Claude may run this on my Mac." Read each one.
+2. **No `bash -c` jobs. No `eval` jobs. No "any arg" placeholders (`regex = ".*"`).** If you find yourself writing one, you've lost.
+3. **`command_hash`-pin any job whose binary lives inside a project tree.**
+4. **Prefer host-only command paths** (`/usr/local/bin/foo`, `/opt/...`) over project-relative ones (`vendor/bin/foo`, `scripts/...`) for sensitive jobs.
+5. **Keep `BUILDER_API_PASSWORD` out of any file the container can read.** Use env-gorilla / KeePassXC if you have them.
+6. **Treat dev-server runtime endpoints (`/run` `/stop`) as a "run my exact declared command, no args" interface.** That's all they are — no surprises.
+7. **For untrusted projects** (cloned from GitHub, doing security research, etc.) — **don't add a `[project.<name>]` block at all**, or add one with zero jobs and `runtime.enabled = false`. The cage works fine without Builder API; you just lose autonomous dev.
+8. **Read `CHANGELOG.md` for security advisories** before bumping versions.
+9. **Browser jobs run inside the container, ALWAYS.** Use playwright MCP from the agent (preferred), or a `docker exec llm-docker ...` job if you need queue integration. Never install Chrome on the Mac for screenshot/browser-automation jobs; never put a host browser path in a job's `command =`. The cage's whole point is sandboxing browser RCEs — defeating it by running browser work on the host puts your home dir + keychain a Chromium 0-day away.
 
 ## 🚧 Roadmap
-* **TEST SSH**: SSH -> Run OpenCode/Claude Code as a server for IDE integration (port 49455)
+* **Finish SSH**: SSH -> Run OpenCode/Claude Code as a server for IDE integration (port 49455)
 * **More claude setting** ideas 🥴
   - alwaysThinkingEnabled: true — auto-extended-thinking for hard tasks
   - showThinkingSummaries: false — hides verbose internal reasoning

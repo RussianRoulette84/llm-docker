@@ -25,7 +25,11 @@
       "TaskStop",
       "TaskList",
       "TaskGet",
-      "ToolSearch"
+      "ToolSearch",
+      "Bash(mkdir -p /root/Projects/llm-docker/src/examples/python-example/.claude/commands /root/Projects/llm-docker/src/examples/php-example/.claude/commands)",
+      "Bash(cp /root/Projects/llm-docker/.claude/commands/LLM-DOCKER-BUILDER-API-BOOTSTRAP.md /root/Projects/llm-docker/src/examples/python-example/.claude/commands/LLM-DOCKER-BUILDER-API-BOOTSTRAP.md)",
+      "Bash(cp /root/Projects/llm-docker/.claude/commands/LLM-DOCKER-BUILDER-API-BOOTSTRAP.md /root/Projects/llm-docker/src/examples/php-example/.claude/commands/LLM-DOCKER-BUILDER-API-BOOTSTRAP.md)",
+      "Skill(CHECK)"
     ],
     "deny": [
       "Bash(rm *)",

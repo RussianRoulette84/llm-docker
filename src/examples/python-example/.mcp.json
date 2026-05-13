@@ -1,0 +1,37 @@
+{
+  "_comment": "Sample MCP config for a llm-docker-integrated Python project. The 5 servers below give Claude/OpenCode eyes (playwright + chromium), filesystem read/write, git read-only, log tailing, and host-side job control via builder-api. Adjust paths / drop any server you don't want.",
+  "_playwright_note": "Uses system chromium via --executable-path because Playwright's default chrome-for-testing channel has no Linux arm64 build. --no-sandbox is safe here because the llm-docker container is already cap_drop + no-new-privileges sandboxed.",
+  "_builder_api_note": "BUILDER_API_PASSWORD is forwarded into the container by cld/ocd. The same value must match [defaults].password in ~/.llm-docker/builder-api.toml on the host.",
+  "mcpServers": {
+    "playwright": {
+      "command": "node",
+      "args": ["./node_modules/@playwright/mcp/cli.js", "--executable-path", "/usr/bin/chromium", "--headless", "--isolated", "--no-sandbox"]
+    },
+    "filesystem": {
+      "command": "node",
+      "args": ["./node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "."]
+    },
+    "git": {
+      "command": "node",
+      "args": ["./node_modules/@cyanheads/git-mcp-server/dist/index.js"]
+    },
+    "llm-docker-logs": {
+      "command": "node",
+      "args": ["./scripts/mcp/logs-server/index.js"],
+      "env": {
+        "BUILDER_API_PASSWORD": "${BUILDER_API_PASSWORD}",
+        "BUILDER_API_HOST": "host.docker.internal",
+        "BUILDER_API_PORT": "6666"
+      }
+    },
+    "llm-docker-ops": {
+      "command": "node",
+      "args": ["./scripts/mcp/ops-server/index.js"],
+      "env": {
+        "BUILDER_API_PASSWORD": "${BUILDER_API_PASSWORD}",
+        "BUILDER_API_HOST": "host.docker.internal",
+        "BUILDER_API_PORT": "6666"
+      }
+    }
+  }
+}

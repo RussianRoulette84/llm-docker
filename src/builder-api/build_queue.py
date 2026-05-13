@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +57,12 @@ class BuildEntry:
     # cfg.build; job callers fill them from the resolved Job.
     command: str = ""
     timeout_s: int = 0
+    # SIGTERM→SIGKILL grace window (seconds). 0 = use the helper's default (3s).
+    kill_after_s: int = 0
+    # Subdir (relative to project_root) the subprocess runs in. "." = project
+    # root. Snapshotted at enqueue time so a mid-flight hot-reload can't move
+    # the goalposts on a building job.
+    cwd: str = "."
     # Set when this entry came from POST /job/<name>; None for legacy /build.
     # Surfaces in to_public() so /queue and /build_status callers can tell
     # which job a build came from.
@@ -68,12 +74,22 @@ class BuildEntry:
     # at enqueue time. Internal; not exposed in to_public().
     fingerprint: str = field(default="", repr=False)
     _done: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Live subprocess handle. Populated only while the entry is `building`.
+    # Used by `BuildQueue.cancel_current()` to signal the running process
+    # group from another thread. Never serialized.
+    _proc: object = field(default=None, repr=False)
 
-    def to_public(self) -> dict:
+    def to_public(self, *, include_log_tail: bool = True) -> dict:
         """Serialisable view. Built explicitly rather than via asdict()
         because asdict() deep-copies every field, and threading.Event
         contains a non-picklable Lock — it crashes before we get a chance
-        to drop the field."""
+        to drop the field.
+
+        `include_log_tail=False` is used by /queue's history view to keep
+        per-poll responses tight (every history entry was carrying ~3 KB
+        of log text; on a busy day /queue ballooned past 100 KB). The
+        full log_tail is still available via /build_status?id=<id>.
+        """
         d: dict = {
             "id": self.id,
             "agent_id": self.agent_id,
@@ -83,7 +99,6 @@ class BuildEntry:
             "queued_at": self.queued_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "log_tail": self.log_tail,
             "command": self.command,
             "timeout_s": self.timeout_s,
             "elapsed_s": _elapsed(self),
@@ -91,6 +106,8 @@ class BuildEntry:
             "started_at_iso": _iso(self.started_at),
             "finished_at_iso": _iso(self.finished_at),
         }
+        if include_log_tail:
+            d["log_tail"] = self.log_tail
         if self.job_name is not None:
             d["job_name"] = self.job_name
             d["params"] = self.params or {}
@@ -152,36 +169,14 @@ class BuildQueue:
             self._cfg = new_cfg
             self._build_cfg = new_cfg.build
 
-    def enqueue(self, *, args: list[str], agent_id: str) -> BuildEntry:
-        """
-        Validate args against the legacy `[build].allowed_args` whitelist,
-        add the entry to the queue, return it.
-
-        Use `enqueue_job()` for `[jobs.<name>]` templates instead — the two
-        paths share a queue but validate differently.
-
-        Raises:
-            ValueError  — whitelist violation (caller maps to HTTP 400)
-            QueueFull   — pending deque at build.max_pending (caller → 429)
-        """
-        validated = self._validate_args(args)
-        fp = _fingerprint(job_name=None, args=validated)
-        return self._enqueue_internal(
-            args=tuple(validated),
-            command=self._build_cfg.command,
-            timeout_s=self._build_cfg.timeout_s,
-            agent_id=str(agent_id or ""),
-            job_name=None,
-            params=None,
-            fingerprint=fp,
-        )
-
     def enqueue_job(
         self,
         *,
         args: list[str],
         command: str,
         timeout_s: int,
+        kill_after_s: int,
+        cwd: str,
         job_name: str,
         params: dict,
         agent_id: str,
@@ -202,6 +197,8 @@ class BuildQueue:
             args=tuple(args),
             command=command,
             timeout_s=timeout_s,
+            kill_after_s=kill_after_s,
+            cwd=cwd,
             agent_id=str(agent_id or ""),
             job_name=job_name,
             params=dict(params) if params else {},
@@ -214,6 +211,8 @@ class BuildQueue:
         args: tuple[str, ...],
         command: str,
         timeout_s: int,
+        kill_after_s: int = 0,
+        cwd: str = ".",
         agent_id: str,
         job_name: Optional[str],
         params: Optional[dict],
@@ -239,6 +238,8 @@ class BuildQueue:
                 args=args,
                 command=command,
                 timeout_s=timeout_s,
+                kill_after_s=kill_after_s,
+                cwd=cwd,
                 job_name=job_name,
                 params=params,
                 fingerprint=fingerprint,
@@ -285,6 +286,44 @@ class BuildQueue:
                 return e
         return None
 
+    def cancel_current(self) -> Optional[dict]:
+        """SIGTERM the running build's process group, then BLOCK until the
+        worker thread acknowledges via _finalize. Returns a small dict with
+        the cancelled entry's id + final status, or None if nothing was
+        running.
+
+        Without the block-on-_done wait, callers saw DELETE return 200
+        while /build_status?id=<id> still reported status="building" for
+        50-200ms (race on _finalize). Carpet-test patterns that POST then
+        immediately DELETE relied on the response meaning "stopped" — so
+        the wait makes the API contract honest. Capped at 15s so a stuck
+        worker can't deadlock the request thread.
+
+        Safe to call from a request thread: grabs the entry + proc under
+        lock, then signals outside the lock so a slow-dying child can't
+        block other enqueues. _kill_process_group uses `killpg` on the
+        whole process group, so a bash → node → chromium chain spawned
+        via `start_new_session=True` dies together rather than orphaning
+        a 1GB chromium.
+        """
+        with self._lock:
+            entry = self._current
+            proc = entry._proc if entry else None
+            grace = entry.kill_after_s if (entry and entry.kill_after_s) else 0
+        if entry is None or proc is None:
+            return None
+        _kill_process_group(proc, grace_s=grace or None)
+        # Block until _finalize has run: status is terminal, _done is set,
+        # entry has left _current. Without this, the API lies about cancel
+        # having completed.
+        entry._done.wait(timeout=15.0)
+        return {
+            "cancelled": entry.id,
+            "job_name": entry.job_name,
+            "status": entry.status,
+            "returncode": entry.returncode,
+        }
+
     def cancel(self, build_id: str) -> bool:
         """
         Cancel a pending (not-yet-started) build. Returns True on success,
@@ -323,12 +362,20 @@ class BuildQueue:
         return out
 
     def snapshot(self) -> dict:
-        """Current queue state for the `/queue` endpoint."""
+        """Current queue state for the `/queue` endpoint. History entries
+        omit `log_tail` to keep per-poll responses small — clients that
+        want the full tail of a specific finished build hit
+        `/build_status?id=<id>` which returns the include-tail view.
+        `total_history` exposes how many entries are in the bounded deque
+        (capped at HISTORY_CAP)."""
         with self._lock:
             return {
                 "current": self._current.to_public() if self._current else None,
                 "pending": [e.to_public() for e in self._pending],
-                "history": [e.to_public() for e in self._history],
+                "history": [
+                    e.to_public(include_log_tail=False) for e in self._history
+                ],
+                "total_history": len(self._history),
             }
 
     def current(self) -> Optional[BuildEntry]:
@@ -373,16 +420,53 @@ class BuildQueue:
         )
 
         # Snapshot at enqueue time. We never re-resolve at execute time, so
-        # a hot-reload of `.builder-api.toml` between enqueue and execute
-        # can't change what's already in flight.
-        cmd = [entry.command or self._build_cfg.command, *entry.args]
+        # a hot-reload of the host toml between enqueue and execute can't
+        # change what's already in flight. entry.command is always set by
+        # enqueue_job (the only enqueue path); fall back to "" defensively.
+        # Daemon-side substitution: the reserved arg token `{{container}}` is
+        # replaced at dispatch with the ID of the running container labelled
+        # `llm-docker-project=<this-project>`. Lets wrapper-via-docker-exec
+        # jobs stay stable across Claude restarts (container names are
+        # `claude-<PID>`; the label survives restarts because cld sets it).
+        resolved_args = list(entry.args)
+        for i, a in enumerate(resolved_args):
+            if a == "{{container}}":
+                cid = _resolve_managed_container(self._cfg.name)
+                if not cid:
+                    self._finalize(
+                        entry,
+                        returncode=126,
+                        reason=f"no running container labelled "
+                               f"llm-docker-project={self._cfg.name}",
+                    )
+                    return
+                resolved_args[i] = cid
+        cmd = [entry.command, *resolved_args]
         timeout = entry.timeout_s or self._build_cfg.timeout_s
+
+        # Resolve per-job cwd against project_root. String-level path-escape
+        # was rejected at config-load time (jobs.py); .resolve() here also
+        # catches symlink-based escape attempts.
+        if entry.cwd in ("", "."):
+            job_cwd = self._cfg.project_root
+        else:
+            job_cwd = (self._cfg.project_root / entry.cwd).resolve()
+            try:
+                job_cwd.relative_to(self._cfg.project_root)
+            except ValueError:
+                self._finalize(
+                    entry,
+                    returncode=126,
+                    reason=f"cwd escapes project root: {entry.cwd}",
+                )
+                return
 
         # Open the build log for append; subprocess writes stdout+stderr there.
         self._build_log.parent.mkdir(parents=True, exist_ok=True)
         log_header = (
             f"\n=== build {entry.id} agent={entry.agent_id or '?'} "
-            f"args={list(entry.args)} start={_iso(entry.started_at)} ===\n"
+            f"args={list(entry.args)} cwd={job_cwd} "
+            f"start={_iso(entry.started_at)} ===\n"
         )
         try:
             with self._build_log.open("ab") as log_f:
@@ -390,13 +474,16 @@ class BuildQueue:
                 log_f.flush()
                 proc = subprocess.Popen(
                     cmd,
-                    cwd=str(self._cfg.project_root),
+                    cwd=str(job_cwd),
                     stdout=log_f,
                     stderr=subprocess.STDOUT,
                     shell=False,                 # execvp, never /bin/sh -c
                     start_new_session=True,     # new pg so timeout kills children
                     env=os.environ.copy(),
                 )
+                # Expose the live Popen so DELETE /current/cancel can find
+                # it. Cleared in _finalize once the wait returns.
+                entry._proc = proc
         except FileNotFoundError:
             self._finalize(entry, returncode=127, reason="command not found")
             return
@@ -407,12 +494,20 @@ class BuildQueue:
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
+            _kill_process_group(proc, grace_s=entry.kill_after_s or None)
             rc = -1
             self._finalize(entry, returncode=rc, reason="timeout")
             return
 
-        self._finalize(entry, returncode=rc, reason=None)
+        # Distinguish a fresh-finished build from one killed by
+        # cancel_current(): SIGTERM/SIGKILL gives rc<0. We only know
+        # "cancelled" if the entry's status was flipped by the cancel
+        # path, OR if rc<0 — the latter is the simpler heuristic and
+        # matches what /current/cancel callers expect.
+        if rc < 0:
+            self._finalize(entry, returncode=rc, reason="cancelled")
+        else:
+            self._finalize(entry, returncode=rc, reason=None)
 
     def _finalize(
         self,
@@ -423,7 +518,13 @@ class BuildQueue:
     ) -> None:
         entry.returncode = returncode
         entry.finished_at = time.time()
-        entry.status = STATUS_DONE if returncode == 0 else STATUS_FAILED
+        # Distinguish user-cancelled (DELETE /current/cancel → SIGTERM)
+        # from a genuine failure. Both have rc<0; reason="cancelled"
+        # is set by _execute() only when the kill came from cancel_current.
+        if reason == "cancelled":
+            entry.status = STATUS_CANCELLED
+        else:
+            entry.status = STATUS_DONE if returncode == 0 else STATUS_FAILED
         entry.log_tail = _tail_text(self._build_log, LOG_TAIL_LINES)
 
         with self._lock:
@@ -456,28 +557,6 @@ class BuildQueue:
     def _get(self, build_id: str) -> Optional[BuildEntry]:
         with self._lock:
             return self._by_id.get(build_id)
-
-    def _validate_args(self, args) -> list[str]:
-        if args is None:
-            return []
-        if not isinstance(args, (list, tuple)):
-            raise ValueError("args must be a list of strings")
-        allowed = set(self._build_cfg.allowed_args)
-        out: list[str] = []
-        for a in args:
-            if not isinstance(a, str):
-                raise ValueError("args must be strings")
-            # Strict whitelist: empty `allowed_args = []` means NO args
-            # allowed (not "any args allowed"). This is the safer default
-            # — projects that want unrestricted args should use [jobs.*]
-            # with explicit placeholder regexes instead.
-            if a not in allowed:
-                raise ValueError(
-                    f"arg {a!r} not in whitelist. Allowed: "
-                    f"{sorted(allowed) or '[]'}"
-                )
-            out.append(a)
-        return out
 
 
 # ---------------------------------------------------------------------------
@@ -520,16 +599,41 @@ def _elapsed(entry: BuildEntry) -> Optional[float]:
     return round(end - entry.started_at, 3)
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
+def _resolve_managed_container(project_name: str) -> str:
+    """Return the container ID of the running container labelled
+    `llm-docker-project=<project_name>`, or empty string if none found.
+    cld/ocd set this label at `docker run` time so wrapper jobs can
+    `docker exec {{container}} ...` without hardcoding the volatile
+    `claude-<PID>` container name."""
+    try:
+        r = subprocess.run(
+            [
+                "docker", "ps",
+                "--filter", f"label=llm-docker-project={project_name}",
+                "-q",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+    if r.returncode != 0:
+        return ""
+    ids = [ln.strip() for ln in r.stdout.split("\n") if ln.strip()]
+    return ids[0] if ids else ""
+
+
+def _kill_process_group(proc: subprocess.Popen, *, grace_s: Optional[int] = None) -> None:
     """Kill the whole process group we spawned; otherwise timed-out builds
-    leave child processes running."""
+    leave child processes running. `grace_s` is the SIGTERM→SIGKILL window
+    (default 3s, configurable per-job via `[jobs.<name>].kill_after_s`)."""
     import signal
+    grace = grace_s if grace_s and grace_s > 0 else 3
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         return
-    # Give the tree a few seconds to shut down, then SIGKILL survivors.
-    for _ in range(30):
+    # Poll every 100 ms for `grace` seconds, then SIGKILL stragglers.
+    for _ in range(int(grace * 10)):
         if proc.poll() is not None:
             return
         time.sleep(0.1)

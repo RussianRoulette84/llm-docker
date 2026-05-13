@@ -1,0 +1,10 @@
+{
+  "name": "llm-docker-logs-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Logs MCP server for projects integrated with llm-docker.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}

@@ -15,8 +15,33 @@ matching where Python servers normally chatter.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
+
+# Threshold for "narrow" vs "wide" rendering. The default applescript
+# spawn opens a 43-column iTerm window — below ~70 the single-line event
+# format wraps badly, so we collapse to a 2-line compact view. Above ~70
+# we keep the original spacious layout.
+NARROW_COL_THRESHOLD = 70
+
+
+def _term_cols(default: int = 80) -> int:
+    """Best-effort terminal width. Reads stderr's tty; falls back to
+    $COLUMNS, then to `default`. Never raises."""
+    for fd in (sys.stderr, sys.stdout):
+        try:
+            return os.get_terminal_size(fd.fileno()).columns
+        except (OSError, AttributeError, ValueError):
+            continue
+    try:
+        return int(os.environ.get("COLUMNS", default))
+    except ValueError:
+        return default
+
+
+def _is_narrow() -> bool:
+    return _term_cols() < NARROW_COL_THRESHOLD
 
 # 256-color palette mirroring install.sh's blue→purple gradient.
 C1 = "\033[38;5;33m"
@@ -26,6 +51,7 @@ C4 = "\033[38;5;51m"
 C5 = "\033[38;5;81m"
 C6 = "\033[38;5;87m"
 C7 = "\033[38;5;141m"   # purple — primary accent
+C8 = "\033[38;5;213m"   # pink — project name highlight
 ORANGE = "\033[38;5;208m"
 GREEN  = "\033[38;5;82m"
 RED    = "\033[38;5;196m"
@@ -35,34 +61,115 @@ DIM    = "\033[2m"
 BOLD   = "\033[1m"
 RST    = "\033[0m"
 
-# Compact ASCII glyph. Eight rows, ≤62 cols — fits a default-width
-# terminal without wrapping. Coloured row-by-row in the blue→purple
-# gradient at boot time.
-_ASCII_LINES = [
-    " ███████ ███   ███ ███ ███      ███████  ███████ ███ ",
-    " ███   ███████ ██████ ██████    ███   ███████   ████ ",
-    " ███████ ███   ███ ██  ███      ███████  ███████ ███ ",
-    " ███   ███   █████  █████   ▄▄▄ ███   ███████   ████ ",
-    " ███████ ███   ███████ ███ ▀▀▀▀ ███   ███████   ████ ",
+# Wide ASCII glyph (LLM DOCKER + tagline). Eight rows, ≤65 cols — coloured
+# row-by-row in the blue→purple gradient at boot time.
+_ASCII_LINES_WIDE = [
+    " ██     ██     ██▄  ▄██     ▄▄▄▄   ▄▄▄   ▄▄▄▄ ▄▄ ▄▄ ▄▄▄▄▄ ▄▄▄▄  ",
+    " ██     ██     ██ ▀▀ ██ ▄▄▄ ██▀██ ██▀██ ██▀▀▀ ██▄█▀ ██▄▄  ██▄█▄ ",
+    " ██████ ██████ ██    ██     ████▀ ▀███▀ ▀████ ██ ██ ██▄▄▄ ██ ██ ",
+    "                      Builder API ",
+]
+
+# Narrow ASCII glyph (LLM + tagline). Used in the 43-col iTerm split where
+# the wide art would wrap into garbage. The "LLM" letters are reused from
+# the wide art so the look stays consistent across panes.
+_ASCII_LINES_NARROW = [
+    "       ██     ██     ██▄  ▄██",
+    "       ██     ██     ██ ▀▀ ██",
+    "       ██████ ██████ ██    ██",
+    " ▄▄▄▄   ▄▄▄   ▄▄▄▄ ▄▄ ▄▄ ▄▄▄▄▄ ▄▄▄▄  ",
+    " ██▀██ ██▀██ ██▀▀▀ ██▄█▀ ██▄▄  ██▄█▄ ",
+    " ████▀ ▀███▀ ▀████ ██ ██ ██▄▄▄ ██ ██ ",
+    " "
+    "            Builder API",
 ]
 
 
-def show_banner(name: str, bind: str, port: int, jobs_count: int) -> None:
+def _frame(lines, color, inner_width):
+    """ywizz-style framed box: `◆ ─╮ / │  content  │ / ├──╯`. Rounded
+    right corners, straight verticals on the left, single accent colour.
+    SGR escapes inside `lines` are tolerated — visible width is computed
+    by stripping them so padding stays aligned."""
+    import re
+    strip = re.compile(r"\033\[[0-9;]*m")
+    out = []
+    top_dashes = "─" * max(0, inner_width)
+    out.append(f"  {color}◆ {top_dashes}╮{RST}\n")
+    for line in lines:
+        visible = strip.sub("", line)
+        pad = max(0, inner_width - 2 - len(visible))
+        out.append(f"  {color}│{RST}  {line}{' ' * pad}{color}│{RST}\n")
+    bot_dashes = "─" * (inner_width + 1)
+    out.append(f"  {color}├{bot_dashes}╯{RST}\n")
+    return "".join(out)
+
+
+def show_banner(name: str, bind: str, port: int, jobs_names) -> None:
     """Print the boot banner + status header to stderr. Called once
-    from server.main()."""
+    from server.main(). Wide terminals get the full LLM DOCKER art;
+    narrow panes get the slim LLM-only variant. Both modes wrap the
+    status lines in a ywizz-style accent frame, with the project name
+    highlighted in pink so it pops against the blue/purple gradient.
+
+    `jobs_names` is either a list of job names (preferred — printed
+    underneath the frame) or an int (legacy: just shown as a count)."""
+    if isinstance(jobs_names, int):
+        names = []
+        jobs_count = jobs_names
+    else:
+        names = sorted(jobs_names)
+        jobs_count = len(names)
+
+    cols = _term_cols()
+    narrow = cols < NARROW_COL_THRESHOLD
+
+    ascii_lines = _ASCII_LINES_NARROW if narrow else _ASCII_LINES_WIDE
+    inner_width = (min(cols, 44) if narrow else 60) - 4
+
     palette = [C1, C2, C3, C5, C6, C7]
-    out = ["\n"]
-    for i, line in enumerate(_ASCII_LINES):
+    art = []
+    for i, line in enumerate(ascii_lines):
         c = palette[min(i, len(palette) - 1)]
-        out.append(f"  {c}{line}{RST}\n")
-    out.append(
-        f"\n  {C7}{BOLD}■{RST} {name!r}  "
-        f"{DIM}listening{RST} {C5}{bind}:{port}{RST}  "
-        f"{DIM}·  jobs={C7}{jobs_count}{RST}{DIM}  ·  "
-        f"v0.2  ·  events live below{RST}\n"
-        f"  {DIM}{'─' * 58}{RST}\n"
-    )
-    sys.stderr.write("".join(out))
+        art.append(f"  {c}{line}{RST}\n")
+
+    proj = f"{C8}{BOLD}{name!r}{RST}"
+    listen = f"{C5}{bind}:{port}{RST}"
+    jobs = f"{DIM}jobs={RST}{C7}{jobs_count}{RST}"
+    if narrow:
+        status = [
+            f"{C7}■{RST} {proj}",
+            f"{DIM}↳{RST} {listen}",
+            f"{jobs}  {DIM}· events ↓{RST}",
+        ]
+    else:
+        status = [
+            f"{C7}■{RST} {proj}  {DIM}listening{RST} {listen}",
+            f"{jobs}  {DIM}·  events live below{RST}",
+        ]
+
+    sys.stderr.write("\n" + "".join(art) + "\n" + _frame(status, C7, inner_width))
+
+    # Job list under the frame — wrapped to terminal width, 2-space gutter,
+    # 4-space hang. Visible width tracked separately from rendered string
+    # so ANSI escapes don't trip the wrap. Skipped if no jobs (legacy int
+    # call site).
+    if names:
+        max_width = max(40, cols - 4)
+        line = "    "
+        visible = 4
+        out: list[str] = []
+        for n in names:
+            need = len(n) + 2
+            if visible + need > max_width and line.strip():
+                out.append(line.rstrip())
+                line = "    "
+                visible = 4
+            line += f"{C7}{n}{RST}  "
+            visible += need
+        if line.strip():
+            out.append(line.rstrip())
+        sys.stderr.write(f"  {DIM}jobs:{RST}\n" + "\n".join(out) + "\n")
+
     sys.stderr.flush()
 
 
@@ -82,10 +189,11 @@ _EVENT_STYLE: dict[str, tuple[str, str]] = {
 
 
 def event_line(record: dict) -> None:
-    """EventStore subscriber. Renders one colored line per event."""
+    """EventStore subscriber. Renders one event in wide or compact mode
+    depending on the terminal width detected at write time. Wide = single
+    line (~85 chars). Compact = 2 lines (header + indented summary)."""
     typ = record.get("type", "?")
     color, glyph = _EVENT_STYLE.get(typ, (GREY, "·"))
-    # Special case: build_finished with non-zero rc paints red instead of green.
     if typ == "build_finished" and record.get("status") != "done":
         color, glyph = RED, "✗"
     ts = record.get("ts", time.time())
@@ -94,10 +202,19 @@ def event_line(record: dict) -> None:
     except (TypeError, ValueError):
         hms = "--:--:--"
     msg = _summarize(record)
-    sys.stderr.write(
-        f"  {DIM}{hms}{RST}  {color}{glyph} "
-        f"{typ:<22}{RST}  {GREY}{msg}{RST}\n"
-    )
+
+    if _is_narrow():
+        # 2-line compact: short timestamp + glyph + type; message indented.
+        # Skip the message line entirely if there's nothing to say.
+        hm = hms[:5]   # HH:MM
+        sys.stderr.write(f"{DIM}{hm}{RST} {color}{glyph} {typ}{RST}\n")
+        if msg:
+            sys.stderr.write(f"  {GREY}{msg}{RST}\n")
+    else:
+        sys.stderr.write(
+            f"  {DIM}{hms}{RST}  {color}{glyph} "
+            f"{typ:<22}{RST}  {GREY}{msg}{RST}\n"
+        )
     sys.stderr.flush()
 
 

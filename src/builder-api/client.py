@@ -208,7 +208,6 @@ def ws(
     `on_message` default: print line-by-line log frames, skip others.
     """
     import base64
-    import hashlib
     import os as _os
     import socket
     import struct

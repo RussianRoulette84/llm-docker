@@ -1,0 +1,288 @@
+# ──────────────────────────────────────────────────────────────────────
+# builder-api host config — copy to ~/.llm-docker/builder-api.toml
+# ──────────────────────────────────────────────────────────────────────
+#
+# This file is the SINGLE SOURCE OF TRUTH for every command the
+# builder-api daemon will ever execute on your Mac, across every project.
+#
+#   * Lives at ~/.llm-docker/builder-api.toml — host-owned, never bind-
+#     mounted into any container.
+#   * Containers (Claude / OpenCode) can read the resolved job list via
+#     GET /jobs and execute via POST /job/<name>, but they CANNOT change
+#     which jobs exist or what command each runs. Auditable in one file.
+#
+# Resolution order (later wins):
+#   1. [jobs.<name>]                        — global (every project)
+#   2. [language.<lang>.jobs.<name>]        — per opted-in language pack
+#   3. [project.<name>.jobs.<name>]         — explicit project override
+#
+# Daemon launch:  `python3 server.py --project <name>`
+#                 (cld / ocd derive <name> from $(basename "$project_dir"))
+#
+# Hot-reload:     NONE. Daemon reads this file once at startup. Edit it,
+#                 then kill the daemon and let cld/ocd relaunch — that
+#                 way the cage's job surface only changes on a deliberate
+#                 operator action, never silently via a file write.
+# ──────────────────────────────────────────────────────────────────────
+
+
+# ── Defaults ──────────────────────────────────────────────────────────
+[defaults]
+password = "${BUILDER_API_PASSWORD}"      # env-interpolated; never inline secrets
+log_dir  = "~/.llm-docker/logs"            # per-project logs go under <log_dir>/<project>/
+bind     = "127.0.0.1"                     # 0.0.0.0 requires password (non-loopback)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# GLOBAL JOBS — usable from every project, no opt-in needed
+# ──────────────────────────────────────────────────────────────────────
+
+[jobs.git-status]
+command     = "git"
+args        = ["status", "--short", "--porcelain"]
+timeout_s   = 10
+description = "Show working tree status (porcelain)"
+
+[jobs.git-log]
+command     = "git"
+args        = ["log", "--oneline", "-n", "{n}"]
+timeout_s   = 10
+description = "Last N commits, oneline format"
+[jobs.git-log.placeholders.n]
+regex       = "^[1-9][0-9]?$"
+max_len     = 2
+required    = true
+description = "Number of commits to show (1..99)"
+
+[jobs.tree]
+command     = "tree"
+args        = ["-L", "{depth}", "-a", "--gitignore"]
+timeout_s   = 10
+description = "Filesystem tree, N levels deep, respecting .gitignore"
+[jobs.tree.placeholders.depth]
+regex       = "^[1-5]$"
+required    = true
+description = "Tree depth 1..5"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# LANGUAGE PACKS — opted into via project.<name>.languages = [...]
+# ──────────────────────────────────────────────────────────────────────
+
+# ── Python ────────────────────────────────────────────────────────────
+[language.python.jobs.pytest]
+command     = "pytest"
+args        = ["-x", "--tb=short"]
+timeout_s   = 300
+description = "Run the full test suite, stop on first failure"
+
+[language.python.jobs.pytest-filter]
+command     = "pytest"
+args        = ["-x", "--tb=short", "-k", "{pattern}"]
+timeout_s   = 300
+description = "Run tests matching keyword pattern"
+[language.python.jobs.pytest-filter.placeholders.pattern]
+regex       = "^[A-Za-z0-9_\\-]+$"
+required    = true
+description = "pytest -k pattern (alphanumeric + _-)"
+
+[language.python.jobs.ruff]
+command     = "ruff"
+args        = ["check", "--fix", "."]
+timeout_s   = 60
+description = "Lint + autofix"
+
+[language.python.jobs.mypy]
+command     = "mypy"
+args        = ["."]
+timeout_s   = 120
+description = "Static type check"
+
+[language.python.jobs.pip-install]
+command     = "pip"
+args        = ["install", "-r", "requirements.txt"]
+timeout_s   = 300
+description = "Install Python dependencies"
+
+
+# ── PHP ───────────────────────────────────────────────────────────────
+[language.php.jobs.phpunit]
+command     = "vendor/bin/phpunit"
+args        = []
+timeout_s   = 300
+description = "Run the full PHPUnit suite"
+
+[language.php.jobs.phpunit-filter]
+command     = "vendor/bin/phpunit"
+args        = ["--filter", "{test}"]
+timeout_s   = 300
+description = "Run a single PHPUnit class or method by name"
+[language.php.jobs.phpunit-filter.placeholders.test]
+regex       = "^[A-Za-z][A-Za-z0-9_:]*$"
+max_len     = 200
+required    = true
+description = "Test class or Class::method (alphanumerics + _:)"
+
+[language.php.jobs.pint]
+command     = "vendor/bin/pint"
+args        = ["--test"]
+timeout_s   = 60
+description = "Code-style check (dry-run)"
+
+[language.php.jobs.composer-install]
+command     = "composer"
+args        = ["install", "--no-dev"]
+timeout_s   = 300
+description = "Install Composer dependencies"
+
+
+# ── Node / TypeScript ─────────────────────────────────────────────────
+[language.node.jobs.npm-test]
+command     = "npm"
+args        = ["test"]
+timeout_s   = 300
+description = "npm test"
+
+[language.node.jobs.npm-build]
+command     = "npm"
+args        = ["run", "build"]
+timeout_s   = 600
+description = "npm run build"
+
+[language.node.jobs.npm-install]
+command     = "npm"
+args        = ["install"]
+timeout_s   = 300
+description = "Install npm dependencies"
+
+[language.node.jobs.tsc-check]
+command     = "npx"
+args        = ["tsc", "--noEmit"]
+timeout_s   = 120
+description = "TypeScript type-check, no emit"
+
+[language.node.jobs.jest-filter]
+command     = "npx"
+args        = ["jest", "-t", "{pattern}"]
+timeout_s   = 300
+description = "Run jest tests matching pattern"
+[language.node.jobs.jest-filter.placeholders.pattern]
+regex       = "^[A-Za-z0-9 _\\-]+$"
+max_len     = 80
+required    = true
+description = "Jest -t pattern"
+
+
+# ── Docker Compose (cross-language; opt-in via languages = [..., \"compose\"]) ─
+[language.compose.jobs.compose-ps]
+command     = "docker"
+args        = ["compose", "ps"]
+timeout_s   = 10
+description = "List compose services"
+
+[language.compose.jobs.compose-up]
+command     = "docker"
+args        = ["compose", "up", "-d"]
+timeout_s   = 300
+description = "Start all services detached"
+
+[language.compose.jobs.compose-down]
+command     = "docker"
+args        = ["compose", "down"]
+timeout_s   = 60
+description = "Stop and remove all services"
+
+[language.compose.jobs.compose-logs]
+command     = "docker"
+args        = ["compose", "logs", "--tail", "{lines}", "{service}"]
+timeout_s   = 30
+description = "Tail logs from one compose service"
+[language.compose.jobs.compose-logs.placeholders.lines]
+regex       = "^[1-9][0-9]{0,3}$"
+required    = true
+description = "Number of lines to tail (1..9999)"
+[language.compose.jobs.compose-logs.placeholders.service]
+regex       = "^[a-z][a-z0-9_\\-]{0,30}$"
+required    = true
+description = "Compose service name"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# PROJECTS — match basename($project_dir); add one block per project
+# ──────────────────────────────────────────────────────────────────────
+
+[project.llm-docker]
+root      = "~/Projects/llm-docker"
+port      = 6666
+languages = ["python"]
+# Dev jobs for working ON llm-docker itself (cage source).
+[project.llm-docker.jobs.smoke]
+command     = "src/smoke_test.sh"
+args        = []
+timeout_s   = 120
+description = "Run llm-docker smoke tests"
+[project.llm-docker.jobs.lint-shell]
+command     = "/bin/bash"
+args        = ["-n", "{file}"]
+timeout_s   = 10
+description = "Bash -n syntax check on a tracked shell script"
+[project.llm-docker.jobs.lint-shell.placeholders.file]
+regex       = "^src/(cld|ocd|install\\.sh|setup\\.sh|builder-api/run-local\\.sh|docker/docker-entrypoint\\.sh|docker/zprofile|docker/install_cli\\.sh|docker/install_devpack\\.sh)$"
+required    = true
+description = "One of the tracked shell scripts under src/"
+[project.llm-docker.jobs.syntax-py]
+command     = "python3"
+args        = ["-m", "py_compile", "{file}"]
+timeout_s   = 10
+description = "Byte-compile a builder-api Python file (catches syntax errors)"
+[project.llm-docker.jobs.syntax-py.placeholders.file]
+regex       = "^src/builder-api/(server|config|build_queue|jobs|hot_reload|banner|events|logs|runtime|security|ws|client)\\.py$"
+required    = true
+description = "Path to a builder-api .py file under src/"
+
+
+[project.example-python]
+root      = "~/Projects/example-python"
+port      = 6701
+languages = ["python"]
+# Override the language default — point pytest at your test wrapper if you have one.
+[project.example-python.jobs.pytest]
+command     = "scripts/run-tests.sh"
+args        = []
+timeout_s   = 300
+description = "Run the project test suite via the repo's wrapper script"
+# Project-specific job example
+[project.example-python.jobs.smoke]
+command     = "scripts/ci/smoke.sh"
+args        = []
+timeout_s   = 120
+description = "Smoke test"
+# Long-lived dev server (claude can /run, /stop, /status)
+[project.example-python.runtime]
+enabled        = true
+start_command  = ".venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+cwd            = "."
+stop_signal    = "SIGTERM"
+stop_timeout_s = 5
+
+
+[project.example-php-compose]
+root      = "~/Projects/example-php-compose"
+port      = 6702
+languages = ["php", "node", "compose"]
+# Example of a project-specific job with placeholders (browser screenshot helper).
+[project.example-php-compose.jobs.screenshot]
+command     = "scripts/dev/screenshot.js"
+args        = ["--page", "{page}"]
+timeout_s   = 60
+description = "Take a screenshot of a page via puppeteer"
+[project.example-php-compose.jobs.screenshot.placeholders.page]
+regex       = "^[a-z][a-z0-9\\-/]{0,80}$"
+required    = true
+description = "Page route slug (lowercase, slashes ok)"
+[project.example-php-compose.runtime]
+enabled        = true
+start_command  = "docker compose up"
+cwd            = "."
+stop_signal    = "SIGTERM"
+stop_timeout_s = 10
