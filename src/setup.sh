@@ -840,7 +840,10 @@ setup_image() {
     [ "$tool" != "both" ] && build_tag="llm-docker-${tool}:latest"
 
     _log SETUP "Building Docker image $build_tag. For details run: tail logs/llm-docker.log"
-    _log_docker_exec docker build "${build_args[@]}" \
+    # --provenance/--sbom=false: stop buildx emitting a manifest-list image the
+    # classic Docker store can't expose as a plain tag — otherwise the post-build
+    # `docker image inspect "$build_tag"` check always misses and we rebuild every launch.
+    _log_docker_exec docker build --provenance=false --sbom=false "${build_args[@]}" \
         --build-arg "TOOL=${tool}" \
         -t "$build_tag" "$SCRIPT_DIR"
 }
