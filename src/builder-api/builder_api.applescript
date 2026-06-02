@@ -4,12 +4,16 @@
 -- cld/ocd when the user passes `--api` (or `-a`) on a macOS host.
 --
 -- Usage from shell:
---   osascript builder_api.applescript <launcher> <project-dir> [mode] [port]
---     mode = "split"       (vertical split of current iTerm window)
---          | "new-window"  (default — open a new positioned iTerm window)
---     port = TCP port the daemon listens on. Used by the reuse path to
---            kill only THIS project's daemon (`lsof -ti :PORT`), not all
---            builder-api processes on the host.
+--   osascript builder_api.applescript <launcher> <project-dir> [mode] [port] [handoff]
+--     mode    = "split"       (vertical split of current iTerm window)
+--             | "new-window"  (default — open a new positioned iTerm window)
+--     port    = TCP port the daemon listens on. Used by the reuse path to
+--               kill only THIS project's daemon (`lsof -ti :PORT`), not all
+--               builder-api processes on the host.
+--     handoff = optional path to a short-lived shell file written by the
+--               calling cld/ocd; sourced + deleted before run-local.sh runs
+--               so the new shell inherits the parent's already-unwrapped
+--               secrets without re-prompting Touch ID.
 --
 -- The launcher-script is builder-api/run-local.sh; it sources .env and
 -- execs `python3 server.py` in <project-dir>.
@@ -107,10 +111,20 @@ on run argv
     if (count of argv) >= 4 then
         set portStr to item 4 of argv
     end if
+    set handoffPath to ""
+    if (count of argv) >= 5 then
+        set handoffPath to item 5 of argv
+    end if
 
     -- We invoke via `bash` so run-local.sh doesn't need the execute bit set;
     -- quoted form guarantees correct escaping of paths with spaces.
     set cmd to "bash " & quoted form of launcher & " " & quoted form of projectDir
+    -- Source the parent's secret handoff (then delete it) so the spawned
+    -- shell skips its own env-gorilla call. reuseCmd inherits this prefix
+    -- because it builds from `cmd` below.
+    if handoffPath is not "" then
+        set cmd to ". " & quoted form of handoffPath & " 2>/dev/null; rm -f " & quoted form of handoffPath & "; " & cmd
+    end if
     set sessionTitle to my titleForProject(projectDir)
     -- Reuse-path command: kill ONLY the daemon bound to this project's
     -- port, not all builder-api processes on the host. Falls back to a

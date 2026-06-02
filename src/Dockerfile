@@ -30,8 +30,7 @@ RUN apt-get update && \
 RUN npm install -g pnpm
 
 # --- Shell toolchain: zsh + oh-my-zsh + p10k + autosuggest + syntax highlight + fzf.
-# Packages referenced by src/docker/zprofile (bind-mounted at /root/.zprofile): micro
-# (EDITOR), bat (fz preview), ripgrep (fz content mode), ncdu (tt alias), fzf.
+# Packages: micro (EDITOR), bat (fz preview), ripgrep (fz content mode), ncdu (tt alias), fzf.
 # locales package + locale-gen so LANG=en_US.UTF-8 in zprofile doesn't warn.
 # Debian ships `bat` as `batcat` — symlink for zprofile compatibility.
 RUN apt-get update && \
@@ -59,8 +58,7 @@ RUN RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c \
     && git clone --depth=1 https://github.com/romkatv/powerlevel10k \
         "$ZSH/custom/themes/powerlevel10k"
 
-# Baseline .zshrc — loads omz + fzf keybindings + the user's .zprofile.
-# zprofile is bind-mounted from the host at /root/.zprofile (see cld/ocd).
+# Baseline .zshrc — loads omz + fzf keybindings.
 RUN printf '%s\n' \
         'export ZSH="$HOME/.oh-my-zsh"' \
         'ZSH_THEME="powerlevel10k/powerlevel10k"' \
@@ -71,8 +69,6 @@ RUN printf '%s\n' \
         '[ -f /usr/share/doc/fzf/examples/key-bindings.zsh ] && source /usr/share/doc/fzf/examples/key-bindings.zsh' \
         '[ -f /usr/share/doc/fzf/examples/completion.zsh ] && source /usr/share/doc/fzf/examples/completion.zsh' \
         '' \
-        '# User zprofile — bind-mounted read-only from host src/docker/zprofile.' \
-        '[ -f "$HOME/.zprofile" ] && source "$HOME/.zprofile"' \
         > /root/.zshrc
 
 # Make zsh the login shell for root (SSH logins + EXIT_TO_DOCKER drop).

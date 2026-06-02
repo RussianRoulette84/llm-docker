@@ -264,7 +264,7 @@ https://packages.sury.org/php/ $(lsb_release -sc) main" \
         curl -sS https://getcomposer.org/installer \
             | php -- --install-dir=/usr/local/bin --filename=composer
     fi
-
+    # Update: Yaro disabled bin/docker/zprofile. it messed things up. plx fix me. or dont need me.
     # PATH wiring for `~/.config/composer/vendor/bin` lives in
     # src/docker/zprofile (bind-mounted to /root/.zprofile at runtime).
     # We can't write to /root/.zprofile here because the runtime mount

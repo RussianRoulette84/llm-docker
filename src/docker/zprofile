@@ -562,7 +562,6 @@ _devpack_packages_linux() {
         && sudo rm -rf /usr/local/go \
         && sudo tar -C /usr/local -xzf /tmp/go.tar.gz \
         && rm -f /tmp/go.tar.gz \
-        && grep -q "/usr/local/go/bin" ~/.zprofile || echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.zprofile \
         && export PATH=$PATH:/usr/local/go/bin'
 
     # ── 3. Python ─────────────────────────────────────────────────────────

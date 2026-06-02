@@ -3,20 +3,34 @@
 set -e
 
 # --- env-gorilla integration: inject KeePassXC-backed secrets before launch.
-# Re-execs self through `env-gorilla llm-docker --` so API keys live in the
-# keystore instead of (or alongside) .env. Triggers when env-gorilla is on
-# PATH AND either:
-#   - USER=yaro  → always inject (Yaro's machine; gorilla overrides .env), OR
-#   - .env missing → fallback for any user who hasn't seeded .env locally.
-# Guard var prevents an infinite re-exec loop.
+# Loads the `llm-docker` profile (cage-wide keys) AND, if the CWD's basename
+# is a different name, that project's profile too — both merged into a single
+# chip-blob by env-gorilla v0.12+ so one Touch ID covers everything. A missing
+# project profile in kdbx is a non-fatal warning, not an error.
 _self_dir="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
 if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
    && command -v env-gorilla >/dev/null 2>&1 \
    && { [ "${USER:-}" = "yaro" ] || [ ! -f "$_self_dir/.env" ]; }; then
+    _proj_dir=""
+    for _a in "$@"; do
+        case "$_a" in
+            -*) ;;
+            *) [ -d "$_a" ] && { _proj_dir="$(realpath "$_a")"; break; } ;;
+        esac
+    done
+    [ -z "$_proj_dir" ] && _proj_dir="$(pwd)"
+    _proj_name="$(basename "$_proj_dir")"
+    unset _proj_dir _a
+
+    if [ -n "$_proj_name" ] && [ "$_proj_name" != "llm-docker" ]; then
+        _profiles="llm-docker,$_proj_name"
+    else
+        _profiles="llm-docker"
+    fi
     export LLM_DOCKER_ENV_GORILLA=1
-    exec env-gorilla llm-docker -- "$0" "$@"
+    exec env-gorilla "$_profiles" -- "$0" "$@"
 fi
-unset _self_dir
+unset _self_dir _proj_name _profiles
 
 SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
 
@@ -505,6 +519,37 @@ _spawn_api_bg() {
     _log CLD "builder-api in background — PID $pid  ·  log: ${C2}$log${RST}"
 }
 
+# _write_secret_handoff — when `-a` opens a new iTerm/Terminal window,
+# that fresh shell does NOT inherit our env, so run-local.sh's
+# "BUILDER_API_PASSWORD already loaded" sentinel misses and env-gorilla
+# runs again (= extra Touch ID). Instead we dump our forwarding-eligible
+# env to a short-lived file under /tmp/s3c-gorilla/ (mode 0600, owner-
+# only, same dir as the chip-blobs). The spawned window sources it and
+# immediately deletes it. ~1 second on disk.
+# Echoes the file path on stdout, or empty if nothing was written.
+_write_secret_handoff() {
+    local dir="/tmp/s3c-gorilla"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    chmod 700 "$dir" 2>/dev/null
+    local f
+    f=$(mktemp "$dir/handoff-XXXXXX.env" 2>/dev/null) || return 0
+    chmod 600 "$f"
+    local _block='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
+    local n=0 k v
+    while IFS='=' read -r k v; do
+        [ -z "$k" ] && continue
+        [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        [[ "$k" =~ $_block ]] && continue
+        printf 'export %s=%q\n' "$k" "$v" >>"$f"
+        n=$((n+1))
+    done < <(env)
+    if [ "$n" -eq 0 ]; then
+        rm -f "$f"
+        return 0
+    fi
+    echo "$f"
+}
+
 # _maybe_start_api — spawn the builder-api server if --api / -a was passed
 # AND one isn't already on the configured port. macOS spawn chain:
 # AppleScript (positioned) → `open -a iTerm <.command>` (unpositioned) →
@@ -555,18 +600,24 @@ _maybe_start_api() {
             return 0
         fi
 
+        # Hand our already-unwrapped secrets to the new Terminal window
+        # via a short-lived file, so run-local.sh's sentinel skips its
+        # own env-gorilla call (= no extra Touch ID).
+        local handoff
+        handoff="$(_write_secret_handoff)"
+
         # 1a) Already inside iTerm? Split the current window left/right.
         # Right pane = 43 cols of builder-api, left pane = whatever the
         # user was running (their main cld/ocd session, untouched).
         if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
-            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" >/dev/null 2>&1; then
+            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" >/dev/null 2>&1; then
                 _status "api" "builder-api split into right pane (port $port)"
                 return 0
             fi
         fi
 
         # 1b) Not in iTerm, or split denied: positioned new window.
-        if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" new-window "$port" >/dev/null 2>&1; then
+        if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" new-window "$port" "$handoff" >/dev/null 2>&1; then
             _status "api" "builder-api spawned in positioned iTerm window (port $port)"
             return 0
         fi
@@ -578,6 +629,7 @@ _maybe_start_api() {
         cmd_file=$(mktemp -t builder-api.XXXXXX).command
         cat >"$cmd_file" <<EOF
 #!/bin/bash
+[ -n "$handoff" ] && [ -f "$handoff" ] && { . "$handoff"; rm -f "$handoff"; }
 cd "$project_dir"
 exec bash "$launcher" "$project_dir"
 EOF
@@ -832,6 +884,20 @@ run_claude_container() {
     # combined llm-docker:latest if that's what install.sh produced.
     IMAGE_TAG="$(_llm-docker_image_for_tool claude)"
 
+    # Forward every env var into the container. Tiny blocklist: only vars
+    # that would BREAK the container if a Mac value leaked in (PATH points
+    # at /Users/yaro/..., HOME points at a path that doesn't exist, loader
+    # hijack via LD_/DYLD_, etc.) plus the env-gorilla re-exec guard.
+    EXTRA_ENV=""
+    _ENV_BLOCK='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
+    while IFS='=' read -r _ename _; do
+        [ -z "$_ename" ] && continue
+        [[ "$_ename" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        [[ "$_ename" =~ $_ENV_BLOCK ]] && continue
+        EXTRA_ENV="$EXTRA_ENV -e $_ename"
+    done < <(env)
+    unset _ename _ENV_BLOCK
+
     docker run --rm -it \
         --label com.docker.compose.project=llm-docker \
         --label "llm-docker-project=$CWD_BASE" \
@@ -849,7 +915,6 @@ run_claude_container() {
         -v "$SCRIPT_DIR/ascii/llm-docker.txt:/opt/llm-docker/ascii.txt:ro" \
         -v "$SCRIPT_DIR/docker/colorize.sh:/opt/llm-docker/colorize.sh:ro" \
         -v "$SCRIPT_DIR/llm-container-claude-settings.json:/opt/llm-docker/templates/claude-settings.json:ro" \
-        -v "$SCRIPT_DIR/docker/zprofile:/root/.zprofile:ro" \
         $SSH_HOST_KEY_MOUNT \
         --network "$NETWORK_MODE" \
         $PORT_MAPPING \
@@ -871,19 +936,8 @@ run_claude_container() {
         -e DANGER_MODE="$DANGER_MODE" \
         $SLOT_ENV \
         $ENV_FILES \
-        -e DOCKER_DIR \
-        -e ANTHROPIC_API_KEY \
-        -e OPENAI_API_KEY \
-        -e ZAI_API_KEY \
-        -e BUILDER_API_PASSWORD \
-        -e CODEMAN_USERNAME \
-        -e CODEMAN_PASSWORD \
-        -e LLM_DOCKER_SSH_AUTHORIZED_KEYS \
+        $EXTRA_ENV \
         "$IMAGE_TAG" "${CLAUDE_FLAGS[@]}" "$@" "${INIT_PROMPT[@]}"
-    # NOTE: secrets (ANTHROPIC/OPENAI/ZAI/BUILDER_API/SSH_AUTHORIZED_KEYS)
-    # are listed AFTER $ENV_FILES so docker's last-flag-wins rule makes
-    # the current shell's values override whatever's in .env. This is how
-    # env-gorilla-injected secrets override an out-of-date or empty .env.
 }
 
 # --api: start the builder-api BEFORE fan-out so we spawn it exactly once

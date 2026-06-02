@@ -1,3 +1,34 @@
+# v2.5 (2026-06-02)
+
+One password per macOS boot covers every project. Container sees every secret your shell has. Default install is lean.
+
+## llm-docker cage
+
+- [NEW] Launch `cld` (or `ocd`) from any project folder — env-gorilla now loads the cage-wide `llm-docker` secrets AND that project's own secrets in ONE go, no extra password or fingerprint prompts compared to launching from llm-docker itself. Same for the builder-api when you pass `-a`. Powered by env-gorilla v0.12's new merge mode.
+- [NEW] Every variable in your launching shell flows into the container — not a hardcoded list. Add a new secret to your vault, it just shows up.
+- [BUG] `cld` was silently asking for the master password on every launch even when secrets were cached. The pre-check that detected per-project profiles was the culprit. Killed. No more phantom prompts.
+- [CHANGE] Same env-passthrough now applies to `ocd` (OpenCode launcher) — was still on the old 8-secret allowlist. Brought to parity with `cld`.
+- [CHANGE] The `~/.zprofile` bind-mount and auto-sourcing into spawned shells were causing trouble and got disabled. Side effect: PATH for tools installed under `~/.config/composer/vendor/bin` (Envoy) doesn't auto-inherit anymore.
+
+## Setup & Install
+
+- [BUG] `./install.sh` had a wrong helper-library path and crashed at boot — fixed.
+- [CHANGE] Lean defaults: media, security, ruby, cpp, llvm/clang, ns, vanilla tmux all off in `llm-docker.conf` unless you opt in.
+
+### Dev logs
+
+- [NEW] `src/cld`, `src/ocd`, `src/builder-api/run-local.sh` all switched from nested `env-gorilla A -- env-gorilla B -- ...` to a single `env-gorilla A,B -- ...` call (env-gorilla v0.12 comma syntax). One merged chip-blob → one Touch ID per launch instead of two.
+- [BUG] `src/cld` was calling `env-gorilla --list 2>/dev/null | grep -qw -- "$_proj_name"` as a profile-existence pre-check. `--list` itself invokes `ask_master_pw`, and its stderr was redirected — so the prompt was invisible but `read -rs pw` still consumed master-pw input from the TTY every launch. Removed; env-gorilla now warns-and-continues on missing profiles, no pre-check needed.
+- [CHANGE] `src/cld` and `src/ocd` both compute `_profiles="llm-docker,<basename>"` if the project's basename differs from `llm-docker`, else just `llm-docker`. Single `exec env-gorilla "$_profiles" -- "$0" "$@"`.
+- [CHANGE] `src/cld` `run_claude_container` already had a blanket `env`-output scan replacing the 8-line `-e ANTHROPIC_API_KEY` allowlist. `src/ocd` `run_opencode_container` now uses the identical scan. Names validated against `^[A-Za-z_][A-Za-z0-9_]*$`, 12 patterns blocklisted (PATH, HOME, TMPDIR, PWD, OLDPWD, SHELL, USER, LOGNAME, HOSTNAME, SHLVL, LD_*, DYLD_*, LLM_DOCKER_ENV_GORILLA).
+- [TWEAK] `docker-entrypoint.sh` — `. /root/.zprofile` sourcing AND `exec zsh -l` drop-to-shell commented out.
+- [TWEAK] `Dockerfile` baseline `.zshrc` no longer sources `$HOME/.zprofile`; bind-mount comments removed.
+- [TWEAK] `ocd` — dropped the `docker/zprofile:/root/.zprofile:ro` bind.
+- [BUG] `install.sh` — `$SCRIPT_DIR/src/lib/ywizz/ywizz.sh` → `$SCRIPT_DIR/lib/ywizz/ywizz.sh` (extra `src/`).
+- [BUG] `src/lib/ywizz/task.sh` had a half-edited line with an unclosed quote + `#BUG HERE FICX ME` debug copy — restored the working `printf` call.
+- [CHANGE] `llm-docker.conf` defaults flipped to `false`: `INSTALL_MEDIA`, `INSTALL_SECURITY`, `INSTALL_RUBY`, `INSTALL_CPP`, `INSTALL_LLVM_CLANG`, `INSTALL_NS`, `INSTALL_TMUX_VANILLA`.
+- [CHANGE] s3c-gorilla bundled into this repo at `s3c-gorilla/` (env-gorilla v0.12 with comma syntax).
+
 # v2.4 (2026-05-13)
 
 Builder API tightened so a project can't author its own host commands anymore. Plus the chromium-leak fix, a working monorepo story, and a pile of small polish.
@@ -46,7 +77,7 @@ Builder API tightened so a project can't author its own host commands anymore. P
 ## Shell & UX
 
 - [NEW] True-color terminals: `COLORTERM=truecolor` is set on every container launch, so claude / opencode / any modern TUI gets the 24-bit palette.
-- [BUG] Commands installed under `~/.config/composer/vendor/bin` (Envoy, etc.) were "command not found" in Claude's Bash tool even though they worked in interactive shells. Every child shell now inherits the full PATH.
+- [BUG] Commands installed under `~/.config/composer/vendor/bin` (Envoy, etc.) were "command not found" in Claude's Bash tool even though they worked in interactive shells. Every child shell now inherits the full PATH. (Note: rolled back in v2.5 — see v2.5 entry.)
 
 ## Examples / templates
 

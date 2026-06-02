@@ -134,7 +134,7 @@ run_with_progress_bar() {
         if [[ -n "$_label" ]]; then
             printf "\r%b %b[%s]%b %b[%b%b] %s" "${TUI_PREFIX:-$(get_accent)}" "${_label_color}" "$_label" "$RESET" "$RESET" "$bar_str" "$RESET" "$message"
         else
-            printf "\r%b %b[%b%b] %s" "$x`{TUI_PREFIX:-$(get_accent)}" "$RESET" "$bar_str" "$RESET" "$message"
+            printf "\r%b %b[%b%b] %s" "${TUI_PREFIX:-$(get_accent)}" "$RESET" "$bar_str" "$RESET" "$message"
         fi
         sleep 0.06
         i=$((i + 1))

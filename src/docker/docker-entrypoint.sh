@@ -97,9 +97,9 @@ _exit_or_drop_to_shell() {
     if [ "${EXIT_TO_DOCKER:-false}" = "true" ]; then
         printf "\n%s exited (code %s). Dropped to container shell — type 'exit' to leave the container.\n\n" "$tool" "$exit_code"
         # Prefer zsh (login shell so ~/.zprofile sources) — fall back to bash.
-        if command -v zsh >/dev/null 2>&1; then
-            exec zsh -l
-        fi
+        # if command -v zsh >/dev/null 2>&1; then
+        #     exec zsh -l
+        # fi
         exec bash
     fi
     exit "$exit_code"
@@ -289,10 +289,10 @@ fi
 # shell-outs, scripted invocations). The entrypoint runs as a plain bash
 # script — not a login shell — so /root/.zprofile is NOT auto-sourced.
 # This catches it once at process start and lets every child inherit.
-if [ -f /root/.zprofile ]; then
-    # shellcheck disable=SC1091
-    . /root/.zprofile 2>/dev/null || true
-fi
+# if [ -f /root/.zprofile ]; then
+#     # shellcheck disable=SC1091
+#     . /root/.zprofile 2>/dev/null || true
+# fi
 
 # Determine which tool to run (default to opencode for backward compatibility)
 TOOL=${TOOL:-opencode}

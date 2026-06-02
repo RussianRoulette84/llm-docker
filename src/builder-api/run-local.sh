@@ -41,12 +41,15 @@ elif [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
      && { [ "${USER:-}" = "yaro" ] || [ ! -f "$SCRIPT_DIR/../.env" ]; }; then
     export LLM_DOCKER_ENV_GORILLA=1
 
-    # Chain: env-gorilla llm-docker → env-gorilla <project> → bash this script.
-    # Two env-gorilla calls — Keychain TouchID caches between them so it's
-    # one fingerprint in practice. We do NOT pre-check via `env-gorilla --list`
-    # because that itself prompts TouchID, defeating the whole point.
-    echo "[run-local] env-gorilla chain: llm-docker → ${PROJECT_NAME}"
-    exec env-gorilla llm-docker -- env-gorilla "$PROJECT_NAME" -- bash "$0" "$@"
+    # Single env-gorilla call with the comma syntax (v0.12+) — merges both
+    # profiles into one chip-blob so exactly one fingerprint covers everything.
+    if [ -n "$PROJECT_NAME" ] && [ "$PROJECT_NAME" != "llm-docker" ]; then
+        _profiles="llm-docker,$PROJECT_NAME"
+    else
+        _profiles="llm-docker"
+    fi
+    echo "[run-local] env-gorilla: $_profiles"
+    exec env-gorilla "$_profiles" -- bash "$0" "$@"
 fi
 
 if [ ! -d "$PROJECT_DIR" ]; then

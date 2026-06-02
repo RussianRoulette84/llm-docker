@@ -54,7 +54,7 @@ secondary_accent="$ORANGE"          # Claude orange
 row_selected_color="\033[1;37m"
 
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/src/lib/ywizz/ywizz.sh"
+source "$SCRIPT_DIR/lib/ywizz/ywizz.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/setup.sh"
 
