@@ -1,3 +1,21 @@
+# v2.6 (2026-06-05)
+
+`cld -a` no longer asks for a second fingerprint. Builder-api jobs list now color-codes by family and packs cleaner in narrow panes. Update check throttled to once a day instead of every launch.
+
+## llm-docker cage
+- [BUG] `cld -a` was asking for a second Touch ID when opening the builder-api Terminal panel. Now zero extra fingerprints — the secrets from your first prompt are handed off to the new window directly.
+- [NEW] Update check throttled to once per 24h. Use `UPDATE_FORCE=1 cld` to force a check immediately.
+- [BUG] First-ever `cld -a` on macOS was silently skipping the secret handoff because BSD `mktemp` doesn't accept template suffixes after the `X`'s. Fixed.
+
+## Builder API — visuals
+- [TWEAK] Jobs list under the boot banner now color-codes by prefix family (db-*, sa-*, django-*, lounge-*, etc.) and packs at most 2 jobs per row, so related jobs group visually instead of forming a 3-4-wide wall.
+
+### Dev logs
+- [CHANGE] Builder-api panel handoff now passes the secrets file as `$2` to `run-local.sh` instead of prepending `source <handoff>; rm -f <handoff>; bash …` to the iTerm-typed command. Some zsh setups (custom bracketed-paste widgets) prefix the first pasted char with `?` and broke the chain; passing as a positional arg side-steps it entirely.
+- [NEW] `_write_secret_handoff` helper added to `src/cld` + `src/ocd` — writes a mode-0600 short-lived file under `/tmp/s3c-gorilla/`, allowlist excludes host-path / loader-hijack vars (PATH / HOME / LD_* / DYLD_* / LLM_DOCKER_ENV_GORILLA).
+- [CHANGE] `src/builder-api/run-local.sh` accepts an optional handoff path as `$2`, sources + deletes it before the env-gorilla sentinel check.
+- [TWEAK] Update-check marker lives at `/root/.claude/.last_update_check` (host-persisted via the claude bind mount); touched only on a successful npm update so a flaky network doesn't lock you out for a day.
+
 # v2.5 (2026-06-02)
 
 One password per macOS boot covers every project. Container sees every secret your shell has. Default install is lean.

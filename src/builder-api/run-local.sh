@@ -18,6 +18,20 @@ set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="${1:-$(pwd)}"
+HANDOFF_PATH="${2:-}"
+
+# --- secret handoff from cld/ocd ---
+# If a handoff file was written by the parent (cld/ocd's _write_secret_handoff)
+# and passed as $2, source it now so BUILDER_API_PASSWORD and project secrets
+# land in env BEFORE the env-gorilla sentinel check below. AppleScript can't
+# pass env into a freshly spawned iTerm shell directly, so this CLI-arg shape
+# replaces the older `source ... ; rm -f ... ; bash ...` chain that some zsh
+# setups mangle with a leading `?`.
+if [ -n "$HANDOFF_PATH" ] && [ -f "$HANDOFF_PATH" ]; then
+    # shellcheck disable=SC1090
+    . "$HANDOFF_PATH"
+    rm -f "$HANDOFF_PATH"
+fi
 
 # --- env-gorilla integration ---
 # Goal: ZERO extra fingerprints when this script is launched from an already-

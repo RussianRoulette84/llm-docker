@@ -149,23 +149,42 @@ def show_banner(name: str, bind: str, port: int, jobs_names) -> None:
 
     sys.stderr.write("\n" + "".join(art) + "\n" + _frame(status, C7, inner_width))
 
-    # Job list under the frame — wrapped to terminal width, 2-space gutter,
-    # 4-space hang. Visible width tracked separately from rendered string
-    # so ANSI escapes don't trip the wrap. Skipped if no jobs (legacy int
-    # call site).
+    # Job list under the frame. Two visual rules:
+    #   1. Color by prefix group — every "<prefix>-..." cluster (db-*, sa-*,
+    #      django-*, lounge-*, etc.) gets its own color cycled from the
+    #      palette, so eyes can pick out related jobs at a glance.
+    #   2. Hard cap of 2 jobs per row (even when more would fit), so the
+    #      list never devolves into a 3-4 column wall that's hard to scan
+    #      in a 43-col iTerm pane. Long single names still get their own row.
     if names:
+        group_palette = [C2, C3, C5, C6, C7, C8]
+        prefix_color: dict[str, str] = {}
+
+        def _color_for(n: str) -> str:
+            pfx = n.split("-", 1)[0] if "-" in n else n
+            if pfx not in prefix_color:
+                prefix_color[pfx] = group_palette[
+                    len(prefix_color) % len(group_palette)
+                ]
+            return prefix_color[pfx]
+
         max_width = max(40, cols - 4)
         line = "    "
         visible = 4
+        on_line = 0
         out: list[str] = []
         for n in names:
             need = len(n) + 2
-            if visible + need > max_width and line.strip():
+            wrap_for_width = visible + need > max_width
+            wrap_for_cap = on_line >= 2
+            if (wrap_for_width or wrap_for_cap) and line.strip():
                 out.append(line.rstrip())
                 line = "    "
                 visible = 4
-            line += f"{C7}{n}{RST}  "
+                on_line = 0
+            line += f"{_color_for(n)}{n}{RST}  "
             visible += need
+            on_line += 1
         if line.strip():
             out.append(line.rstrip())
         sys.stderr.write(f"  {DIM}jobs:{RST}\n" + "\n".join(out) + "\n")

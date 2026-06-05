@@ -270,17 +270,31 @@ fi
 
 # Auto-update claude-code and opencode on launch when UPDATE_ON_START=true.
 # Skipped when internet is blocked (npm registry unreachable).
+# Throttled to once per 24h via a marker in /root/.claude/ (host-persisted
+# bind mount, so the timer survives container restarts). Override with
+# UPDATE_FORCE=1 when you want to force a check immediately.
 if [ "${UPDATE_ON_START:-false}" = "true" ] && [ "${INTERNET_ACCESS:-true}" = "true" ]; then
-    echo "[update] Checking for claude-code and opencode updates..."
-    _upd_log=$(mktemp)
-    if npm install -g --silent @anthropic-ai/claude-code@latest opencode-ai@latest >"$_upd_log" 2>&1 \
-         && node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs >>"$_upd_log" 2>&1; then
-        sed 's/^/[update] /' "$_upd_log"
-        echo "[update] Done."
-    else
-        sed 's/^/[update] /' "$_upd_log"
-        echo "[update] Update failed — continuing with installed versions."
+    _upd_marker=/root/.claude/.last_update_check
+    _upd_age=999999
+    if [ "${UPDATE_FORCE:-false}" != "true" ] && [ -f "$_upd_marker" ]; then
+        _upd_age=$(( $(date +%s) - $(stat -c %Y "$_upd_marker" 2>/dev/null || echo 0) ))
     fi
+    if [ "$_upd_age" -lt 86400 ]; then
+        echo "[update] Last check $((_upd_age / 3600))h ago — skipping (UPDATE_FORCE=1 to override)."
+    else
+        echo "[update] Checking for claude-code and opencode updates..."
+        _upd_log=$(mktemp)
+        if npm install -g --silent @anthropic-ai/claude-code@latest opencode-ai@latest >"$_upd_log" 2>&1 \
+             && node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs >>"$_upd_log" 2>&1; then
+            sed 's/^/[update] /' "$_upd_log"
+            echo "[update] Done."
+            touch "$_upd_marker" 2>/dev/null || true
+        else
+            sed 's/^/[update] /' "$_upd_log"
+            echo "[update] Update failed — continuing with installed versions."
+        fi
+    fi
+    unset _upd_marker _upd_age _upd_log
 fi
 
 # Source /root/.zprofile so PATH (composer/vendor/bin, go/bin, GOPATH/bin,

@@ -618,7 +618,7 @@ _write_secret_handoff() {
     mkdir -p "$dir" 2>/dev/null || return 0
     chmod 700 "$dir" 2>/dev/null
     local f
-    f=$(mktemp "$dir/handoff-XXXXXX.env" 2>/dev/null) || return 0
+    f=$(mktemp "$dir/handoff-XXXXXXXX" 2>/dev/null) || return 0
     chmod 600 "$f"
     local _block='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
     local n=0 k v
@@ -711,9 +711,8 @@ _maybe_start_api() {
         cmd_file=$(mktemp -t builder-api.XXXXXX).command
         cat >"$cmd_file" <<EOF
 #!/bin/bash
-[ -n "$handoff" ] && [ -f "$handoff" ] && { . "$handoff"; rm -f "$handoff"; }
 cd "$project_dir"
-exec bash "$launcher" "$project_dir"
+exec bash "$launcher" "$project_dir" "$handoff"
 EOF
         chmod +x "$cmd_file"
         if [ -d "/Applications/iTerm.app" ] && open -a iTerm "$cmd_file" 2>/dev/null; then

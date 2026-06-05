@@ -118,12 +118,16 @@ on run argv
 
     -- We invoke via `bash` so run-local.sh doesn't need the execute bit set;
     -- quoted form guarantees correct escaping of paths with spaces.
+    -- Handoff path is passed as the SECOND positional arg to run-local.sh
+    -- (run-local.sh sources + deletes it). We used to prepend
+    -- `source <handoff>; rm -f <handoff>;` to cmd, but some zsh setups
+    -- prefix the first word of a bracketed-paste line with `?` (the glob
+    -- char), turning `source` / `.` into a NOMATCH error. `bash` doesn't
+    -- get that mangling, so we keep the line starting with bash and let
+    -- run-local.sh consume the handoff arg on its end.
     set cmd to "bash " & quoted form of launcher & " " & quoted form of projectDir
-    -- Source the parent's secret handoff (then delete it) so the spawned
-    -- shell skips its own env-gorilla call. reuseCmd inherits this prefix
-    -- because it builds from `cmd` below.
     if handoffPath is not "" then
-        set cmd to ". " & quoted form of handoffPath & " 2>/dev/null; rm -f " & quoted form of handoffPath & "; " & cmd
+        set cmd to cmd & " " & quoted form of handoffPath
     end if
     set sessionTitle to my titleForProject(projectDir)
     -- Reuse-path command: kill ONLY the daemon bound to this project's
