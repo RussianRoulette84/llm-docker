@@ -1,0 +1,293 @@
+# ──────────────────────────────────────────────────────────────────────
+# builder-api host config — BASE — copy to ~/.llm-docker/builder-api.toml
+# ──────────────────────────────────────────────────────────────────────
+#
+# v3.0 layout:
+#
+#   ~/.llm-docker/
+#     builder-api.toml        ← this file (defaults, globals, langs, verbs)
+#     projects/
+#       <name>.toml           ← one shard per project (host-owned, never bind-mounted)
+#
+# Containers (Claude / OpenCode) can read the resolved job list via
+# GET /jobs and execute via POST /job/<name>, but they CANNOT change
+# which jobs exist or what command each runs.
+#
+# Resolution for a daemon launched as `--project <name>`:
+#   1. [jobs.<name>]                         — global (every project)
+#   2. [language.<lang>.jobs.<name>]         — per opted-in language pack
+#   3. [project.<name>.jobs.<name>]          — explicit project override
+#                                              (lives in projects/<name>.toml)
+#
+# Generic verbs (`up` / `down` / `restart` / `build` / `lint` / …) are
+# declared here under [verb.<name>] as VOCABULARY only — metadata, allowed
+# platforms, required query param. Each project shard implements verbs as
+# HUB jobs whose body is a `platforms` sub-table:
+#
+#     [project.<name>.jobs.up.platforms.web]
+#     command = "docker"
+#     args    = ["compose", "up", "-d"]
+#
+#     [project.<name>.jobs.up.platforms.ios]
+#     command = "xcodebuild"
+#     args    = ["-workspace", "App.xcworkspace", "build"]
+#     cwd     = "ios"
+#
+# Agents call `POST /job/up?platform=ios`. Missing impl → 404 with the
+# list of platforms the project does implement.
+#
+# Daemon launch:  `python3 server.py --project <name>`
+#                 (cld / ocd derive <name> from $(basename "$project_dir"))
+#
+# ──────────────────────────────────────────────────────────────────────
+# Security rules (READ before extending):
+# ──────────────────────────────────────────────────────────────────────
+#   1. Prefer a PINNED BINARY (pytest, ruff, npm, docker, pg_isready, …)
+#      with regex-validated placeholders. No shell, no script file.
+#   2. If you MUST invoke a script file, it MUST have `command_hash`.
+#      No exceptions. Hash-less bash/python invocations are refused.
+#   3. Every `{placeholder}` MUST have a corresponding `[placeholders.X]`
+#      block with a tight `regex`. No defaults to "match anything".
+#   4. NEVER expose a job that runs an arbitrary command string. The
+#      `sa` job (slav-ai) is the one regulated escape hatch — its
+#      `cmd` placeholder is regex-bounded; do not copy that pattern.
+#   5. Long-lived services do NOT belong here. The daemon group-kills
+#      the job's process tree on exit ON PURPOSE. Use launchd or run
+#      the service from a user-supervised Terminal instead.
+#   6. Project shards under projects/ may NOT declare [jobs.*],
+#      [language.*], [verb.*], or [defaults] — those live ONLY here.
+#      The daemon refuses to start a shard that tries.
+#   7. ~/.llm-docker/projects/ MUST NOT be bind-mounted into any
+#      container. Host-owned config stays host-owned.
+# ──────────────────────────────────────────────────────────────────────
+
+
+# ── Defaults ──────────────────────────────────────────────────────────
+[defaults]
+password = "${BUILDER_API_PASSWORD}"
+log_dir  = "~/.llm-docker/logs"
+bind     = "127.0.0.1"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GENERIC VERBS — vocabulary every project may implement per-platform.
+# Calling agents always send `?platform=<plat>` matching one of the
+# `platforms` lists below. Missing impl → 404; unknown platform → 400.
+# ══════════════════════════════════════════════════════════════════════
+
+[verb.up]
+description    = "Start the project's runtime for a target platform"
+platforms      = ["ios", "android", "web", "api", "mobile", "desktop"]
+required_param = "platform"
+
+[verb.down]
+description    = "Stop the runtime (compose down: containers + network removed)"
+platforms      = ["web", "api"]
+required_param = "platform"
+
+[verb.restart]
+description    = "Restart the runtime in place"
+platforms      = ["web", "api"]
+required_param = "platform"
+
+[verb.build]
+description    = "Compile / package for the target platform"
+platforms      = ["ios", "android", "web", "api", "mobile", "desktop"]
+required_param = "platform"
+
+[verb.lint]
+description    = "Lint check (read-only)"
+platforms      = ["ios", "android", "web", "api", "mobile", "desktop"]
+required_param = "platform"
+
+[verb.test]
+description    = "Run the test suite"
+platforms      = ["ios", "android", "web", "api", "mobile", "desktop"]
+required_param = "platform"
+
+[verb.logs]
+description    = "Tail logs from the runtime (project ./logs/** + browser console)"
+platforms      = ["web", "api", "browser", "all"]
+required_param = "platform"
+
+[verb.status]
+description    = "Liveness probe"
+platforms      = ["web", "api"]
+required_param = "platform"
+
+[verb.deploy]
+description    = "Publish to an external environment"
+platforms      = ["web", "api"]
+required_param = "platform"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GLOBAL JOBS — available to every project
+# ══════════════════════════════════════════════════════════════════════
+
+[jobs.git-status]
+command     = "git"
+args        = ["status", "--short", "--porcelain"]
+timeout_s   = 10
+description = "Show working tree status (porcelain)"
+
+[jobs.git-log]
+command     = "git"
+args        = ["log", "--oneline", "-n", "{n}"]
+timeout_s   = 10
+description = "Last N commits, oneline format"
+[jobs.git-log.placeholders.n]
+regex       = "^[1-9][0-9]?$"
+max_len     = 2
+required    = true
+description = "Number of commits to show (1..99)"
+
+[jobs.tree]
+command     = "tree"
+args        = ["-L", "{depth}", "-a", "--gitignore"]
+timeout_s   = 10
+description = "Filesystem tree, N levels deep, respecting .gitignore"
+[jobs.tree.placeholders.depth]
+regex       = "^[1-5]$"
+required    = true
+description = "Tree depth 1..5"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LANGUAGE PACKS — opt-in per project via `languages = [...]`
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Python ────────────────────────────────────────────────────────────
+[language.python.jobs.pytest]
+command     = "pytest"
+args        = ["-x", "--tb=short"]
+timeout_s   = 300
+description = "Run the full test suite, stop on first failure"
+
+[language.python.jobs.pytest-filter]
+command     = "pytest"
+args        = ["-x", "--tb=short", "-k", "{pattern}"]
+timeout_s   = 300
+description = "Run tests matching keyword pattern"
+[language.python.jobs.pytest-filter.placeholders.pattern]
+regex       = "^[A-Za-z0-9_\\-]+$"
+required    = true
+description = "pytest -k pattern (alphanumeric + _-)"
+
+[language.python.jobs.ruff]
+command            = "ruff"
+args               = ["check", "--fix", "."]
+timeout_s          = 60
+description        = "Lint + autofix"
+mutates_filesystem = true
+
+[language.python.jobs.mypy]
+command     = "mypy"
+args        = ["."]
+timeout_s   = 120
+description = "Static type check"
+
+[language.python.jobs.pip-install]
+command     = "pip"
+args        = ["install", "-r", "requirements.txt"]
+timeout_s   = 300
+description = "Install Python dependencies"
+
+# ── PHP ───────────────────────────────────────────────────────────────
+[language.php.jobs.phpunit]
+command     = "vendor/bin/phpunit"
+args        = []
+timeout_s   = 300
+description = "Run the full PHPUnit suite"
+
+[language.php.jobs.phpunit-filter]
+command     = "vendor/bin/phpunit"
+args        = ["--filter", "{test}"]
+timeout_s   = 300
+description = "Run a single PHPUnit class or method by name"
+[language.php.jobs.phpunit-filter.placeholders.test]
+regex       = "^[A-Za-z][A-Za-z0-9_:]*$"
+max_len     = 200
+required    = true
+description = "Test class or Class::method (alphanumerics + _:)"
+
+[language.php.jobs.pint]
+command     = "vendor/bin/pint"
+args        = ["--test"]
+timeout_s   = 60
+description = "Code-style check (dry-run)"
+
+[language.php.jobs.composer-install]
+command     = "composer"
+args        = ["install", "--no-dev"]
+timeout_s   = 300
+description = "Install Composer dependencies"
+
+# ── Node / TypeScript ─────────────────────────────────────────────────
+[language.node.jobs.npm-test]
+command     = "npm"
+args        = ["test"]
+timeout_s   = 300
+description = "npm test"
+
+[language.node.jobs.npm-build]
+command     = "npm"
+args        = ["run", "build"]
+timeout_s   = 600
+description = "npm run build"
+
+[language.node.jobs.npm-install]
+command     = "npm"
+args        = ["install"]
+timeout_s   = 300
+description = "Install npm dependencies"
+
+[language.node.jobs.tsc-check]
+command     = "npx"
+args        = ["tsc", "--noEmit"]
+timeout_s   = 120
+description = "TypeScript type-check, no emit"
+
+[language.node.jobs.jest-filter]
+command     = "npx"
+args        = ["jest", "-t", "{pattern}"]
+timeout_s   = 300
+description = "Run jest tests matching pattern"
+[language.node.jobs.jest-filter.placeholders.pattern]
+regex       = "^[A-Za-z0-9 _\\-]+$"
+max_len     = 80
+required    = true
+description = "Jest -t pattern"
+
+# ── Docker Compose ────────────────────────────────────────────────────
+[language.compose.jobs.compose-ps]
+command     = "docker"
+args        = ["compose", "ps"]
+timeout_s   = 10
+description = "List compose services"
+
+[language.compose.jobs.compose-up]
+command     = "docker"
+args        = ["compose", "up", "-d"]
+timeout_s   = 300
+description = "Start all services detached"
+
+[language.compose.jobs.compose-down]
+command     = "docker"
+args        = ["compose", "down"]
+timeout_s   = 60
+description = "Stop and remove all services"
+
+[language.compose.jobs.compose-logs]
+command     = "docker"
+args        = ["compose", "logs", "--tail", "{lines}", "{service}"]
+timeout_s   = 30
+description = "Tail logs from one compose service"
+[language.compose.jobs.compose-logs.placeholders.lines]
+regex       = "^[1-9][0-9]{0,3}$"
+required    = true
+description = "Number of lines to tail (1..9999)"
+[language.compose.jobs.compose-logs.placeholders.service]
+regex       = "^[a-z][a-z0-9_\\-]{0,30}$"
+required    = true
+description = "Compose service name"

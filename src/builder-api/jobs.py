@@ -211,8 +211,30 @@ class Job:
     # the request unless the operator explicitly opted in.
     mutates_filesystem: bool = False
     placeholders: dict[str, Placeholder] = field(default_factory=dict)
+    # Generic-verb hub mode. When non-empty, this Job is a router: it has
+    # NO command/args/placeholders of its own; instead each entry maps a
+    # platform name (e.g. "ios", "web") to a fully-validated leaf Job. The
+    # daemon dispatches POST /job/<name>?platform=X to the matching leaf
+    # and runs the leaf through the same security pipeline (placeholders,
+    # command_hash, mutates_filesystem). Empty = ordinary leaf job.
+    platforms: dict[str, "Job"] = field(default_factory=dict)
+
+    @property
+    def is_hub(self) -> bool:
+        """A hub job dispatches to per-platform leaves and has no command
+        of its own."""
+        return bool(self.platforms)
 
     def to_public(self) -> dict:
+        if self.is_hub:
+            out: dict = {
+                "platforms": {
+                    plat: leaf.to_public() for plat, leaf in self.platforms.items()
+                },
+            }
+            if self.description:
+                out["description"] = self.description
+            return out
         out = {
             "command": self.command,
             "args_template": list(self.args_template),
@@ -268,7 +290,80 @@ def parse_jobs(jobs_raw: object, *, file_label: str) -> dict[str, Job]:
     return out
 
 
+# Platform names follow the same alphabet as job names. Kept conservative so
+# downstream filters (events, log filenames) don't have to escape anything.
+_PLATFORM_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def _parse_hub_job(name: str, raw: dict, *, file_label: str) -> Job:
+    """Parse a `[jobs.<name>]` entry whose body is a `platforms` sub-table.
+
+    Hub jobs route to per-platform leaves (`POST /job/<name>?platform=X`).
+    They MUST NOT carry their own command/args/placeholders/hash/etc — all
+    runtime fields live on the leaves. Description on the hub is allowed
+    (shows up in GET /jobs as the verb's summary).
+    """
+    # The hub itself is only metadata. Reject leaf-only fields up top so a
+    # silent typo can't accidentally make a hub appear to "have" a command
+    # that the daemon never runs.
+    forbidden = {
+        "command", "args", "cwd", "timeout_s", "kill_after_s",
+        "command_hash", "mutates_filesystem", "placeholders",
+    }
+    bad = forbidden & set(raw.keys())
+    if bad:
+        raise JobConfigError(
+            f"{file_label}: [jobs.{name}] is a hub (has `platforms` sub-table), "
+            f"so it CANNOT also declare {sorted(bad)!r}. Move those keys "
+            f"inside [jobs.{name}.platforms.<platform>] instead."
+        )
+    platforms_raw = raw["platforms"]
+    if not platforms_raw:
+        raise JobConfigError(
+            f"{file_label}: [jobs.{name}.platforms] must declare at least one "
+            f"platform (e.g. [jobs.{name}.platforms.web])"
+        )
+    leaves: dict[str, Job] = {}
+    for plat_raw, leaf_raw in platforms_raw.items():
+        plat = str(plat_raw)
+        if not _PLATFORM_NAME.match(plat):
+            raise JobConfigError(
+                f"{file_label}: [jobs.{name}.platforms.{plat!r}] — platform "
+                f"name must match {_PLATFORM_NAME.pattern}"
+            )
+        if not isinstance(leaf_raw, dict):
+            raise JobConfigError(
+                f"{file_label}: [jobs.{name}.platforms.{plat}] must be a table"
+            )
+        # Recurse into the standard leaf parser. We pass a synthetic name
+        # like "up@ios" so any nested error message points the operator at
+        # the exact section to fix.
+        leaf = _parse_one_job(
+            f"{name}@{plat}", leaf_raw, file_label=file_label
+        )
+        if leaf.is_hub:
+            raise JobConfigError(
+                f"{file_label}: [jobs.{name}.platforms.{plat}] cannot itself "
+                f"declare a `platforms` sub-table — nested hubs aren't allowed."
+            )
+        leaves[plat] = leaf
+    return Job(
+        name=name,
+        command="",
+        args_template=(),
+        description=str(raw.get("description") or ""),
+        platforms=leaves,
+    )
+
+
 def _parse_one_job(name: str, raw: dict, *, file_label: str) -> Job:
+    # Hub mode: a job entry whose body is just a `platforms` sub-table
+    # routes to per-platform leaves and has no command/args of its own.
+    # The leaves are fully validated leaf jobs (regex, hash, mutation gate)
+    # — only the dispatch layer is new.
+    if isinstance(raw.get("platforms"), dict):
+        return _parse_hub_job(name, raw, file_label=file_label)
+
     cmd = raw.get("command")
     if not isinstance(cmd, str) or not cmd:
         raise JobConfigError(

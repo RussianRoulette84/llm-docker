@@ -1,0 +1,458 @@
+# ──────────────────────────────────────────────────────────────────────
+# slav-ai — project shard
+# ──────────────────────────────────────────────────────────────────────
+# FastAPI experts + Django auth (unchained) + Vite frontend + Swift apps
+# + lounge (anonymous E2E 3D chess) + livekit (local-dev SFU).
+#
+# Long-lived services (uvicorn, django, vite, lounge, livekit) run under
+# launchd so the builder-api daemon's group-kill doesn't reap them when
+# the bootstrap job exits. The *-up / *-down / *-restart jobs just talk
+# to launchctl.
+
+[project.slav-ai]
+root        = "~/Projects/slav-ai"
+port        = 6667
+description = "FastAPI experts + Django auth (unchained) + Vite frontend"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GENERIC VERBS
+# ══════════════════════════════════════════════════════════════════════
+
+# ── up / down / restart — talk to launchd ────────────────────────────
+[project.slav-ai.jobs.up.platforms.api]
+command     = "launchctl"
+args        = ["bootstrap", "gui/501", "/Users/yaro/Library/LaunchAgents/com.slav.uvicorn.plist"]
+timeout_s   = 10
+description = "Bootstrap the FastAPI :3001 LaunchAgent"
+
+[project.slav-ai.jobs.up.platforms.web]
+command     = "launchctl"
+args        = ["bootstrap", "gui/501", "/Users/yaro/Library/LaunchAgents/com.slav.vite.plist"]
+timeout_s   = 10
+description = "Bootstrap the Vite :3000 LaunchAgent"
+
+[project.slav-ai.jobs.down.platforms.api]
+command     = "launchctl"
+args        = ["bootout", "gui/501/com.slav.uvicorn"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.down.platforms.web]
+command     = "launchctl"
+args        = ["bootout", "gui/501/com.slav.vite"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.restart.platforms.api]
+command     = "launchctl"
+args        = ["kickstart", "-k", "gui/501/com.slav.uvicorn"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.restart.platforms.web]
+command     = "launchctl"
+args        = ["kickstart", "-k", "gui/501/com.slav.vite"]
+timeout_s   = 10
+
+
+# ── build ─────────────────────────────────────────────────────────────
+[project.slav-ai.jobs.build.platforms.web]
+command      = "npm"
+args         = ["run", "build"]
+timeout_s    = 180
+kill_after_s = 5
+description  = "Vite frontend build"
+
+[project.slav-ai.jobs.build.platforms.desktop]
+command      = "xcodebuild"
+args         = ["-project", "src/slav-ai-swift/slav-ai-swift.xcodeproj", "-scheme", "Slav AI", "-destination", "platform=macOS", "-derivedDataPath", "/tmp/slav-ai-swift-dd", "-quiet", "build"]
+timeout_s    = 900
+kill_after_s = 15
+description  = "Build the macOS Slav AI app"
+
+[project.slav-ai.jobs.build.platforms.ios]
+command      = "xcodebuild"
+args         = ["-project", "src/slav-ai-swift/slav-ai-swift.xcodeproj", "-scheme", "Slav AI", "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", "/tmp/slav-ai-swift-dd", "-quiet", "build"]
+timeout_s    = 900
+kill_after_s = 15
+description  = "Build the iOS Slav AI app"
+
+
+# ── lint ──────────────────────────────────────────────────────────────
+[project.slav-ai.jobs.lint.platforms.api]
+command     = "ruff"
+args        = ["check", "src/"]
+timeout_s   = 60
+description = "Python lint (ruff)"
+
+[project.slav-ai.jobs.lint.platforms.web]
+command      = "bash"
+args         = ["scripts/ci/lint-fe.sh", "--summary-only", "--no-color"]
+command_hash = { path = "scripts/ci/lint-fe.sh", sha256 = "sha256:d6efd4611a152fc108ddef5775d2e37409cf3feab4deeca66971f0200f861e80" }
+timeout_s    = 120
+description  = "JS/HTML linter"
+
+
+# ── test ──────────────────────────────────────────────────────────────
+[project.slav-ai.jobs.test.platforms.api]
+command      = "env"
+args         = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "-m", "pytest"]
+timeout_s    = 300
+kill_after_s = 5
+description  = "Run pytest against the slav-ai venv"
+
+[project.slav-ai.jobs.test.platforms.web]
+command      = "npx"
+args         = ["playwright", "test"]
+timeout_s    = 300
+kill_after_s = 10
+description  = "Playwright e2e suite"
+
+[project.slav-ai.jobs.test.platforms.desktop]
+command      = "swift"
+args         = ["test"]
+cwd          = "src/slav-ai-swift/SlavCore"
+timeout_s    = 600
+kill_after_s = 10
+description  = "SlavCore Swift Package Manager tests"
+
+
+# ── logs ──────────────────────────────────────────────────────────────
+[project.slav-ai.jobs.logs.platforms.api]
+command     = "tail"
+args        = ["-n", "{lines}", "logs/api.log"]
+timeout_s   = 5
+[project.slav-ai.jobs.logs.platforms.api.placeholders.lines]
+regex    = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
+required = true
+
+[project.slav-ai.jobs.logs.platforms.web]
+command     = "tail"
+args        = ["-n", "{lines}", "logs/vite.log"]
+timeout_s   = 5
+[project.slav-ai.jobs.logs.platforms.web.placeholders.lines]
+regex    = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
+required = true
+
+
+# ── status ────────────────────────────────────────────────────────────
+[project.slav-ai.jobs.status.platforms.api]
+command     = "launchctl"
+args        = ["print", "gui/501/com.slav.uvicorn"]
+timeout_s   = 5
+
+[project.slav-ai.jobs.status.platforms.web]
+command     = "launchctl"
+args        = ["print", "gui/501/com.slav.vite"]
+timeout_s   = 5
+
+
+# ── deploy ────────────────────────────────────────────────────────────
+[project.slav-ai.jobs.deploy.platforms.api]
+command            = "fab"
+args               = ["-H", "root@slav-it.com", "deploy"]
+timeout_s          = 240
+kill_after_s       = 10
+mutates_filesystem = true
+description        = "Pull + migrate + build lounge + restart prod services (Fabric)"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NAMED JOBS — specialized cases
+# ══════════════════════════════════════════════════════════════════════
+
+# -- env-seed for launchd (required once per Mac session) --
+[project.slav-ai.jobs.sa-setenv]
+command      = "bash"
+args         = ["scripts/setenv-launchd.sh"]
+command_hash = { path = "scripts/setenv-launchd.sh", sha256 = "sha256:90f37fb1b72be91b2550eb7a441ca04816c201ded549c9fa34c748e0296e5627" }
+timeout_s    = 10
+description  = "Push allowlisted secrets from env into launchd gui/501 (REQUIRED before any *-up after login/reboot)"
+
+# -- django service (3rd platform doesn't fit verb cleanly — kept named) --
+[project.slav-ai.jobs.sa-django-up]
+command     = "launchctl"
+args        = ["bootstrap", "gui/501", "/Users/yaro/Library/LaunchAgents/com.slav.django.plist"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.sa-django-down]
+command     = "launchctl"
+args        = ["bootout", "gui/501/com.slav.django"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.sa-django-restart]
+command     = "launchctl"
+args        = ["kickstart", "-k", "gui/501/com.slav.django"]
+timeout_s   = 10
+
+# -- lounge (E2E 3D chess sidecar) --
+[project.slav-ai.jobs.lounge-install]
+command            = "npm"
+args               = ["install", "--prefix", "src/lounge"]
+timeout_s          = 600
+kill_after_s       = 10
+mutates_filesystem = true
+
+[project.slav-ai.jobs.lounge-reinstall]
+command            = "npm"
+args               = ["ci", "--include=dev", "--prefix", "src/lounge"]
+timeout_s          = 600
+kill_after_s       = 10
+mutates_filesystem = true
+description        = "Clean from-lockfile rebuild of the lounge (client+server, incl devDeps) — fixes prod-prune dep loss. Deterministic where `npm install` isn't."
+
+[project.slav-ai.jobs.lounge-up]
+command     = "launchctl"
+args        = ["bootstrap", "gui/501", "/Users/yaro/Library/LaunchAgents/com.slav.lounge.plist"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.lounge-down]
+command     = "launchctl"
+args        = ["bootout", "gui/501/com.slav.lounge"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.lounge-restart]
+command     = "launchctl"
+args        = ["kickstart", "-k", "gui/501/com.slav.lounge"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.lounge-status]
+command     = "launchctl"
+args        = ["print", "gui/501/com.slav.lounge"]
+timeout_s   = 5
+
+[project.slav-ai.jobs.lounge-tail]
+command     = "tail"
+args        = ["-n", "{lines}", "logs/lounge.log"]
+timeout_s   = 5
+[project.slav-ai.jobs.lounge-tail.placeholders.lines]
+regex    = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
+required = true
+
+[project.slav-ai.jobs.lounge-build]
+command      = "npm"
+args         = ["run", "build", "--prefix", "src/lounge/client"]
+timeout_s    = 300
+kill_after_s = 5
+
+[project.slav-ai.jobs.lounge-test]
+command      = "node"
+args         = ["--test"]
+cwd          = "src/lounge/server"
+timeout_s    = 120
+kill_after_s = 5
+description  = "Run the lounge server node:test suite (call-presence, livekit, room-registry, sched)"
+
+# -- livekit (local-dev SFU) --
+[project.slav-ai.jobs.livekit-up]
+command     = "launchctl"
+args        = ["bootstrap", "gui/501", "/Users/yaro/Library/LaunchAgents/com.slav.livekit.plist"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.livekit-down]
+command     = "launchctl"
+args        = ["bootout", "gui/501/com.slav.livekit"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.livekit-restart]
+command     = "launchctl"
+args        = ["kickstart", "-k", "gui/501/com.slav.livekit"]
+timeout_s   = 10
+
+[project.slav-ai.jobs.livekit-status]
+command     = "launchctl"
+args        = ["print", "gui/501/com.slav.livekit"]
+timeout_s   = 5
+
+[project.slav-ai.jobs.livekit-tail]
+command     = "tail"
+args        = ["-n", "{lines}", "logs/livekit.log"]
+timeout_s   = 5
+[project.slav-ai.jobs.livekit-tail.placeholders.lines]
+regex    = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
+required = true
+
+# -- smoke / lint variants / formats --
+[project.slav-ai.jobs.smoke]
+command      = "bash"
+args         = ["scripts/ci/smoke.sh"]
+command_hash = { path = "scripts/ci/smoke.sh", sha256 = "sha256:7848ffb6d4ebb618b0c08e5a847d5a70c46640ec5f696a997b50bfa751f1b537" }
+timeout_s    = 600
+kill_after_s = 5
+
+[project.slav-ai.jobs.lint-py-fix]
+command            = "ruff"
+args               = ["check", "--fix", "src/"]
+timeout_s          = 60
+description        = "Python lint with safe autofixes"
+mutates_filesystem = true
+
+[project.slav-ai.jobs.format-py]
+command            = "ruff"
+args               = ["format", "src/"]
+timeout_s          = 60
+description        = "Python format (ruff format)"
+mutates_filesystem = true
+
+# -- frontend preview --
+[project.slav-ai.jobs.preview-fe]
+command     = "npm"
+args        = ["run", "preview"]
+timeout_s   = 5
+description = "Sanity-launch Vite preview"
+
+[project.slav-ai.jobs.e2e-update]
+command      = "npx"
+args         = ["playwright", "test", "--update-snapshots"]
+timeout_s    = 300
+kill_after_s = 10
+
+[project.slav-ai.jobs.e2e-spec]
+command      = "npx"
+args         = ["playwright", "test", "{spec}"]
+timeout_s    = 300
+kill_after_s = 10
+[project.slav-ai.jobs.e2e-spec.placeholders.spec]
+regex       = "^tests/playwright/specs/[A-Za-z0-9_-]{1,80}\\.spec\\.js$"
+max_len     = 160
+required    = true
+
+# -- pytest with filter --
+[project.slav-ai.jobs.pytest-filter]
+command      = "env"
+args         = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "-m", "pytest", "-k", "{pattern}"]
+timeout_s    = 300
+kill_after_s = 5
+[project.slav-ai.jobs.pytest-filter.placeholders.pattern]
+regex       = "^[A-Za-z0-9_\\-]+$"
+required    = true
+
+[project.slav-ai.jobs.mypy]
+command      = "env"
+args         = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "-m", "mypy"]
+timeout_s    = 180
+kill_after_s = 5
+
+# -- package management --
+[project.slav-ai.jobs.npm-install-pkg]
+command            = "npm"
+args               = ["install", "{package}", "--no-save"]
+timeout_s          = 120
+mutates_filesystem = true
+[project.slav-ai.jobs.npm-install-pkg.placeholders.package]
+regex    = "^[@a-zA-Z0-9/_.\\-]+$"
+max_len  = 120
+required = true
+
+[project.slav-ai.jobs.pip-install]
+command            = ".venv/bin/pip"
+args               = ["install", "{package}"]
+timeout_s          = 180
+mutates_filesystem = true
+[project.slav-ai.jobs.pip-install.placeholders.package]
+regex    = "^[A-Za-z0-9_.\\[\\]\\-]+(==[A-Za-z0-9._\\-]+)?$"
+max_len  = 120
+required = true
+
+[project.slav-ai.jobs.pip-uninstall]
+command            = ".venv/bin/pip"
+args               = ["uninstall", "-y", "{package}"]
+timeout_s          = 60
+mutates_filesystem = true
+[project.slav-ai.jobs.pip-uninstall.placeholders.package]
+regex    = "^[A-Za-z0-9_.\\[\\]\\-]+$"
+max_len  = 120
+required = true
+
+[project.slav-ai.jobs.pip-freeze]
+command   = ".venv/bin/pip"
+args      = ["freeze"]
+timeout_s = 30
+
+[project.slav-ai.jobs.pip-install-requirements]
+command            = ".venv/bin/pip"
+args               = ["install", "-r", "requirements.txt"]
+timeout_s          = 300
+kill_after_s       = 5
+mutates_filesystem = true
+
+# -- sa escape hatch (regulated subcommand passthrough) --
+[project.slav-ai.jobs.sa]
+command      = "bash"
+args         = ["scripts/builder/sa-cmd.sh", "{cmd}"]
+command_hash = { path = "scripts/builder/sa-cmd.sh", sha256 = "sha256:71958ab785dc12fe5e6b20c422e12773fa68fcf4ad546e4560277526cb669c56" }
+timeout_s    = 120
+description  = "Run `sa <subcommand>` end-to-end"
+[project.slav-ai.jobs.sa.placeholders.cmd]
+regex       = "^[A-Za-z0-9_ @./:-]+$"
+max_len     = 200
+required    = true
+
+# -- postgres --
+[project.slav-ai.jobs.pg-status]
+command   = "pg_isready"
+args      = ["-h", "127.0.0.1", "-p", "5432"]
+timeout_s = 10
+
+[project.slav-ai.jobs.pg-restart]
+command   = "brew"
+args      = ["services", "restart", "postgresql@16"]
+timeout_s = 30
+
+# -- db utilities --
+[project.slav-ai.jobs.db-query]
+command      = "bash"
+args         = ["scripts/builder/db-query.sh", "{sql}"]
+command_hash = { path = "scripts/builder/db-query.sh", sha256 = "sha256:9d754eb6650c6e827b4fe58f1252b7f7ffdf0611c6636c42ec466d16a88d0d0b" }
+timeout_s    = 30
+[project.slav-ai.jobs.db-query.placeholders.sql]
+regex       = "^[^;]+;?\\s*$"
+max_len     = 4096
+required    = true
+
+[project.slav-ai.jobs.db-backup]
+command            = "env"
+args               = ["PGHOST=127.0.0.1", "PGPORT=5432", "PGUSER=slav_auth", "PGDATABASE=slav_auth", "pg_dump", "--no-owner", "--no-privileges", "--file", "logs/db-backup-latest.sql"]
+timeout_s          = 120
+mutates_filesystem = true
+
+[project.slav-ai.jobs.db-cleanup-all]
+command            = "env"
+args               = ["PGHOST=127.0.0.1", "PGPORT=5432", "PGUSER=slav_auth", "PGDATABASE=slav_auth", "psql", "-c", "DELETE FROM intrusion_useractionlog WHERE ts < now() - interval '365 days'; DELETE FROM intrusion_intrusionevent WHERE ts < now() - interval '180 days'; DELETE FROM users_session WHERE is_active = false AND last_seen < now() - interval '30 days'; DELETE FROM users_ipemaillockout WHERE expires_at IS NOT NULL AND expires_at < now() - interval '24 hours'; DELETE FROM users_ipemaillockout WHERE level <= 2 AND last_attempt_at < now() - interval '7 days'; DO $$ BEGIN IF to_regclass('public.jsl_memory_window') IS NOT NULL THEN DELETE FROM jsl_memory_window WHERE created_at < now() - interval '24 hours'; END IF; END $$"]
+timeout_s          = 180
+kill_after_s       = 5
+mutates_filesystem = true
+description        = "All 6 db-cleanup tasks in one psql session"
+
+# -- django management --
+[project.slav-ai.jobs.django-migrate]
+command      = "env"
+args         = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "src/unchained/manage.py", "migrate"]
+timeout_s    = 120
+
+[project.slav-ai.jobs.django-makemigrations]
+command            = "env"
+args               = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "src/unchained/manage.py", "makemigrations"]
+timeout_s          = 60
+mutates_filesystem = true
+
+[project.slav-ai.jobs.django-check]
+command      = "env"
+args         = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "src/unchained/manage.py", "check"]
+timeout_s    = 30
+
+[project.slav-ai.jobs.django-check-deploy]
+command      = "env"
+args         = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "src/unchained/manage.py", "check", "--deploy"]
+timeout_s    = 30
+
+[project.slav-ai.jobs.django-collectstatic]
+command      = "env"
+args         = ["DJANGO_SETTINGS_MODULE=unchained.config.local", "PYTHONPATH=/Users/yaro/Projects/slav-ai/src", ".venv/bin/python", "src/unchained/manage.py", "collectstatic", "--noinput"]
+timeout_s    = 60
+
+# -- xcode (specialized iOS schemes beyond verb.build) --
+[project.slav-ai.jobs.xcode-jobsite]
+command      = "xcodebuild"
+args         = ["-project", "src/slav-ai-swift/slav-ai-swift.xcodeproj", "-scheme", "Jobsite Link", "-destination", "platform=macOS", "-derivedDataPath", "/tmp/slav-ai-swift-dd", "-quiet", "build"]
+timeout_s    = 900
+kill_after_s = 15
+description  = "Build `Jobsite Link` scheme for macOS"

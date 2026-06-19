@@ -414,10 +414,14 @@ class BuildQueue:
             self._on_start(entry)
         except Exception:
             pass
-        self._events.append(
-            "build_started",
-            {"id": entry.id, "agent_id": entry.agent_id, "args": list(entry.args)},
-        )
+        started_payload = {
+            "id": entry.id,
+            "agent_id": entry.agent_id,
+            "args": list(entry.args),
+        }
+        if entry.job_name:
+            started_payload["job"] = entry.job_name
+        self._events.append("build_started", started_payload)
 
         # Snapshot at enqueue time. We never re-resolve at execute time, so
         # a hot-reload of the host toml between enqueue and execute can't
@@ -546,6 +550,8 @@ class BuildQueue:
             "returncode": returncode,
             "elapsed_s": _elapsed(entry),
         }
+        if entry.job_name:
+            event_payload["job"] = entry.job_name
         if reason:
             event_payload["reason"] = reason
         self._events.append("build_finished", event_payload)

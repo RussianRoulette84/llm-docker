@@ -164,31 +164,31 @@ class BuilderHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def log_message(self, fmt: str, *args) -> None:
-        # Dim every HTTP access line so it falls into the visual background
-        # behind the colored event tail. 4xx / 5xx surface in red. The
-        # interesting state changes (build_*, config_reloaded) come through
-        # banner.event_line via the EventStore subscription, so we don't
-        # repeat ourselves here.
-        agent = self.headers.get("X-Agent-ID") or "-"
+        # Route HTTP access logs through the same single-line formatter
+        # as build events so timestamps + types + messages align. 4xx/5xx
+        # surface in red. Successful 2xx responses are SUPPRESSED from the
+        # live stderr tail — under load the daemon serves dozens of
+        # POST /job/… and GET /build_status polls per second, and the
+        # event tail becomes unreadable. The interesting state changes
+        # (build_enqueued / build_started / build_finished, config_*) still
+        # arrive via banner.event_line (EventStore subscription), which is
+        # what the user actually cares about. To see the raw access log,
+        # tail ~/.llm-docker/logs/<project>/events.log or attach with
+        # BUILDER_API_HTTP_VERBOSE=1 in the daemon's env.
         ip = self.client_address[0] if self.client_address else "?"
         line = fmt % args
         try:
             code = int(args[1])
         except (IndexError, ValueError, TypeError):
             code = 200
+        if code < 400 and not os.environ.get("BUILDER_API_HTTP_VERBOSE"):
+            return
         c = _banner.GREY if code < 400 else _banner.RED
-        if _banner._is_narrow():
-            # Narrow window: just the request + code, no ip/agent padding.
-            sys.stderr.write(
-                f"{_banner.DIM}{time.strftime('%H:%M')}{_banner.RST} "
-                f"{c}{_banner.DIM}· {line}{_banner.RST}\n"
-            )
-        else:
-            sys.stderr.write(
-                f"  {_banner.DIM}{time.strftime('%H:%M:%S')}{_banner.RST}  "
-                f"{c}{_banner.DIM}· http{' ':<19}{_banner.RST}  "
-                f"{_banner.GREY}{ip} {agent}  {line}{_banner.RST}\n"
-            )
+        sys.stderr.write(_banner.format_event_row(
+            time.strftime("%H:%M:%S"),
+            c, "·", "http",
+            f"{ip}  {line}",
+        ))
 
     # ------------------------------------------------------------------
     # Core dispatch
@@ -349,12 +349,73 @@ class BuilderHandler(BaseHTTPRequestHandler):
     def _ep_job_post(self, job_name: str, query: dict) -> tuple[int, dict]:
         cfg = self.app.cfg
         job = cfg.jobs.get(job_name)
+
+        # Generic verbs declared in the base toml ([verb.<name>]) need a
+        # different "not implemented" message than ordinary missing jobs:
+        # the verb is part of the vocabulary, this project just doesn't
+        # implement it. Surface that distinction so callers get a useful
+        # 404 instead of a generic "unknown_job".
+        verb = cfg.verbs.get(job_name)
+        if job is None and verb is not None:
+            return 404, {
+                "error": "verb_not_implemented",
+                "verb": job_name,
+                "project": cfg.name,
+                "declared_platforms": list(verb.platforms),
+                "implemented_platforms": [],
+                "hint": (
+                    f"add a [project.{cfg.name}.jobs.{job_name}.platforms."
+                    f"<platform>] block to your project's shard."
+                ),
+            }
         if job is None:
             return 404, {
                 "error": "unknown_job",
                 "name": job_name,
                 "available": sorted(cfg.jobs.keys()),
             }
+
+        # Verb/hub dispatch: a hub job has no command of its own; the
+        # request must select a platform whose leaf job actually runs.
+        # The leaf goes through the SAME validation / hash / mutation
+        # pipeline below, so the security stack is identical to a flat
+        # job — only the resolution step is new.
+        if job.is_hub:
+            qs_platform = query.get("platform") or []
+            requested = (qs_platform[0] if qs_platform else "").strip()
+            if not requested:
+                return 400, {
+                    "error": "missing_param",
+                    "param": (verb.required_param if verb else "platform"),
+                    "verb": job_name,
+                    "declared_platforms": (
+                        list(verb.platforms) if verb else []
+                    ),
+                    "implemented_platforms": sorted(job.platforms.keys()),
+                    "hint": (
+                        f"call POST /job/{job_name}?platform=<one of "
+                        f"{sorted(job.platforms.keys())}>"
+                    ),
+                }
+            if verb is not None and requested not in verb.platforms:
+                return 400, {
+                    "error": "platform_not_declared",
+                    "verb": job_name,
+                    "platform": requested,
+                    "declared_platforms": list(verb.platforms),
+                }
+            if requested not in job.platforms:
+                return 404, {
+                    "error": "verb_not_implemented",
+                    "verb": job_name,
+                    "platform": requested,
+                    "project": cfg.name,
+                    "declared_platforms": (
+                        list(verb.platforms) if verb else []
+                    ),
+                    "implemented_platforms": sorted(job.platforms.keys()),
+                }
+            job = job.platforms[requested]
 
         body = self._read_json_body()
         if body is None:
@@ -395,22 +456,34 @@ class BuilderHandler(BaseHTTPRequestHandler):
             }
 
         # 4. Mutation gate. Jobs declared `mutates_filesystem = true` need
-        # the caller to opt in via `X-Mutation-Confirmed: yes`. Stops a
-        # carpet-test pattern (POST + race-to-DELETE) from accidentally
-        # firing destructive in-place rewrites (prettier --write, pint
-        # without --test, ruff format, etc.) — the cancel race is
-        # unwinnable on fast file walkers, so the only safe answer is to
-        # refuse the request. 428 Precondition Required is the right
-        # semantic ("you need to send more headers").
+        # the caller to opt in EXPLICITLY. Stops a carpet-test pattern
+        # (POST + race-to-DELETE) from accidentally firing destructive
+        # in-place rewrites (prettier --write, pint without --test, ruff
+        # format, etc.) — the cancel race is unwinnable on fast file
+        # walkers, so the only safe answer is to refuse the request.
+        # 428 Precondition Required is the right semantic.
+        #
+        # Two equivalent ways to confirm — caller picks whichever its
+        # HTTP transport supports:
+        #   * header  `X-Mutation-Confirmed: yes`   (preferred — out-of-band)
+        #   * query   `?confirm=yes`                (fallback for proxies /
+        #                                            MCP wrappers that can't
+        #                                            set custom headers)
+        # Both are equally explicit caller opt-ins; the gate's value is the
+        # conscious confirmation, not the transport.
         if job.mutates_filesystem:
-            confirmed = (self.headers.get("X-Mutation-Confirmed") or "").strip().lower()
-            if confirmed != "yes":
+            hdr = (self.headers.get("X-Mutation-Confirmed") or "").strip().lower()
+            qs_conf = (query.get("confirm") or [""])[0].strip().lower()
+            if hdr != "yes" and qs_conf != "yes":
                 return 428, {
                     "error": "mutation_confirmation_required",
                     "job": job_name,
                     "reason": "this job is declared `mutates_filesystem = true`",
-                    "fix": "send header `X-Mutation-Confirmed: yes` to confirm "
-                           "intent to run a write-in-place job",
+                    "fix": (
+                        "send header `X-Mutation-Confirmed: yes` OR add "
+                        "`?confirm=yes` to the URL to confirm intent to "
+                        "run a write-in-place job"
+                    ),
                 }
 
         # 5. Enqueue (or get existing entry under dedupe window).
@@ -431,12 +504,23 @@ class BuilderHandler(BaseHTTPRequestHandler):
 
     def _ep_jobs(self) -> dict:
         cfg = self.app.cfg
+        verbs_out: dict[str, dict] = {}
+        for name, vs in cfg.verbs.items():
+            entry = vs.to_public()
+            job = cfg.jobs.get(name)
+            entry["implemented_platforms"] = (
+                sorted(job.platforms.keys())
+                if (job is not None and job.is_hub) else []
+            )
+            verbs_out[name] = entry
         return {
             "jobs": {name: job.to_public() for name, job in cfg.jobs.items()},
-            "config_version": "0.3",
+            "verbs": verbs_out,
+            "config_version": "0.4",
             "config_mtime": cfg.config_mtime,
             "project": cfg.name,
             "languages": list(cfg.languages),
+            "shard_paths": [str(p) for p in cfg.shard_paths],
         }
 
     def _ep_build_status(self, query: dict) -> tuple[int, dict]:
@@ -666,6 +750,36 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _graceful_exit)
     signal.signal(signal.SIGTERM, _graceful_exit)
+
+    # Re-render the banner when the iTerm pane is resized. iTerm/Terminal
+    # deliver SIGWINCH to the foreground process when columns/rows change;
+    # without this handler the box drawn at boot stays at the original
+    # width while the new event tail wraps at the new width — visually
+    # inconsistent and impossible to read at a glance after a resize.
+    # Clearing the screen loses on-screen history but the terminal's own
+    # scrollback is untouched; users get a clean banner at the new size
+    # and can scroll up for the previous events.
+    def _winch_handler(_signum, _frame):  # type: ignore[no-untyped-def]
+        try:
+            sys.stderr.write("\033[2J\033[H")
+            _banner.show_banner(
+                cfg.name, cfg.bind, cfg.port, list(cfg.jobs.keys())
+            )
+        except Exception:
+            # Signal handlers must NEVER raise — the user just resized
+            # their pane, the daemon must not die for it. Silently absorb
+            # any write/encoding failure (closed stderr, exotic terminal,
+            # etc.); the next event tail entry will land at the new width
+            # and the user can resize again to retry.
+            pass
+
+    try:
+        signal.signal(signal.SIGWINCH, _winch_handler)
+    except (AttributeError, ValueError):
+        # SIGWINCH doesn't exist on Windows, and signal.signal in a
+        # non-main thread raises ValueError. We're in main, but the
+        # belt-and-suspenders absorbs both cases for portability.
+        pass
 
     try:
         server = ThreadingHTTPServer((cfg.bind, cfg.port), BuilderHandler)

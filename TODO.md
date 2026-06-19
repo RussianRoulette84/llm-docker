@@ -1,0 +1,5 @@
+- Quotes in .env values (e.g. DOCKER_DIR="/root/Projects") — my grep+cut captures literal "/root/Projects", which fails the /* check → mount skipped. Fails safe but silently (surprising).
+- Spaces in WORKSPACE_DIR — in cld:290 the mount is built as an unquoted string, so /Users/john doe/Projects would shell-split. Docker would error out, not wipe. ocd:144 uses an array so it's fine.
+- Symlinks — if ~/Projects is a symlink to /, Docker follows it.
+- Intentional destruction via the active mount — the whole point of a bind mount is that container writes hit host. If you run a destructive command inside while the mount is correctly set, your host files die. This is what CLAUDE.md warns about — no code can prevent it.
+- double check what's going on with `APP_CODE_PATH_CONTAINER=/var/www:cached`

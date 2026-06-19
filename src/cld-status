@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+cld-status — live status panel for running cld containers.
+
+Polls every 5s and renders one row per cld container:
+    <project>  CPU [▁▂▃▆█▇▆▅▃] 42.3%   MEM [████░░░░░░] 38.1%
+               NET ↓  12.4 kB/s   ↑   3.1 kB/s
+
+Footer:
+    CHRM: 3   PLAY: 2
+
+Containers are identified by the docker labels cld attaches at run-time:
+    com.docker.compose.project=llm-docker
+    llm-docker-project=<basename>
+
+Usage:
+    cld-status                  — interactive (Ctrl-C to quit)
+    cld-status --interval 3     — poll every 3s instead of 5s
+    cld-status --width 30       — sparkline width (default 24)
+    NO_COLOR=1 cld-status       — strip ANSI
+
+No external deps; stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+from pathlib import Path
+from typing import Optional
+
+
+# ── tunables ──────────────────────────────────────────────────────────
+SAMPLE_INTERVAL_S = 5            # how often to poll docker stats
+HISTORY_SAMPLES = 60             # 60 × 5s = 5 min
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"        # 8 levels
+MEM_BAR_WIDTH = 10               # cells
+
+# ── ANSI ──────────────────────────────────────────────────────────────
+if os.environ.get("NO_COLOR"):
+    P = G = R = Y = C = D = BOLD = RST = ""
+else:
+    P = "\033[1;35m"; G = "\033[1;32m"; R = "\033[31m"
+    Y = "\033[33m";   C = "\033[1;36m"; D = "\033[2m"
+    BOLD = "\033[1m"; RST = "\033[0m"
+
+CLEAR = "\033[2J\033[H"
+
+
+# ── docker introspection ──────────────────────────────────────────────
+def list_cld_containers() -> list[tuple[str, str, str]]:
+    """Return [(container_id, project_name, started_at_iso), …] for running cld containers."""
+    try:
+        out = subprocess.run(
+            [
+                "docker", "ps",
+                "--filter", "label=com.docker.compose.project=llm-docker",
+                "--format", "{{.ID}}\t{{.Labels}}\t{{.CreatedAt}}",
+            ],
+            capture_output=True, text=True, timeout=4,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    containers: list[tuple[str, str, str]] = []
+    for line in out.stdout.strip().splitlines():
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        cid, labels, created_at = parts[0], parts[1], parts[2]
+        project = "unknown"
+        for kv in labels.split(","):
+            if kv.startswith("llm-docker-project="):
+                project = kv.split("=", 1)[1] or "unknown"
+                break
+        containers.append((cid, project, created_at))
+    return containers
+
+
+def fmt_uptime(created_at: str) -> str:
+    """`docker ps --format {{.CreatedAt}}` returns local-tz strings like
+    '2026-06-19 04:12:55 -0700 PDT'. Compute now-then in compact h/m form."""
+    # Strip trailing tz abbrev (e.g. ' PDT') so strptime can handle the offset.
+    s = created_at.rsplit(" ", 1)[0]
+    try:
+        then = _dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        return "?"
+    delta = _dt.datetime.now(_dt.timezone.utc) - then.astimezone(_dt.timezone.utc)
+    total_s = max(0, int(delta.total_seconds()))
+    if total_s < 60:
+        return f"{total_s}s"
+    if total_s < 3600:
+        return f"{total_s // 60}m"
+    h, rem = divmod(total_s, 3600)
+    m = rem // 60
+    return f"{h}h{m:02d}m"
+
+
+# Bind-mount used by cld: ~/.llm-docker/claude/.claude → /root/.claude inside
+# the container. Claude Code writes its session transcripts to
+# /root/.claude/projects/-root-Projects-<name>/<uuid>.jsonl, so on the host
+# (where cld-status runs) the same file is reachable via:
+#   ~/.llm-docker/claude/.claude/projects/-root-Projects-<name>/<uuid>.jsonl
+_CLAUDE_SESSIONS_ROOT = Path.home() / ".llm-docker/claude/.claude/projects"
+
+
+def claude_ctx_size(project_name: str) -> tuple[int, str]:
+    """Return (bytes, session_id_short) for the most recently written Claude
+    session transcript belonging to this project. Returns (0, '') if no
+    session is found. The byte count is a proxy for context usage — actual
+    tokens are ~bytes/4 but post-compaction the model sees less than what
+    the file holds; treat it as 'work done', not 'tokens in window'."""
+    if not _CLAUDE_SESSIONS_ROOT.is_dir():
+        return (0, "")
+    project_dir = _CLAUDE_SESSIONS_ROOT / f"-root-Projects-{project_name}"
+    if not project_dir.is_dir():
+        return (0, "")
+    try:
+        sessions = sorted(
+            project_dir.glob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return (0, "")
+    if not sessions:
+        return (0, "")
+    latest = sessions[0]
+    try:
+        size = latest.stat().st_size
+    except OSError:
+        return (0, "")
+    return (size, latest.stem[:8])
+
+
+def fmt_bytes(b: float) -> str:
+    if b < 1024:
+        return f"{b:4.0f} B"
+    if b < 1024 * 1024:
+        return f"{b / 1024:5.1f}KB"
+    return f"{b / 1024 / 1024:5.1f}MB"
+
+
+def docker_stats(container_ids: list[str]) -> dict[str, dict]:
+    """One-shot `docker stats` for the given container IDs."""
+    if not container_ids:
+        return {}
+    try:
+        out = subprocess.run(
+            [
+                "docker", "stats", "--no-stream",
+                "--format",
+                "{{.ID}}\t{{.CPUPerc}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.PIDs}}",
+                *container_ids,
+            ],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    result: dict[str, dict] = {}
+    for line in out.stdout.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        cid_short, cpu_s, mem_s, net_s, pids_s = parts[:5]
+        try:
+            pids = int(pids_s)
+        except ValueError:
+            pids = 0
+        result[cid_short] = {
+            "cpu": _parse_pct(cpu_s),
+            "mem": _parse_pct(mem_s),
+            "net_rx": _parse_bytes(net_s.split("/")[0].strip()),
+            "net_tx": _parse_bytes(net_s.split("/")[1].strip())
+            if "/" in net_s else 0,
+            "pids": pids,
+        }
+    return result
+
+
+def _parse_pct(s: str) -> float:
+    try:
+        return float(s.strip().rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
+def _parse_bytes(s: str) -> float:
+    """`1.23kB` / `4.5MiB` → bytes float."""
+    s = s.strip()
+    units = [
+        ("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024),
+        ("GB", 1e9), ("MB", 1e6), ("kB", 1e3), ("B", 1),
+    ]
+    for unit, mult in units:
+        if s.endswith(unit):
+            try:
+                return float(s[: -len(unit)]) * mult
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def count_processes(needle: str) -> int:
+    """Count running processes whose argv contains `needle`. Quietly returns 0
+    when pgrep is absent (Linux without procps, etc.)."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", needle],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0
+    if out.returncode != 0:
+        return 0
+    return len([ln for ln in out.stdout.strip().splitlines() if ln])
+
+
+# ── rendering ─────────────────────────────────────────────────────────
+def sparkline(values: list[float], width: int) -> str:
+    if not values:
+        return " " * width
+    tail = values[-width:]
+    lo = min(tail)
+    hi = max(tail)
+    span = hi - lo
+    if span < 1e-9:
+        span = 1.0
+    chars: list[str] = []
+    for v in tail:
+        idx = int((v - lo) / span * (len(SPARK_BLOCKS) - 1))
+        idx = max(0, min(len(SPARK_BLOCKS) - 1, idx))
+        chars.append(SPARK_BLOCKS[idx])
+    return " " * (width - len(chars)) + "".join(chars)
+
+
+def mem_bar(mem_pct: float) -> str:
+    filled = int(round(mem_pct / 100 * MEM_BAR_WIDTH))
+    filled = max(0, min(MEM_BAR_WIDTH, filled))
+    return "█" * filled + "░" * (MEM_BAR_WIDTH - filled)
+
+
+def render(
+    containers: list[tuple[str, str, str]],
+    stats: dict[str, dict],
+    history: dict[str, deque],
+    chrm: int,
+    play: int,
+    spark_width: int,
+) -> str:
+    out: list[str] = []
+    out.append(f"{P}  ◆ cld status{RST}  {D}{time.strftime('%H:%M:%S')}{RST}\n")
+    if not containers:
+        out.append(f"{D}    no cld containers running{RST}\n")
+    for cid, proj, created_at in containers:
+        cid_short = cid[:12]
+        s = stats.get(cid_short, {"cpu": 0.0, "mem": 0.0,
+                                  "net_rx_rate": 0.0, "net_tx_rate": 0.0,
+                                  "pids": 0})
+        spark = sparkline(list(history.get(cid, deque())), spark_width)
+        cpu = s.get("cpu", 0.0)
+        mem = s.get("mem", 0.0)
+        bar = mem_bar(mem)
+        rx_kb = s.get("net_rx_rate", 0.0) / 1024
+        tx_kb = s.get("net_tx_rate", 0.0) / 1024
+        pids = s.get("pids", 0)
+        uptime = fmt_uptime(created_at)
+        ctx_bytes, sess_id = claude_ctx_size(proj)
+        out.append(
+            f"  {C}{proj:<14}{RST}  "
+            f"cpu {Y}{spark}{RST} {cpu:5.1f}%  "
+            f"mem [{bar}] {mem:5.1f}%\n"
+        )
+        out.append(
+            f"  {'':<14}  net {D}↓{RST}{rx_kb:7.1f} kB/s   "
+            f"{D}↑{RST}{tx_kb:7.1f} kB/s\n"
+        )
+        ctx_str = (
+            f"{fmt_bytes(ctx_bytes)} {D}({sess_id}){RST}"
+            if ctx_bytes else f"{D}— no session{RST}"
+        )
+        out.append(
+            f"  {'':<14}  {D}up{RST} {uptime:<6}  "
+            f"{D}pids{RST} {pids:3d}  "
+            f"{D}ctx{RST} {ctx_str}\n"
+        )
+    out.append("\n")
+    out.append(
+        f"  {D}CHRM:{RST} {G}{chrm}{RST}   "
+        f"{D}PLAY:{RST} {G}{play}{RST}\n"
+    )
+    return "".join(out)
+
+
+# ── main loop ─────────────────────────────────────────────────────────
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Live status panel for running cld containers.",
+    )
+    ap.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S,
+                    help="poll interval in seconds (default 5)")
+    ap.add_argument("--width", type=int, default=24,
+                    help="sparkline width (default 24)")
+    args = ap.parse_args(argv)
+
+    if shutil.which("docker") is None:
+        sys.stderr.write(f"{R}cld-status: docker not on PATH{RST}\n")
+        return 2
+
+    # Per-container history: cpu samples + previous net counters (for rates).
+    cpu_history: dict[str, deque] = {}
+    last_net: dict[str, dict] = {}    # cid -> {rx, tx, ts}
+
+    def _exit(_signum, _frame):
+        sys.stdout.write(f"\n{D}cld-status: exiting{RST}\n")
+        sys.stdout.flush()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _exit)
+    signal.signal(signal.SIGTERM, _exit)
+
+    while True:
+        containers = list_cld_containers()
+        ids = [c[0] for c in containers]
+        stats = docker_stats(ids)
+        now = time.time()
+        chrm = count_processes("chromium") or count_processes("chrome")
+        play = count_processes("playwright")
+
+        # Derive net rates per container; update cpu history.
+        for cid, _proj, _created in containers:
+            cid_short = cid[:12]
+            s = stats.get(cid_short)
+            if s is None:
+                continue
+            hist = cpu_history.setdefault(cid, deque(maxlen=HISTORY_SAMPLES))
+            hist.append(s["cpu"])
+
+            prev = last_net.get(cid)
+            if prev is not None:
+                dt = max(now - prev["ts"], 1e-3)
+                s["net_rx_rate"] = max(0.0, (s["net_rx"] - prev["rx"]) / dt)
+                s["net_tx_rate"] = max(0.0, (s["net_tx"] - prev["tx"]) / dt)
+            else:
+                s["net_rx_rate"] = 0.0
+                s["net_tx_rate"] = 0.0
+            last_net[cid] = {"rx": s["net_rx"], "tx": s["net_tx"], "ts": now}
+
+        # Evict history for containers that disappeared.
+        alive = {cid for cid, _proj, _created in containers}
+        for dead in [k for k in cpu_history if k not in alive]:
+            cpu_history.pop(dead, None)
+            last_net.pop(dead, None)
+
+        sys.stdout.write(CLEAR + render(
+            containers, stats, cpu_history, chrm, play, args.width
+        ))
+        sys.stdout.flush()
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

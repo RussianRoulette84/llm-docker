@@ -119,12 +119,15 @@ on run argv
     -- We invoke via `bash` so run-local.sh doesn't need the execute bit set;
     -- quoted form guarantees correct escaping of paths with spaces.
     -- Handoff path is passed as the SECOND positional arg to run-local.sh
-    -- (run-local.sh sources + deletes it). We used to prepend
-    -- `source <handoff>; rm -f <handoff>;` to cmd, but some zsh setups
-    -- prefix the first word of a bracketed-paste line with `?` (the glob
-    -- char), turning `source` / `.` into a NOMATCH error. `bash` doesn't
-    -- get that mangling, so we keep the line starting with bash and let
-    -- run-local.sh consume the handoff arg on its end.
+    -- (run-local.sh sources + deletes it).
+    --
+    -- The typed line MUST start with `bash` (not `clear;`, not `. <file>`,
+    -- not `source <file>`). Some zsh setups prepend `?` (the glob char) to
+    -- the first word of a bracketed-paste line, turning the first token
+    -- into a NOMATCH error: `?clear` / `?source` / `?.` all glob-fail. The
+    -- bare word `bash` survives more reliably; on the rare retries where
+    -- it still fails, the user just re-runs `cld -c -a`. The screen clear
+    -- moves into run-local.sh's first action so we don't lose it.
     set cmd to "bash " & quoted form of launcher & " " & quoted form of projectDir
     if handoffPath is not "" then
         set cmd to cmd & " " & quoted form of handoffPath
@@ -139,7 +142,13 @@ on run argv
         set reuseCmd to "lsof -ti :" & portStr & " 2>/dev/null | xargs -r kill 2>/dev/null; sleep 0.4; clear; " & cmd
     end if
 
-    set winCols to 43
+    -- Pane width in COLUMNS, not pixels — iTerm multiplies by the
+    -- profile's font size, so a user with a larger font sees a wider
+    -- pixel pane than the col count alone implies. 40 cols keeps the
+    -- right pane at ~23% of a typical 1500-px-wide screen at Yaro's
+    -- font size; banner.py clamps its box (BOX_WIDTH=61) to whatever
+    -- the actual pane width turns out to be.
+    set winCols to 40
 
     -- REUSE: prefer finding the pane by the daemon's actual tty (works
     -- even after the iTerm session's name got overwritten — e.g. you
@@ -162,12 +171,17 @@ on run argv
     end if
 
     if mode is "split" then
-        -- Split the current iTerm window left/right. Right pane shrinks
-        -- to winCols; left pane keeps the rest. The user's existing
-        -- Claude/OpenCode session is in the left pane and untouched.
+        -- Split the current iTerm window left/right and shrink the new
+        -- right pane to winCols. iTerm's `set columns` on a session
+        -- resizes the entire OUTER window (not just the pane) — so we
+        -- snapshot the window bounds before the split, apply the column
+        -- count, then restore the snapshot. iTerm rebalances the two
+        -- panes to fit the original window width, which leaves the
+        -- user's left pane visually untouched outside the divider.
         tell application "iTerm"
             activate
             tell current window
+                set origBounds to bounds
                 tell current session
                     set newSession to (split vertically with default profile)
                     tell newSession
@@ -178,6 +192,9 @@ on run argv
                         write text cmd
                     end tell
                 end tell
+                try
+                    set bounds to origBounds
+                end try
             end tell
         end tell
         return
@@ -195,8 +212,11 @@ on run argv
     set screenRight to item 3 of scr
     set screenBottom to item 4 of scr
 
-    -- 43 cols at the default iTerm profile is ~420 px including padding.
-    set winW to 420
+    -- Approximate pixel width for the new-window mode (only used when
+    -- we're NOT already inside iTerm — split mode lets iTerm size by
+    -- columns). Scales with winCols: ~9.5 px per column at the default
+    -- profile + a small constant for chrome/padding.
+    set winW to 510
     set winX to screenRight - winW
     set winY to screenTop
     -- Menu bar buffer: desktop bounds reportedly already exclude it, but

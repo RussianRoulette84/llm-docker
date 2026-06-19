@@ -63,7 +63,29 @@ if ! docker info > /dev/null 2>&1; then
         _log CLD WARNING "Docker is not running — starting Docker Desktop..."
 
         if [[ "$OSTYPE" == "darwin"* ]]; then
-            open -a Docker
+            # `open -a Docker` relies on LaunchServices. If Docker.app lives in
+            # a subfolder (e.g. /Applications/Utilities/) or LS's index is
+            # stale, it silently fails — we'd then wait 60s for `docker info`
+            # that never comes. Fall back to an absolute-path launch.
+            if ! open -a Docker 2>/dev/null; then
+                _docker_app=""
+                if command -v mdfind >/dev/null 2>&1; then
+                    _docker_app="$(mdfind -name 'Docker.app' 2>/dev/null \
+                        | grep -E '/Docker\.app$' | head -1)"
+                fi
+                if [ -z "$_docker_app" ]; then
+                    _docker_app="$(find /Applications -maxdepth 4 \
+                        -name 'Docker.app' -type d 2>/dev/null | head -1)"
+                fi
+                if [ -n "$_docker_app" ]; then
+                    _log CLD "Found Docker at $_docker_app — launching..."
+                    open "$_docker_app"
+                else
+                    _log CLD ERROR "Could not find Docker.app under /Applications. Install Docker Desktop or move it into /Applications."
+                    exit 1
+                fi
+                unset _docker_app
+            fi
         else
             _log CLD ERROR "Please start Docker manually on your system"
             exit 1
@@ -561,13 +583,18 @@ _maybe_start_api() {
     local project_name
     project_name="$(basename "$project_dir")"
     local port
-    # Port precedence: host's ~/.llm-docker/builder-api.toml under
-    # [project.<name>].port → llm-docker.conf → default 6666. Per-project
-    # .builder-api.toml files are NO LONGER read (security: jobs/commands
-    # must be host-defined; nothing inside a container-writable path is
-    # trusted by the daemon).
-    local host_toml="${HOME}/.llm-docker/builder-api.toml"
-    if [ -f "$host_toml" ]; then
+    # Port precedence (v3.0): per-project shard
+    # ~/.llm-docker/projects/<name>.toml → base ~/.llm-docker/builder-api.toml
+    # → llm-docker.conf → default 6666. The project block moved to per-project
+    # shards in v3.0; the base only holds defaults, globals, language packs,
+    # and verb declarations. Per-project .builder-api.toml files INSIDE the
+    # project tree are still NOT read (security: jobs/commands must be host-
+    # defined; nothing inside a container-writable path is trusted).
+    local host_shard="${HOME}/.llm-docker/api_config/${project_name}.toml"
+    local host_base="${HOME}/.llm-docker/api_config/builder-api.toml"
+    local _f
+    for _f in "$host_shard" "$host_base"; do
+        [ -f "$_f" ] || continue
         port=$(awk -v p="project.$project_name" '
             $0 ~ "^\\[" p "\\]" { in_block=1; next }
             in_block && /^\[/ { in_block=0 }
@@ -576,22 +603,37 @@ _maybe_start_api() {
                 gsub(/[^0-9].*$/, "")
                 print; exit
             }
-        ' "$host_toml")
-    fi
+        ' "$_f")
+        [ -n "${port:-}" ] && break
+    done
+    unset _f
     if [ -z "${port:-}" ]; then
         port="$(_read_env_var BUILDER_API_PORT "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
     fi
     port="${port:-6666}"
 
-    # Note: TCP-probe dedup removed; the applescript's per-project pane
-    # reuse handles "is a daemon already running for this project" by
-    # finding the iTerm session named `builder-api: <project>`. The kill
-    # in the reuse path targets only that project's port, not all daemons.
-
     local launcher="$SCRIPT_DIR/builder-api/run-local.sh"
     if [ ! -f "$launcher" ]; then
         echo "[cld] warning: $launcher not found; skipping --api spawn" >&2
         return 0
+    fi
+
+    # Port-binding dedupe: if another cld/ocd session already has a daemon
+    # on this port, skip the panel spawn entirely. Without this check the
+    # AppleScript opens a new pane, run-local.sh starts server.py, and the
+    # daemon dies with "[Errno 48] Address already in use" inside an
+    # already-visible window — confusing and wasteful. The applescript's
+    # per-project pane reuse only catches the case where the pane is still
+    # alive in iTerm; this handles "daemon backgrounded, pane gone".
+    if command -v lsof >/dev/null 2>&1; then
+        local _api_existing_pid
+        _api_existing_pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
+        if [ -n "$_api_existing_pid" ]; then
+            _status "api" "builder-api already on port $port (PID $_api_existing_pid) — panel skipped"
+            unset _api_existing_pid
+            return 0
+        fi
+        unset _api_existing_pid
     fi
 
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -607,8 +649,11 @@ _maybe_start_api() {
         handoff="$(_write_secret_handoff)"
 
         # 1a) Already inside iTerm? Split the current window left/right.
-        # Right pane = 43 cols of builder-api, left pane = whatever the
-        # user was running (their main cld/ocd session, untouched).
+        # The split divides the EXISTING window — outer window size stays
+        # exactly the same; right pane just shares the screen real estate
+        # with whatever the user was running on the left. Applescript no
+        # longer force-sets the column count, so iTerm doesn't try to
+        # grow the window.
         if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
             if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" >/dev/null 2>&1; then
                 _status "api" "builder-api split into right pane (port $port)"

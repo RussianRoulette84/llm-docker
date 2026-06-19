@@ -220,6 +220,7 @@ EXAMPLE 4: Also a good example (do this):
     - **Length budget: keep every line under ~100 chars.** If longer, split into multiple short flush-left lines chained with `&&` / `;` / `|` or just sequential newlines.
     - For long SQL / arg lists, write to `/tmp/x.sql` on a short line first, then `mysql ... < /tmp/x.sql`.
     - One-liners are fine *only if short*. Don't sacrifice "fits-in-one-line" if it forces the line past the wrap budget.
+- **No auto daemon restart in examples**: NEVER chain `&& cld -c -a` / `&& cld -a` / `&& ocd -a` / any other daemon-spawn or kill onto an install or edit command. The clip-wrapped batch ends after the install step. If the change needs a restart to take effect, mention it in prose BEFORE or AFTER the code block, never inside it. Yaro restarts on his own timing across multiple terminals — silently restarting at the end of a `cp` clobbers state he chose to keep. Applies to every entry point: cld, ocd, run-local.sh, builder-api panel spawn, anything that kicks a long-running process.
 
 ---
 
