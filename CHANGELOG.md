@@ -1,3 +1,40 @@
+# v2.9 (2026-06-19)
+
+## API
+- [NEW] Live config reload. No restart needed.
+- [BUG] Build logs no longer leak the previous job's output.
+- [TWEAK] Build long-poll tells you which timed out: the wait, or the build.
+
+## API — visuals
+- [TWEAK] Status panel moved to top-right of the split and auto-sizes to actual content height — no more 15-empty-row gap.
+- [BUG] Running `cld -a` twice for the same project no longer creates a duplicate right panel; existing pane is reused.
+- [BUG] First-typed line in the right pane no longer comes out as `?bash` (was an iTerm timing issue with multi-pane splits).
+
+## cld & ocd
+- [NEW] `cld -c` and `ocd -c` now resume the session that started in THIS iTerm pane — not the most-recent session globally. Each pane gets its own session pin.
+- [NEW] `--refresh-env` flag — wipes env-gorilla's cached secret blob before re-exec so newly-added KeePassXC keys actually reach the container.
+- [CHANGE] `--dangerously-skip-permissions` is ON by default. `--safe` (or `--no-danger` / `--no-dg`) turns it off.
+
+## Jobs
+- [NEW] iOS simulator app restart (terminate + relaunch booted-sim app, no rebuild).
+- [NEW] Marketing-site build + deploy via Envoy (Eleventy projects).
+- [NEW] Named deploy aliases for the `deploy?platform=*` verbs — for clients that can't send query params.
+- [NEW] Clean dependency reinstall (`npm ci --include=dev`) — heals half-gutted `node_modules`.
+- [NEW] Redis service jobs (start / stop / restart / status / tail via brew services). Also wired as a `redis` platform on the `up` / `down` / `restart` verbs.
+- [CHANGE] Multi-subproject repos with a `src/` layout supported — project-shard paths can prefix cleanly.
+
+### Dev logs
+- [NEW] `server.py:_start_config_watch()` — polls api_config mtimes every 1.5s. `_reload_config()` swaps `cfg`, emits `config_reloaded` (added/removed/verbs_changed), reprints banner. Parse fail → `config_reload_failed`, prior `cfg` kept.
+- [CHANGE] `build_queue.py` — `BuildEntry.log_start_offset` snapshotted before launch. `_tail_text(start_offset=…)` scopes reads. `wait()` returns `poll_timed_out` + `build_timed_out`; legacy `timed_out` aliased.
+- [NEW] `compose-exec` — regex enum `^(verify|phpinfo|redis-ping|mysql-version|tail-errors|php-lint-changed)$`. Service hard-coded `workspace`. `bash -c … "$1".sh -- {snippet}` shape.
+- [NEW] Per-terminal session tracking in cld + ocd. TSV maps `(terminal_id, project_path, session_id)` keyed by `ITERM_SESSION_ID` → `TMUX_PANE` → `tty`. cld scans newest `*.jsonl`; ocd queries `opencode.db`.
+- [NEW] `--refresh-env` strips itself from `$@` before re-exec to avoid loops; runs `env-gorilla --clear "$_profiles"` first.
+- [BUG] `builder_api.applescript`: each pane's `write text` must run IMMEDIATELY after its split. Multi-pane setup writes builder-api first, then 0.5s delay, then status pane on the second split.
+- [BUG] Bash-level orphan-kill removed from cld; moved into applescript's post-reuse-check path. Reuse-by-port skips `reuseCmd` when daemon is alive (just focuses pane).
+- [NEW] cld-status calls `osascript … set rows` on its own iTerm session via `ITERM_SESSION_ID` after each render.
+- [CHANGE] `verb.up` / `verb.down` / `verb.restart` `platforms` lists extended with `"redis"`.
+- [TWEAK] Prompt-submit hook rewritten to `printf '%b\n'` with multi-line reminder content.
+
 # v2.8 (2026-06-19)
 
 Generic commands across every project, per-project settings, and a live status panel.

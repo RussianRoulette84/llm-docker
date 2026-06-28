@@ -153,6 +153,36 @@ _PREFIX_FAMILY = {
     "pt":       ("e2e",    C4),
     "db":       ("db",     C2),
     "sa":       ("sa",     YELLOW),
+    # Code-quality + frontend ops — cool cyan family so it reads
+    # as "checks/lint/build" rather than runtime/network/data.
+    "lint":     ("lint",    C3),
+    "format":   ("format",  C4),
+    "preview":  ("preview", C6),
+    "build":    ("build",   C5),
+    # Test runners — orange, same as docker/compose, since their
+    # green/red verdict is the visual eye-catch, not the family color.
+    "e2e":      ("e2e",     ORANGE),
+    "playwright": ("e2e",   ORANGE),
+    "smoke":    ("test",    GREEN),
+    "test":     ("test",    GREEN),
+    # Database family — cool blue/cyan, distinct from `db-*` (C2).
+    "pg":       ("pg",      C1),
+    "mysql":    ("mysql",   C1),
+    "redis":    ("redis",   RED),
+    # Python/Django web framework — distinct cyan from pure python.
+    "django":   ("django",  C6),
+    # iOS / macOS toolchain — pink, same family as `ios`.
+    "xcode":    ("xcode",   C8),
+    "swift":    ("xcode",   C8),
+    "pod":      ("xcode",   C8),
+    # Long-lived sidecars / launchd-managed services.
+    "lounge":   ("lounge",  YELLOW),
+    "livekit":  ("livekit", C7),
+    "uvicorn":  ("api",     C5),
+    # Deploy / fab / envoy — pink so deploys jump out.
+    "deploy":   ("deploy",  C8),
+    "envoy":    ("deploy",  C8),
+    "fab":      ("deploy",  C8),
 }
 
 
@@ -257,10 +287,10 @@ def show_banner(name: str, bind: str, port: int, jobs_names) -> None:
 _EVENT_STYLE: dict[str, tuple[str, str]] = {
     "server_started":           (C7,     "▲"),
     "config_reloaded":          (C7,     "↻"),
-    "build_enqueued":           (C5,     "+"),
-    "build_started":            (ORANGE, "▸"),
-    "build_finished":           (GREEN,  "✓"),  # → RED below if failed
-    "build_cancelled":          (YELLOW, "⊘"),
+    "job_enqueued":             (C5,     "+"),
+    "job_started":              (ORANGE, "▸"),
+    "job_finished":             (GREEN,  "✓"),  # → RED below if failed
+    "job_cancelled":            (YELLOW, "⊘"),
     "runtime_started":          (ORANGE, "▶"),
     "runtime_stopped":          (YELLOW, "■"),
     "runtime_exited":           (RED,    "▣"),
@@ -291,7 +321,7 @@ def event_line(record: dict) -> None:
     rather than wrapped so the tail stays scannable."""
     typ = record.get("type", "?")
     color, glyph = _EVENT_STYLE.get(typ, (GREY, "·"))
-    if typ == "build_finished" and record.get("status") != "done":
+    if typ == "job_finished" and record.get("status") != "done":
         color, glyph = RED, "✗"
     ts = record.get("ts", time.time())
     try:
@@ -324,9 +354,9 @@ def _summarize(rec: dict) -> str:
     truncates anyway, but we still keep messages tight here so the
     truncated suffix carries actual information rather than ellipsis."""
     t = rec.get("type")
-    if t in ("build_enqueued", "build_started"):
+    if t in ("job_enqueued", "job_started"):
         return _build_summary(rec)
-    if t == "build_finished":
+    if t == "job_finished":
         bits = [f"id={rec.get('id')}"]
         job = rec.get("job")
         if job:
@@ -340,7 +370,7 @@ def _summarize(rec: dict) -> str:
         if reason:
             bits.append(f"({reason})")
         return "  ".join(bits)
-    if t == "build_cancelled":
+    if t == "job_cancelled":
         return f"id={rec.get('id')}"
     if t == "config_reloaded":
         return (

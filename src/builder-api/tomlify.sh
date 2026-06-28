@@ -118,6 +118,45 @@ install_shard() {
     echo "${G}✓ $name → $HOST_API_CONFIG/$name.toml${RST}"
 }
 
+# Restart every running builder-api daemon whose port we can find in the
+# installed shards. v2.9+ daemons hot-reload from mtime polls in ~1.5s,
+# but older daemons (started before the v2.9 hot-reload code was loaded)
+# don't — they need a hard kill to pick up a new shard. Killing them is
+# the safe move either way: the iTerm pane shows the dead prompt, and
+# the next `cld -a` from that project spawns a fresh daemon that loads
+# the new shard cleanly.
+restart_running_daemons() {
+    command -v lsof >/dev/null 2>&1 || return 0
+    local f port pid killed=0
+    for f in "$HOST_API_CONFIG"/*.toml; do
+        [ -f "$f" ] || continue
+        # Skip the base file — projects only.
+        [ "$(basename "$f")" = "builder-api.toml" ] && continue
+        # Parse the [project.<name>].port line via awk (same parser
+        # shape cld + ocd use).
+        port=$(awk '
+            /^\[project\./ { in_proj=1; next }
+            in_proj && /^\[/ { in_proj=0 }
+            in_proj && /^[[:space:]]*port[[:space:]]*=/ {
+                gsub(/^[[:space:]]*port[[:space:]]*=[[:space:]]*/, "")
+                gsub(/[^0-9].*$/, "")
+                print; exit
+            }
+        ' "$f")
+        [ -z "$port" ] && continue
+        pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null && {
+                echo "${G}↻${RST} killed daemon on port $port (PID $pid, project $(basename "$f" .toml))"
+                killed=$((killed + 1))
+            }
+        fi
+    done
+    if [ "$killed" -gt 0 ]; then
+        echo "${D}re-run cld -a from each project to bring its panel back${RST}"
+    fi
+}
+
 case "$1" in
     list)
         echo "${P}base:${RST} $REPO_BASE"
@@ -131,6 +170,7 @@ case "$1" in
         ;;
     base)
         install_base
+        restart_running_daemons
         ;;
     all)
         install_base
@@ -139,13 +179,13 @@ case "$1" in
             _is_base "$f" && continue
             install_shard "$(_shard_name "$f")"
         done
+        restart_running_daemons
         ;;
     -h|--help|help)
         usage
         ;;
     *)
         install_shard "$1"
+        restart_running_daemons
         ;;
 esac
-
-echo "${D}Restart daemon with: cld -c -a${RST}"

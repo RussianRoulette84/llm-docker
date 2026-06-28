@@ -40,7 +40,15 @@ npm-debug.log*
 # OS metadata
 .DS_Store
 .Trash-*
+.Trash/
+.Trashes/
+.Spotlight-V100/
+.fseventsd/
 Thumbs.db
+
+# Backup / scratch files (no-backup-during-dev rule)
+*.bak
+*.orig
 
 # Private agent notes / scratch
 .agents/

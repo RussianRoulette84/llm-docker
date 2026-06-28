@@ -25,6 +25,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -98,18 +99,136 @@ class AppContext:
         # `server_started` lands in the user's view too.
         self.events.subscribe(_banner.event_line)
 
-        # NO hot-reload of the host toml. v2.4.x removed the
-        # ConfigWatcher subsystem entirely. The cage's job surface only
-        # grows on a deliberate operator action (kill + relaunch the
-        # daemon) — never silently via a file write. Rationale: an
-        # in-container agent that gets a splice script run on the host
-        # would otherwise widen the exec surface mid-session. With no
-        # hot-reload, the banner's startup job list IS the audit
-        # checkpoint; nothing new can sneak in between restarts.
+        # Hot-reload of host config (re-added in v2.9). Watches the
+        # api_config directory mtimes; on change, reloads the project
+        # view, emits a `config_reloaded` event listing job-set deltas,
+        # and reprints the banner. Two safety properties preserved:
+        #
+        #   (a) audit visibility — every reload emits an event and a
+        #       banner reprint, so the surface change is never silent.
+        #       This was the v2.4.x concern when ConfigWatcher was
+        #       removed; it's addressed here by making the reload LOUD.
+        #   (b) host-owned scope — ~/.llm-docker/api_config/ lives on
+        #       the host filesystem and is NOT bind-mounted into any
+        #       container. A container-side agent can't trigger a
+        #       reload by writing files; only Yaro (or the llm-docker
+        #       project itself) edits these files.
+        self._watch_thread: Optional[threading.Thread] = None
+        self._watch_stop = threading.Event()
+        self._start_config_watch()
 
     def shutdown(self) -> None:
+        self._watch_stop.set()
+        if self._watch_thread is not None:
+            self._watch_thread.join(timeout=2.0)
         self.build_queue.shutdown()
         self.runtime.shutdown()
+
+    # ------------------------------------------------------------------
+    # Config hot-reload
+    # ------------------------------------------------------------------
+
+    def _start_config_watch(self) -> None:
+        """Start a daemon thread that polls api_config file mtimes every
+        ~1.5s. Polling is good enough — these are host-side hand-edits,
+        not high-frequency. inotify/FSEvents would add a platform-
+        dependent dep we don't want for one timer."""
+        watch_paths: list[Path] = []
+        if self.cfg.config_path is not None:
+            watch_paths.append(self.cfg.config_path)
+        watch_paths.extend(self.cfg.shard_paths)
+        if not watch_paths:
+            return
+
+        snapshot = {p: self._safe_mtime(p) for p in watch_paths}
+
+        def _watch() -> None:
+            while not self._watch_stop.wait(1.5):
+                # Re-walk the projects directory too — new shards can
+                # appear (a `tomlify.sh slav-ai` after the daemon
+                # started). Removed shards drop out of the snapshot
+                # the next time around.
+                current_paths = [self.cfg.config_path] if self.cfg.config_path else []
+                projects_dir = self.cfg.config_path.parent if self.cfg.config_path else None
+                if projects_dir and projects_dir.is_dir():
+                    for p in sorted(projects_dir.glob("*.toml")):
+                        if p not in current_paths:
+                            current_paths.append(p)
+                changed = False
+                fresh: dict[Path, float] = {}
+                for p in current_paths:
+                    m = self._safe_mtime(p)
+                    fresh[p] = m
+                    if snapshot.get(p) != m:
+                        changed = True
+                if set(fresh.keys()) != set(snapshot.keys()):
+                    changed = True
+                if not changed:
+                    continue
+                snapshot.clear()
+                snapshot.update(fresh)
+                self._reload_config()
+
+        t = threading.Thread(target=_watch, name="config-watch", daemon=True)
+        t.start()
+        self._watch_thread = t
+
+    @staticmethod
+    def _safe_mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _reload_config(self) -> None:
+        """Re-load the host config + shards. On parse / validation error,
+        keep the old config in place and emit a `config_reload_failed`
+        event with the error — the daemon stays serving the previous
+        good state instead of crashing because a hand-edit dropped a
+        comma."""
+        old_jobs = set(self.cfg.jobs.keys())
+        old_verbs = {
+            (name, tuple(sorted(j.platforms.keys())))
+            for name, j in self.cfg.jobs.items() if j.is_hub
+        }
+        try:
+            new_cfg = _config.load(self.cfg.name, self.cfg.config_path)
+        except SystemExit as e:
+            # ConfigError subclasses SystemExit; capture and report.
+            self.events.append(
+                "config_reload_failed",
+                {"project": self.cfg.name, "code": int(e.code or 1)},
+            )
+            return
+        self.cfg = new_cfg
+        self.build_queue.update_cfg(new_cfg)
+        new_jobs = set(new_cfg.jobs.keys())
+        added = sorted(new_jobs - old_jobs)
+        removed = sorted(old_jobs - new_jobs)
+        new_verbs = {
+            (name, tuple(sorted(j.platforms.keys())))
+            for name, j in new_cfg.jobs.items() if j.is_hub
+        }
+        verb_changes = sorted({n for n, _ in (new_verbs ^ old_verbs)})
+        self.events.append(
+            "config_reloaded",
+            {
+                "project": new_cfg.name,
+                "added": added,
+                "removed": removed,
+                "verbs_changed": verb_changes,
+                "total_jobs": len(new_jobs),
+            },
+        )
+        # Reprint the banner so the operator sees the new job set.
+        try:
+            sys.stderr.write("\033[2J\033[H")
+            _banner.show_banner(
+                new_cfg.name, new_cfg.bind, new_cfg.port,
+                list(new_cfg.jobs.keys()),
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -751,26 +870,35 @@ def main() -> int:
     signal.signal(signal.SIGINT, _graceful_exit)
     signal.signal(signal.SIGTERM, _graceful_exit)
 
-    # Re-render the banner when the iTerm pane is resized. iTerm/Terminal
-    # deliver SIGWINCH to the foreground process when columns/rows change;
-    # without this handler the box drawn at boot stays at the original
-    # width while the new event tail wraps at the new width — visually
-    # inconsistent and impossible to read at a glance after a resize.
-    # Clearing the screen loses on-screen history but the terminal's own
-    # scrollback is untouched; users get a clean banner at the new size
-    # and can scroll up for the previous events.
+    # Re-render the banner + recent event history when the iTerm pane is
+    # resized. iTerm/Terminal deliver SIGWINCH to the foreground process
+    # when columns/rows change; without a handler the boot banner stays
+    # at the old width while the new event tail wraps at the new width
+    # — visually inconsistent. We clear the screen, reprint the banner
+    # at the new size, then REPLAY the last ~40 events through
+    # banner.event_line so the user keeps their scroll history instead
+    # of seeing a blank pane.
     def _winch_handler(_signum, _frame):  # type: ignore[no-untyped-def]
         try:
             sys.stderr.write("\033[2J\033[H")
             _banner.show_banner(
                 cfg.name, cfg.bind, cfg.port, list(cfg.jobs.keys())
             )
+            try:
+                recent = app.events.query(n=40)
+                for ev in recent.get("events") or []:
+                    # Skip server_started — the banner above already
+                    # represents the same "we're up" signal, and we
+                    # don't want a stale-looking duplicate.
+                    if ev.get("type") == "server_started":
+                        continue
+                    _banner.event_line(ev)
+            except Exception:
+                pass
         except Exception:
             # Signal handlers must NEVER raise — the user just resized
             # their pane, the daemon must not die for it. Silently absorb
-            # any write/encoding failure (closed stderr, exotic terminal,
-            # etc.); the next event tail entry will land at the new width
-            # and the user can resize again to retry.
+            # any write/encoding failure.
             pass
 
     try:

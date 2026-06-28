@@ -77,17 +77,17 @@ bind     = "127.0.0.1"
 
 [verb.up]
 description    = "Start the project's runtime for a target platform"
-platforms      = ["ios", "android", "web", "api", "mobile", "desktop"]
+platforms      = ["ios", "android", "web", "api", "mobile", "desktop", "redis"]
 required_param = "platform"
 
 [verb.down]
 description    = "Stop the runtime (compose down: containers + network removed)"
-platforms      = ["web", "api"]
+platforms      = ["web", "api", "redis"]
 required_param = "platform"
 
 [verb.restart]
 description    = "Restart the runtime in place"
-platforms      = ["web", "api"]
+platforms      = ["web", "api", "redis"]
 required_param = "platform"
 
 [verb.build]

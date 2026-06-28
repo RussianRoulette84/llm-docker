@@ -4,14 +4,20 @@
 #
 # Layout (Mac host):
 #   ~/Projects/purpletech/
-#     api/                  ← Lumen gateway (host-side php)
-#     angular/              ← Angular workspace
-#     ios/                  ← iOS app (Xcode workspace)
-#     alamofire-objc/       ← Objective-C library
-#     docker/               ← compose stack (pt-mysql, pt-redis, pt-app,
+#     src/
+#       api/                ← Lumen gateway (host-side php)
+#       angular/            ← Angular workspace
+#       ios/                ← iOS app (Xcode workspace)
+#       alamofire-objc/     ← Objective-C library
+#       docker/             ← compose stack (pt-mysql, pt-redis, pt-app,
 #                              pt-workspace, …)
-#     php/src/              ← backend tests (mount: /var/www/src inside
+#       php/src/            ← backend tests (mount: /var/www/src inside
 #                              workspace container)
+#       website/            ← Eleventy marketing site
+#       show/               ← (subproject)
+#     scripts/              ← host-snippets / exec-snippets (NOT moved)
+#     data/                 ← DB data dir (NOT moved)
+#     logs/                 ← (NOT moved)
 
 [project.purpletech]
 root      = "~/Projects/purpletech"
@@ -26,36 +32,36 @@ languages = ["php", "node", "compose"]
 # ── up ────────────────────────────────────────────────────────────────
 [project.purpletech.jobs.up.platforms.web]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "up", "-d"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "up", "-d"]
 timeout_s   = 300
 description = "Start the compose stack (web + api + workspace + mysql + redis)"
 
 [project.purpletech.jobs.up.platforms.api]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "up", "-d"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "up", "-d"]
 timeout_s   = 300
 description = "Same compose stack as `up web` — Lumen api runs in pt-app"
 
 [project.purpletech.jobs.up.platforms.ios]
 command      = "bash"
 args         = ["build-and-run.sh"]
-cwd          = "ios"
+cwd          = "src/ios"
 timeout_s    = 1800
 kill_after_s = 15
-command_hash = { path = "ios/build-and-run.sh", sha256 = "sha256:f23265bd8929c6845ea5af1743a34d93e38883833e9aebc9a7eb0048cb37dd62" }
+command_hash = { path = "src/ios/build-and-run.sh", sha256 = "sha256:f23265bd8929c6845ea5af1743a34d93e38883833e9aebc9a7eb0048cb37dd62" }
 description  = "Build + boot sim + install + launch the iOS app"
 
 
 # ── down ──────────────────────────────────────────────────────────────
 [project.purpletech.jobs.down.platforms.web]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "down"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "down"]
 timeout_s   = 60
 description = "Stop and REMOVE every compose service (containers + network)"
 
 [project.purpletech.jobs.down.platforms.api]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "down"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "down"]
 timeout_s   = 60
 description = "Same as `down web`"
 
@@ -63,13 +69,13 @@ description = "Same as `down web`"
 # ── restart ───────────────────────────────────────────────────────────
 [project.purpletech.jobs.restart.platforms.web]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "restart"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "restart"]
 timeout_s   = 120
 description = "Restart every compose service in place"
 
 [project.purpletech.jobs.restart.platforms.api]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "restart"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "restart"]
 timeout_s   = 120
 description = "Same as `restart web`"
 
@@ -79,16 +85,23 @@ description = "Same as `restart web`"
 command      = "bash"
 args         = ["scripts/host-snippets/angular-build.sh"]
 timeout_s    = 1800
-command_hash = { path = "scripts/host-snippets/angular-build.sh", sha256 = "sha256:f83fd9fc0a9bdc041b355cc2f962c3ee92af5f1a4744d0994eb12ca4e374a0ca" }
+command_hash = { path = "scripts/host-snippets/angular-build.sh", sha256 = "sha256:6a73ba4002f34967470b2297c053940ad2894acc3cc54b858655d72f2b81b97b" }
 description  = "Production Angular build"
 
 [project.purpletech.jobs.build.platforms.ios]
 command      = "xcodebuild"
 args         = ["-workspace", "PurpleTECH.xcworkspace", "-scheme", "PurpleTECH", "-configuration", "Debug", "-destination", "generic/platform=iOS Simulator", "build"]
-cwd          = "ios"
+cwd          = "src/ios"
 timeout_s    = 1800
 kill_after_s = 15
 description  = "Build the iOS app for the simulator (Debug)"
+
+[project.purpletech.jobs.ios-restart]
+command     = "bash"
+args        = ["-c", "xcrun simctl terminate booted com.triphazard.app; exec xcrun simctl launch booted com.triphazard.app"]
+cwd         = "src/ios"
+timeout_s   = 30
+description = "Terminate + relaunch the iOS app on the booted simulator (no rebuild)"
 
 
 # ── lint ──────────────────────────────────────────────────────────────
@@ -96,7 +109,7 @@ description  = "Build the iOS app for the simulator (Debug)"
 command      = "bash"
 args         = ["scripts/host-snippets/angular-lint.sh", "{flags}"]
 timeout_s    = 600
-command_hash = { path = "scripts/host-snippets/angular-lint.sh", sha256 = "sha256:f388bcecc1a69743aaa7760d4898de56eff930992512b751bf673848cb344d9b" }
+command_hash = { path = "scripts/host-snippets/angular-lint.sh", sha256 = "sha256:ae983a9c74a02bd48325629d317104fa47d7b0649eaf60df9398ddfed2d7eab0" }
 description  = "Full frontend linter"
 [project.purpletech.jobs.lint.platforms.web.placeholders.flags]
 regex    = "^(--(js-only|html-only|ts-only|no-ts|fast|summary-only|prettier|no-custom|no-unclosed|show-commented|no-color|debug))?$"
@@ -105,7 +118,7 @@ required = false
 [project.purpletech.jobs.lint.platforms.ios]
 command     = "pod"
 args        = ["lib", "lint", "AlamofireObjC.podspec", "--allow-warnings"]
-cwd         = "alamofire-objc"
+cwd         = "src/alamofire-objc"
 timeout_s   = 900
 description = "pod lib lint AlamofireObjC (proves the ObjC surface)"
 
@@ -114,29 +127,29 @@ description = "pod lib lint AlamofireObjC (proves the ObjC surface)"
 [project.purpletech.jobs.test.platforms.web]
 command     = "npm"
 args        = ["test"]
-cwd         = "angular"
+cwd         = "src/angular"
 timeout_s   = 300
 description = "Angular test suite (jest)"
 
 [project.purpletech.jobs.test.platforms.ios]
 command     = "swift"
 args        = ["test"]
-cwd         = "alamofire-objc"
+cwd         = "src/alamofire-objc"
 timeout_s   = 600
 description = "AlamofireObjC Swift test suite"
 
 [project.purpletech.jobs.test.platforms.api]
 command      = "bash"
-args         = ["-c", "cd api && exec vendor/bin/phpunit"]
+args         = ["-c", "cd src/api && exec vendor/bin/phpunit"]
 timeout_s    = 300
-command_hash = { path = "api/vendor/bin/phpunit", sha256 = "sha256:1fb9d47c7f192da01d06d1574b85a7e1c02b959cc03a969df1a8c0422abfc574" }
-description  = "Lumen api PHPUnit (host-side, cwd=api)"
+command_hash = { path = "src/api/vendor/bin/phpunit", sha256 = "sha256:1fb9d47c7f192da01d06d1574b85a7e1c02b959cc03a969df1a8c0422abfc574" }
+description  = "Lumen api PHPUnit (host-side, cwd=src/api)"
 
 
 # ── logs ──────────────────────────────────────────────────────────────
 [project.purpletech.jobs.logs.platforms.api]
 command     = "tail"
-args        = ["-n", "{lines}", "docker/logs/purpletech/purpletech.log"]
+args        = ["-n", "{lines}", "src/docker/logs/purpletech/purpletech.log"]
 timeout_s   = 10
 description = "Tail the Lumen api log"
 [project.purpletech.jobs.logs.platforms.api.placeholders.lines]
@@ -168,19 +181,27 @@ description  = "Liveness probe: pidfile alive + port 9000 listener"
 
 [project.purpletech.jobs.status.platforms.api]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "ps"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "ps"]
 timeout_s   = 10
 description = "Compose service status"
 
 
 # ── deploy ────────────────────────────────────────────────────────────
 [project.purpletech.jobs.deploy.platforms.web]
-command            = "envoy"
-args               = ["run", "deploy", "--branch", "{branch}", "--server", "{server}"]
+# Envoy's task variables need the `--server=X --branch=Y` form (= sign),
+# not space-separated, otherwise $server/$branch aren't bound inside the
+# Envoy.blade.php task. Daemon's placeholder validator rejects embedded
+# substrings (`--server={server}` as one arg), so we go through a bash
+# -c wrapper that builds the = form internally — same pattern as
+# phpunit-filter. Placeholders stay standalone elements (regex still
+# applied) and the daemon sees nothing different from any other safe job.
+command            = "bash"
+args               = ["-c", "exec envoy run deploy --server=\"$1\" --branch=\"$2\"", "--", "{server}", "{branch}"]
+cwd                = "src/angular"
 timeout_s          = 1800
 kill_after_s       = 10
 mutates_filesystem = true
-description        = "Deploy via Envoy (Laravel deployment from macOS host)"
+description        = "Deploy via Envoy (Laravel deployment from macOS host). Envoy.blade.php lives in src/angular/, so cwd points there."
 [project.purpletech.jobs.deploy.platforms.web.placeholders.branch]
 regex    = "^[A-Za-z0-9._/\\-]{1,80}$"
 max_len  = 80
@@ -190,10 +211,112 @@ regex    = "^[a-z][a-z0-9_-]{0,30}$"
 max_len  = 30
 required = true
 
+[project.purpletech.jobs.deploy.platforms.api]
+# Same shape as the web leaf — bash -c wrapper for Envoy's `=` form —
+# but cwd points at src/php/ since the backend's Envoy.blade.php and
+# release dir live there (releases at /var/www/backend/releases).
+command            = "bash"
+args               = ["-c", "exec envoy run deploy --server=\"$1\" --branch=\"$2\"", "--", "{server}", "{branch}"]
+cwd                = "src/php"
+timeout_s          = 1800
+kill_after_s       = 10
+mutates_filesystem = true
+description        = "Deploy the backend (Slim) via Envoy. Envoy.blade.php lives in src/php/."
+[project.purpletech.jobs.deploy.platforms.api.placeholders.branch]
+regex    = "^[A-Za-z0-9._/\\-]{1,80}$"
+max_len  = 80
+required = true
+[project.purpletech.jobs.deploy.platforms.api.placeholders.server]
+regex    = "^[a-z][a-z0-9_-]{0,30}$"
+max_len  = 30
+required = true
+
+# Third deployable: the Lumen api gateway in src/api/. Doesn't fit the
+# verb's two-platform shape (web/api are already taken by angular and
+# the Slim backend) so it stays a named job. Same bash -c Envoy
+# wrapper, cwd=src/api → /var/www/api on dev-api / live-api.
+[project.purpletech.jobs.deploy-gateway]
+command            = "bash"
+args               = ["-c", "exec envoy run deploy --server=\"$1\" --branch=\"$2\"", "--", "{server}", "{branch}"]
+cwd                = "src/api"
+timeout_s          = 1800
+kill_after_s       = 10
+mutates_filesystem = true
+description        = "Deploy the Lumen api gateway (src/api/ → /var/www/api @ dev-api / live-api)"
+[project.purpletech.jobs.deploy-gateway.placeholders.server]
+regex    = "^[a-z][a-z0-9_-]{0,30}$"
+max_len  = 30
+required = true
+[project.purpletech.jobs.deploy-gateway.placeholders.branch]
+regex    = "^[A-Za-z0-9._/\\-]{1,80}$"
+max_len  = 80
+required = true
+
 
 # ══════════════════════════════════════════════════════════════════════
 # NAMED JOBS — specialized cases that don't fit a single verb
 # ══════════════════════════════════════════════════════════════════════
+
+# -- website (Eleventy marketing site → /var/www/purplecollar-www) --
+[project.purpletech.jobs.deploy-website]
+command            = "bash"
+args               = ["-c", "exec envoy run deploy --server=\"$1\" --branch=\"$2\"", "--", "{server}", "{branch}"]
+cwd                = "src/website"
+timeout_s          = 1800
+kill_after_s       = 10
+mutates_filesystem = true
+description        = "Deploy the marketing site via Envoy (builds eleventy on the box, rsyncs _site)"
+[project.purpletech.jobs.deploy-website.placeholders.server]
+regex    = "^[a-z][a-z0-9_-]{0,30}$"
+max_len  = 30
+required = true
+[project.purpletech.jobs.deploy-website.placeholders.branch]
+regex    = "^[A-Za-z0-9._/\\-]{1,80}$"
+max_len  = 80
+required = true
+
+[project.purpletech.jobs.build-website]
+command     = "npm"
+args        = ["run", "build"]
+cwd         = "src/website"
+timeout_s   = 600
+description = "Build the marketing site (eleventy + OG cards + minify) into website/_site"
+
+# -- named deploy aliases (run_job-callable — the deploy verb needs
+#    ?platform= which some clients can't send) --
+[project.purpletech.jobs.deploy-backend]
+command            = "bash"
+args               = ["-c", "exec envoy run deploy --server=\"$1\" --branch=\"$2\"", "--", "{server}", "{branch}"]
+cwd                = "src/php"
+timeout_s          = 1800
+kill_after_s       = 10
+mutates_filesystem = true
+description        = "Deploy the Slim backend via Envoy (src/php/ → /var/www/backend) — same target as deploy?platform=api"
+[project.purpletech.jobs.deploy-backend.placeholders.server]
+regex    = "^[a-z][a-z0-9_-]{0,30}$"
+max_len  = 30
+required = true
+[project.purpletech.jobs.deploy-backend.placeholders.branch]
+regex    = "^[A-Za-z0-9._/\\-]{1,80}$"
+max_len  = 80
+required = true
+
+[project.purpletech.jobs.deploy-frontend]
+command            = "bash"
+args               = ["-c", "exec envoy run deploy --server=\"$1\" --branch=\"$2\"", "--", "{server}", "{branch}"]
+cwd                = "src/angular"
+timeout_s          = 1800
+kill_after_s       = 10
+mutates_filesystem = true
+description        = "Deploy the Angular app via Envoy (src/angular/ → /var/www/angular) — same target as deploy?platform=web"
+[project.purpletech.jobs.deploy-frontend.placeholders.server]
+regex    = "^[a-z][a-z0-9_-]{0,30}$"
+max_len  = 30
+required = true
+[project.purpletech.jobs.deploy-frontend.placeholders.branch]
+regex    = "^[A-Za-z0-9._/\\-]{1,80}$"
+max_len  = 80
+required = true
 
 # -- screenshots --
 [project.purpletech.jobs.pt-shoot]
@@ -213,15 +336,22 @@ required = false
 # -- backend tests (in-container, reach pt-mysql/pt-redis) --
 [project.purpletech.jobs.phpunit-local]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/src", "workspace", "php", "vendor/phpunit/phpunit/phpunit"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/src", "workspace", "php", "vendor/phpunit/phpunit/phpunit"]
 timeout_s   = 300
 description = "Full backend (php/src) PHPUnit suite inside workspace container — invokes the real binary via php so a missing vendor/bin/phpunit proxy (which composer only writes on a real install, not a no-op) doesn't break us"
 
 [project.purpletech.jobs.phpunit-local-filter]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/src", "workspace", "php", "vendor/phpunit/phpunit/phpunit", "--filter", "{test}"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/src", "workspace", "php", "vendor/phpunit/phpunit/phpunit", "--filter", "{test}"]
 timeout_s   = 300
 description = "One backend PHPUnit class or method by name, in-container (real binary path — see phpunit-local for why)"
+
+[project.purpletech.jobs.phpunit-baseline]
+command            = "docker"
+args               = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/src", "workspace", "php", "vendor/phpunit/phpunit/phpunit", "--generate-baseline", "phpunit-baseline.xml"]
+timeout_s          = 300
+mutates_filesystem = true
+description        = "Generate a PHPUnit deprecation baseline (writes php/src/phpunit-baseline.xml). Suppresses the ~75 pre-existing PHP 8.2 deprecations in legacy core files so new deprecations still fail loudly."
 [project.purpletech.jobs.phpunit-local-filter.placeholders.test]
 regex       = "^[A-Za-z][A-Za-z0-9_:]*$"
 max_len     = 200
@@ -230,7 +360,7 @@ description = "Test class or Class::method (alphanumerics + _:)"
 
 [project.purpletech.jobs.composer-install-local]
 command            = "docker"
-args               = ["compose", "-f", "docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/src", "workspace", "composer", "install"]
+args               = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/src", "workspace", "composer", "install"]
 timeout_s          = 600
 mutates_filesystem = true
 description        = "composer install (with dev) in php/src inside the workspace container — needed for phpunit-local"
@@ -239,7 +369,7 @@ description        = "composer install (with dev) in php/src inside the workspac
 [project.purpletech.jobs.artisan-migrate]
 command            = "php"
 args               = ["artisan", "migrate", "--force"]
-cwd                = "api"
+cwd                = "src/api"
 timeout_s          = 120
 mutates_filesystem = true
 description        = "Run pending Lumen migrations (host-side; for DEV/PROD where DB resolves)"
@@ -247,7 +377,7 @@ description        = "Run pending Lumen migrations (host-side; for DEV/PROD wher
 [project.purpletech.jobs.artisan-migrate-rollback]
 command            = "php"
 args               = ["artisan", "migrate:rollback", "--force"]
-cwd                = "api"
+cwd                = "src/api"
 timeout_s          = 60
 mutates_filesystem = true
 description        = "Roll back the last migration batch (host-side)"
@@ -255,95 +385,95 @@ description        = "Roll back the last migration batch (host-side)"
 [project.purpletech.jobs.artisan-migrate-status]
 command     = "php"
 args        = ["artisan", "migrate:status"]
-cwd         = "api"
+cwd         = "src/api"
 timeout_s   = 30
 description = "Show migration status (host-side)"
 
 [project.purpletech.jobs.artisan-cache-clear]
 command            = "php"
 args               = ["artisan", "cache:clear"]
-cwd                = "api"
+cwd                = "src/api"
 timeout_s          = 30
 mutates_filesystem = true
 
 [project.purpletech.jobs.artisan-config-clear]
 command            = "php"
 args               = ["artisan", "config:clear"]
-cwd                = "api"
+cwd                = "src/api"
 timeout_s          = 30
 mutates_filesystem = true
 
 [project.purpletech.jobs.artisan-route-clear]
 command            = "php"
 args               = ["artisan", "route:clear"]
-cwd                = "api"
+cwd                = "src/api"
 timeout_s          = 30
 mutates_filesystem = true
 
 [project.purpletech.jobs.artisan-view-clear]
 command            = "php"
 args               = ["artisan", "view:clear"]
-cwd                = "api"
+cwd                = "src/api"
 timeout_s          = 30
 mutates_filesystem = true
 
 [project.purpletech.jobs.artisan-route-list]
 command     = "php"
 args        = ["artisan", "route:list"]
-cwd         = "api"
+cwd         = "src/api"
 timeout_s   = 30
 description = "List every registered HTTP route"
 
 [project.purpletech.jobs.artisan-storage-link]
 command            = "php"
 args               = ["artisan", "storage:link"]
-cwd                = "api"
+cwd                = "src/api"
 timeout_s          = 30
 mutates_filesystem = true
 
 # -- artisan (local Docker DB via workspace container) --
 [project.purpletech.jobs.artisan-migrate-local]
 command            = "docker"
-args               = ["compose", "-f", "docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/api", "workspace", "php", "artisan", "migrate", "--force"]
+args               = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/api", "workspace", "php", "artisan", "migrate", "--force"]
 timeout_s          = 120
 mutates_filesystem = true
 description        = "Run pending migrations against local Docker MySQL (workspace container)"
 
 [project.purpletech.jobs.artisan-migrate-rollback-local]
 command            = "docker"
-args               = ["compose", "-f", "docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/api", "workspace", "php", "artisan", "migrate:rollback", "--force"]
+args               = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/api", "workspace", "php", "artisan", "migrate:rollback", "--force"]
 timeout_s          = 60
 mutates_filesystem = true
 
 [project.purpletech.jobs.artisan-migrate-status-local]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/api", "workspace", "php", "artisan", "migrate:status"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "-w", "/var/www/api", "workspace", "php", "artisan", "migrate:status"]
 timeout_s   = 30
 
 # -- iOS Xcode build-log parser --
 [project.purpletech.jobs.ios-buildlog]
 command     = "xclogparser"
 args        = ["parse", "--project", "PurpleTECH", "--reporter", "issues"]
-cwd         = "ios"
+cwd         = "src/ios"
 timeout_s   = 60
 description = "Parse the latest Xcode build log (errors + warnings)"
 
 [project.purpletech.jobs.ios-clean]
 command     = "xcodebuild"
 args        = ["-workspace", "PurpleTECH.xcworkspace", "-scheme", "PurpleTECH", "-configuration", "Debug", "clean"]
-cwd         = "ios"
+cwd         = "src/ios"
 timeout_s   = 300
 description = "Clean the iOS build (DerivedData stays)"
 
 [project.purpletech.jobs.ios-pod-install]
 command            = "pod"
 args               = ["install"]
-cwd                = "ios"
+cwd                = "src/ios"
 timeout_s          = 600
 mutates_filesystem = true
 
 # -- compose lifecycle (overrides language pack so every compose-* job
-# pins -f docker/docker-compose.yml; without the override, the
+# pins -f src/docker/docker-compose.yml; without the override, the
 # language-pack defaults run against a non-existent ./compose.yaml
 # at project root and fail). compose-down / compose-stop / compose-build
 # are gated by mutates_filesystem because they tear down or rebuild
@@ -351,63 +481,83 @@ mutates_filesystem = true
 # ?confirm=yes to fire them. --
 [project.purpletech.jobs.compose-ps]
 command   = "docker"
-args      = ["compose", "-f", "docker/docker-compose.yml", "ps"]
+args      = ["compose", "-f", "src/docker/docker-compose.yml", "ps"]
 timeout_s = 10
 
 [project.purpletech.jobs.compose-up]
 command   = "docker"
-args      = ["compose", "-f", "docker/docker-compose.yml", "up", "-d"]
+args      = ["compose", "-f", "src/docker/docker-compose.yml", "up", "-d"]
 timeout_s = 300
 
 [project.purpletech.jobs.compose-down]
 command            = "docker"
-args               = ["compose", "-f", "docker/docker-compose.yml", "down"]
+args               = ["compose", "-f", "src/docker/docker-compose.yml", "down"]
 timeout_s          = 60
 mutates_filesystem = true
 description        = "Stop and REMOVE every compose service (containers + network)"
 
 [project.purpletech.jobs.compose-stop]
 command     = "docker"
-args        = ["compose", "-f", "docker/docker-compose.yml", "stop"]
+args        = ["compose", "-f", "src/docker/docker-compose.yml", "stop"]
 timeout_s   = 60
 description = "Stop every compose service WITHOUT removing containers (use compose-up to resume)"
 
 [project.purpletech.jobs.compose-restart]
 command = "docker"
-args    = ["compose", "-f", "docker/docker-compose.yml", "restart", "{service}"]
+args    = ["compose", "-f", "src/docker/docker-compose.yml", "restart", "{service}"]
 [project.purpletech.jobs.compose-restart.placeholders.service]
 regex   = "^[a-zA-Z0-9_-]+$"
 
 [project.purpletech.jobs.compose-build]
 command            = "docker"
-args               = ["compose", "-f", "docker/docker-compose.yml", "build", "{service}"]
+args               = ["compose", "-f", "src/docker/docker-compose.yml", "build", "{service}"]
 mutates_filesystem = true
 [project.purpletech.jobs.compose-build.placeholders.service]
 regex   = "^[a-zA-Z0-9_-]+$"
 
 [project.purpletech.jobs.compose-logs]
 command = "docker"
-args    = ["compose", "-f", "docker/docker-compose.yml", "logs", "--tail=200", "{service}"]
+args    = ["compose", "-f", "src/docker/docker-compose.yml", "logs", "--tail=200", "{service}"]
 [project.purpletech.jobs.compose-logs.placeholders.service]
 regex   = "^[a-zA-Z0-9_-]+$"
+
+# compose-exec — run a pre-defined READ-ONLY diagnostic snippet inside
+# the workspace container. Snippet name is regex-bounded to an explicit
+# allowlist of read-only diagnostic scripts at scripts/exec-snippets/
+# <name>.sh (host) → /var/www/scripts/exec-snippets/<name>.sh (workspace
+# mount). Mutating operations (artisan-migrate, composer-install, …)
+# have their own gated jobs and MUST NOT be added to this allowlist —
+# the regex-enum is the daemon's enforcement of that boundary, not a
+# convention. Service hard-coded to `workspace` (the only one the
+# scripts mount targets); add a separate job if another service ever
+# needs the same treatment.
+[project.purpletech.jobs.compose-exec]
+command   = "docker"
+args      = ["compose", "-f", "src/docker/docker-compose.yml", "exec", "-T", "workspace", "bash", "-c", "exec /var/www/scripts/exec-snippets/\"$1\".sh", "--", "{snippet}"]
+timeout_s = 60
+[project.purpletech.jobs.compose-exec.placeholders.snippet]
+regex    = "^(verify|phpinfo|redis-ping|mysql-version|tail-errors|php-lint-changed)$"
+max_len  = 40
+required = true
+description = "One of the six read-only diagnostic snippets"
 
 # -- frontend npm jobs --
 [project.purpletech.jobs.npm-install]
 command   = "npm"
 args      = ["install"]
-cwd       = "angular"
+cwd       = "src/angular"
 timeout_s = 600
 
 [project.purpletech.jobs.tsc-check]
 command   = "npx"
 args      = ["tsc", "--noEmit"]
-cwd       = "angular"
+cwd       = "src/angular"
 timeout_s = 120
 
 [project.purpletech.jobs.jest-filter]
 command   = "npx"
 args      = ["jest", "--testNamePattern", "{filter}"]
-cwd       = "angular"
+cwd       = "src/angular"
 timeout_s = 300
 [project.purpletech.jobs.jest-filter.placeholders.filter]
 regex    = "^[A-Za-z0-9 ._-]+$"
@@ -418,7 +568,7 @@ required = true
 command      = "bash"
 args         = ["scripts/host-snippets/angular-up.sh"]
 timeout_s    = 30
-command_hash = { path = "scripts/host-snippets/angular-up.sh", sha256 = "sha256:481cd7606b19aa22ea22feeaedd107d651f1fe5644b763dd5c0709df4156fcac" }
+command_hash = { path = "scripts/host-snippets/angular-up.sh", sha256 = "sha256:f8ca85c20f432a915bbb65c8d83abd9e5483083ed67107caba056f0134cd042a" }
 
 [project.purpletech.jobs.angular-down]
 command      = "bash"
@@ -430,17 +580,31 @@ command_hash = { path = "scripts/host-snippets/angular-down.sh", sha256 = "sha25
 command      = "bash"
 args         = ["scripts/host-snippets/angular-install.sh"]
 timeout_s    = 1800
-command_hash = { path = "scripts/host-snippets/angular-install.sh", sha256 = "sha256:bfa0780956da84d07a246db8d3001f4541bd4fb4a3bdcc3361e84c7789961227" }
+command_hash = { path = "scripts/host-snippets/angular-install.sh", sha256 = "sha256:0721755450b6ec3806915ba59ea6f711d698916bd077e70f2c0f137b61ec0756" }
+
+# Clean from-lockfile rebuild of the angular tree. `npm ci` deletes
+# node_modules and reinstalls from package-lock.json — deterministic,
+# heals a half-gutted tree (e.g. when patch-package postinstall died
+# mid-reconcile under angular-install). Use when `angular-install`
+# no-ops because lock-vs-tree comparison thinks nothing's needed.
+[project.purpletech.jobs.angular-reinstall]
+command            = "npm"
+args               = ["ci", "--include=dev"]
+cwd                = "src/angular"
+timeout_s          = 1800
+kill_after_s       = 15
+mutates_filesystem = true
+description        = "Clean rebuild of angular/node_modules from package-lock.json (heals half-gutted trees)"
 
 [project.purpletech.jobs.angular-prettier-check]
 command      = "bash"
 args         = ["scripts/host-snippets/angular-prettier-check.sh"]
 timeout_s    = 300
-command_hash = { path = "scripts/host-snippets/angular-prettier-check.sh", sha256 = "sha256:51e58e92503c64fa7ef59169523fc27bf18c2f41b0d825a60ede7a86048a35a8" }
+command_hash = { path = "scripts/host-snippets/angular-prettier-check.sh", sha256 = "sha256:b1ca671b720cb15365b993fb3067a9bb58a5a1a48fb94807a440987ad98b0e61" }
 
 [project.purpletech.jobs.git-status-all]
 command      = "bash"
 args         = ["scripts/host-snippets/git-status-all.sh"]
 timeout_s    = 15
-command_hash = { path = "scripts/host-snippets/git-status-all.sh", sha256 = "sha256:2755209b78d188460854188c5996b71cd73ddc605557fc582dc149d8b1fc3c77" }
+command_hash = { path = "scripts/host-snippets/git-status-all.sh", sha256 = "sha256:8f89121a6f01aa4af8218eb17bb87787c8471bcf2fe1160609604e9bf4ed4157" }
 description  = "git status across all 6 repos"

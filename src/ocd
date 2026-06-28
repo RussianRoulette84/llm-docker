@@ -8,6 +8,20 @@ set -e
 # chip-blob by env-gorilla v0.12+ so one Touch ID covers everything. A missing
 # project profile in kdbx is a non-fatal warning, not an error.
 _self_dir="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
+# --refresh-env: wipe env-gorilla's cached chip-blob before re-exec, so
+# newly-added KeePassXC entries propagate. Strip the flag from $@ either
+# way so downstream arg parsing doesn't see it.
+_refresh_env=false
+_new_args=()
+for _a in "$@"; do
+    case "$_a" in
+        --refresh-env) _refresh_env=true ;;
+        *) _new_args+=("$_a") ;;
+    esac
+done
+set -- "${_new_args[@]}"
+unset _new_args _a
+
 if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
    && command -v env-gorilla >/dev/null 2>&1 \
    && { [ "${USER:-}" = "yaro" ] || [ ! -f "$_self_dir/.env" ]; }; then
@@ -27,10 +41,13 @@ if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
     else
         _profiles="llm-docker"
     fi
+    if [ "$_refresh_env" = true ]; then
+        env-gorilla --clear "$_profiles" >/dev/null 2>&1 || true
+    fi
     export LLM_DOCKER_ENV_GORILLA=1
     exec env-gorilla "$_profiles" -- "$0" "$@"
 fi
-unset _self_dir _proj_name _profiles
+unset _self_dir _proj_name _profiles _refresh_env
 
 SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
 
@@ -455,6 +472,67 @@ if [ "$CLEAN_CONTAINERS" = true ]; then
     fi
 fi
 
+# ── per-terminal session tracking ──────────────────────────────────────
+# Map (iTerm pane / tty, project) → opencode session ID so `ocd -c`
+# from the same terminal where a session started resumes THAT session,
+# not whichever session was used most recently across all terminals.
+_TERM_SESSIONS_FILE="$HOME/.llm-docker/opencode/.local/share/opencode/terminal-sessions.tsv"
+
+_terminal_id() {
+    if [ -n "${ITERM_SESSION_ID:-}" ]; then
+        printf '%s' "$ITERM_SESSION_ID"
+    elif [ -n "${TMUX_PANE:-}" ]; then
+        printf 'tmux:%s' "$TMUX_PANE"
+    else
+        tty 2>/dev/null || printf 'unknown'
+    fi
+}
+
+# Predict the container-side DOCKER_WORKDIR for a host workdir. Mirrors
+# the resolution at run_opencode_container's top so we can match the
+# `directory` column opencode wrote to its sqlite db.
+_docker_workdir_for() {
+    local workdir="$1"
+    if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$workdir" == "$WORKSPACE_DIR"* ]]; then
+        local rel="${workdir#$WORKSPACE_DIR}"
+        rel="${rel#/}"
+        if [ -z "$rel" ]; then
+            printf '%s' "$DOCKER_WORKSPACE_TARGET"
+        else
+            printf '%s/%s' "$DOCKER_WORKSPACE_TARGET" "$rel"
+        fi
+    else
+        printf '%s/%s' "$DOCKER_DIR" "$(basename "$workdir")"
+    fi
+}
+
+_lookup_terminal_session() {
+    local tid="$1" proj="$2"
+    [ -f "$_TERM_SESSIONS_FILE" ] || return 0
+    awk -F'\t' -v t="$tid" -v p="$proj" '$1==t && $2==p {u=$3} END{if(u) print u}' "$_TERM_SESSIONS_FILE"
+}
+
+# Query opencode's sqlite db for the newest session in `docker_wd` and
+# save it for (terminal, project). No-op when sqlite3 or db missing.
+_save_terminal_session() {
+    local tid="$1" proj="$2" docker_wd="$3"
+    local db="$HOME/.llm-docker/opencode/.local/share/opencode/opencode.db"
+    [ -f "$db" ] || return 0
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    local wd_esc="${docker_wd//\'/\'\'}"
+    local sid
+    sid="$(sqlite3 "$db" "SELECT id FROM session WHERE directory = '$wd_esc' ORDER BY time_created DESC LIMIT 1" 2>/dev/null)"
+    [ -z "$sid" ] && return 0
+    mkdir -p "$(dirname "$_TERM_SESSIONS_FILE")"
+    local tmp
+    tmp="$(mktemp)"
+    if [ -f "$_TERM_SESSIONS_FILE" ]; then
+        awk -F'\t' -v t="$tid" -v p="$proj" '!($1==t && $2==p)' "$_TERM_SESSIONS_FILE" > "$tmp"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$tid" "$proj" "$sid" "$(date +%s)" >> "$tmp"
+    mv "$tmp" "$_TERM_SESSIONS_FILE"
+}
+
 # Function to run a single OpenCode container
 run_opencode_container() {
     local WORKDIR="$1"
@@ -539,6 +617,17 @@ run_opencode_container() {
         local SLOT_FILE="$HOME/.llm-docker/opencode/.local/share/opencode/slot_${SLOT}.id"
         [ -f "$SLOT_FILE" ] && RESUME_SESSION="$(cat "$SLOT_FILE")"
     fi
+
+    # Per-terminal continue: if `-c` was used without --slot and without
+    # an explicit UUID, and we've saved a session for THIS iTerm pane in
+    # this project, resume that specific session.
+    if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ]; then
+        local _TS_TID _TS_SAVED
+        _TS_TID=$(_terminal_id)
+        _TS_SAVED=$(_lookup_terminal_session "$_TS_TID" "$WORKDIR")
+        [ -n "$_TS_SAVED" ] && RESUME_SESSION="$_TS_SAVED"
+    fi
+
     SLOT_ENV=""
     [ -n "$SLOT" ]           && SLOT_ENV="$SLOT_ENV -e SLOT=$SLOT"
     [ -n "$RESUME_SESSION" ] && SLOT_ENV="$SLOT_ENV -e SLOT_RESUME_ID=$RESUME_SESSION"
@@ -653,6 +742,11 @@ run_opencode_container() {
         $ENV_FILES \
         $EXTRA_ENV \
         "$IMAGE_TAG" "$@"
+
+    # Save THIS terminal's opencode session ID so a subsequent `ocd -c`
+    # in the same pane resumes here, not whichever session was most
+    # recent globally. Non-blocking: silently no-ops on any error.
+    _save_terminal_session "$(_terminal_id)" "$WORKDIR" "$DOCKER_WORKDIR" 2>/dev/null || true
 }
 
 # _write_secret_handoff — when `-a` opens a new iTerm/Terminal window,
@@ -728,18 +822,17 @@ _maybe_start_api() {
         return 0
     fi
 
-    # Port-binding dedupe: if another cld/ocd session already has a daemon
-    # on this port, skip the panel spawn. Without this check the AppleScript
-    # opens a new pane, run-local.sh starts server.py, and the daemon dies
-    # with "[Errno 48] Address already in use" inside an already-visible
-    # window — confusing and wasteful.
+    # Orphan-daemon cleanup: kill any previous daemon still bound to this
+    # project's port so the fresh spawn below binds clean. AppleScript's
+    # reuse path handles the pane-still-alive case; this handles
+    # "daemon backgrounded, pane gone" so the user reliably gets new
+    # panels every ocd -a instead of "no panels" silence.
     if command -v lsof >/dev/null 2>&1; then
         local _api_existing_pid
         _api_existing_pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
         if [ -n "$_api_existing_pid" ]; then
-            _log OCD "builder-api already on port $port (PID $_api_existing_pid) — panel skipped"
-            unset _api_existing_pid
-            return 0
+            kill "$_api_existing_pid" 2>/dev/null
+            sleep 0.4
         fi
         unset _api_existing_pid
     fi
@@ -760,16 +853,22 @@ _maybe_start_api() {
         local handoff
         handoff="$(_write_secret_handoff)"
 
+        # Optional cld-status dashboard alongside the builder-api panel.
+        local status_cmd=""
+        if [ -x "$SCRIPT_DIR/cld-status" ]; then
+            status_cmd="exec $SCRIPT_DIR/cld-status"
+        fi
+
         # 1a) Already inside iTerm? Split the current window left/right.
         if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
-            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" >/dev/null 2>&1; then
+            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" "$status_cmd" >/dev/null 2>&1; then
                 echo "[ocd] builder-api split into right pane (port $port)"
                 return 0
             fi
         fi
 
         # 1b) Not in iTerm, or split denied: positioned new window.
-        if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" new-window "$port" "$handoff" >/dev/null 2>&1; then
+        if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" new-window "$port" "$handoff" "$status_cmd" >/dev/null 2>&1; then
             echo "[ocd] builder-api spawned in positioned iTerm window (port $port)"
             return 0
         fi

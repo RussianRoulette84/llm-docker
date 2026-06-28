@@ -86,7 +86,7 @@ description = "Python lint (ruff)"
 [project.slav-ai.jobs.lint.platforms.web]
 command      = "bash"
 args         = ["scripts/ci/lint-fe.sh", "--summary-only", "--no-color"]
-command_hash = { path = "scripts/ci/lint-fe.sh", sha256 = "sha256:d6efd4611a152fc108ddef5775d2e37409cf3feab4deeca66971f0200f861e80" }
+command_hash = { path = "scripts/ci/lint-fe.sh", sha256 = "sha256:f283faf8e2fb791519bfc701eb08d459100a303838fc098ea4bf8fdd882e5c98" }
 timeout_s    = 120
 description  = "JS/HTML linter"
 
@@ -163,7 +163,7 @@ description        = "Pull + migrate + build lounge + restart prod services (Fab
 [project.slav-ai.jobs.sa-setenv]
 command      = "bash"
 args         = ["scripts/setenv-launchd.sh"]
-command_hash = { path = "scripts/setenv-launchd.sh", sha256 = "sha256:90f37fb1b72be91b2550eb7a441ca04816c201ded549c9fa34c748e0296e5627" }
+command_hash = { path = "scripts/setenv-launchd.sh", sha256 = "sha256:a2dc9cb646efb5a13b64d2ecda6097f78aa0c6a7a45dbe312570f8b2527fe637" }
 timeout_s    = 10
 description  = "Push allowlisted secrets from env into launchd gui/501 (REQUIRED before any *-up after login/reboot)"
 
@@ -270,11 +270,61 @@ timeout_s   = 5
 regex    = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
 required = true
 
+# -- redis (brew-managed; dev config store + rate-limit backend) --
+[project.slav-ai.jobs.redis-up]
+command     = "brew"
+args        = ["services", "start", "redis"]
+timeout_s   = 15
+description = "Start the brew-managed redis (loopback 127.0.0.1:6379)"
+
+[project.slav-ai.jobs.redis-down]
+command     = "brew"
+args        = ["services", "stop", "redis"]
+timeout_s   = 15
+
+[project.slav-ai.jobs.redis-restart]
+command     = "brew"
+args        = ["services", "restart", "redis"]
+timeout_s   = 15
+
+[project.slav-ai.jobs.redis-status]
+command     = "bash"
+args        = ["-c", "redis-cli ping && echo '---' && brew services info redis"]
+timeout_s   = 10
+description = "redis-cli ping + brew services info redis"
+
+[project.slav-ai.jobs.redis-tail]
+command     = "tail"
+args        = ["-n", "{lines}", "/opt/homebrew/var/log/redis.log"]
+timeout_s   = 5
+description = "Tail the brew redis log"
+[project.slav-ai.jobs.redis-tail.placeholders.lines]
+regex    = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
+required = true
+
+# Redis as a 3rd platform on the up/down/restart verbs so it gets the
+# same dispatch surface as uvicorn (api) and vite (web).
+[project.slav-ai.jobs.up.platforms.redis]
+command     = "brew"
+args        = ["services", "start", "redis"]
+timeout_s   = 15
+description = "Bring redis up alongside the rest of the dev stack"
+
+[project.slav-ai.jobs.down.platforms.redis]
+command     = "brew"
+args        = ["services", "stop", "redis"]
+timeout_s   = 15
+
+[project.slav-ai.jobs.restart.platforms.redis]
+command     = "brew"
+args        = ["services", "restart", "redis"]
+timeout_s   = 15
+
 # -- smoke / lint variants / formats --
 [project.slav-ai.jobs.smoke]
 command      = "bash"
 args         = ["scripts/ci/smoke.sh"]
-command_hash = { path = "scripts/ci/smoke.sh", sha256 = "sha256:7848ffb6d4ebb618b0c08e5a847d5a70c46640ec5f696a997b50bfa751f1b537" }
+command_hash = { path = "scripts/ci/smoke.sh", sha256 = "sha256:54eb9b7e1d1b1f81ccedd48fb55da58281b9bd2b8d350e2ac502c529b6c1fb6a" }
 timeout_s    = 600
 kill_after_s = 5
 

@@ -115,23 +115,26 @@ on run argv
     if (count of argv) >= 5 then
         set handoffPath to item 5 of argv
     end if
+    -- Optional 6th arg: shell command to run in a SECOND new pane
+    -- horizontally-split off the source pane (typically the cld-status
+    -- live dashboard). Empty = don't spawn one. Only honored in "split"
+    -- mode — new-window mode opens a separate iTerm window and has no
+    -- "source pane" to split off of.
+    set statusCmd to ""
+    if (count of argv) >= 6 then
+        set statusCmd to item 6 of argv
+    end if
 
-    -- We invoke via `bash` so run-local.sh doesn't need the execute bit set;
-    -- quoted form guarantees correct escaping of paths with spaces.
+    -- Build the shell command that needs to run in the new pane.
+    -- We invoke via `bash` so run-local.sh doesn't need the execute bit
+    -- set; quoted form guarantees correct escaping of paths with spaces.
     -- Handoff path is passed as the SECOND positional arg to run-local.sh
     -- (run-local.sh sources + deletes it).
-    --
-    -- The typed line MUST start with `bash` (not `clear;`, not `. <file>`,
-    -- not `source <file>`). Some zsh setups prepend `?` (the glob char) to
-    -- the first word of a bracketed-paste line, turning the first token
-    -- into a NOMATCH error: `?clear` / `?source` / `?.` all glob-fail. The
-    -- bare word `bash` survives more reliably; on the rare retries where
-    -- it still fails, the user just re-runs `cld -c -a`. The screen clear
-    -- moves into run-local.sh's first action so we don't lose it.
     set cmd to "bash " & quoted form of launcher & " " & quoted form of projectDir
     if handoffPath is not "" then
         set cmd to cmd & " " & quoted form of handoffPath
     end if
+
     set sessionTitle to my titleForProject(projectDir)
     -- Reuse-path command: kill ONLY the daemon bound to this project's
     -- port, not all builder-api processes on the host. Falls back to a
@@ -156,6 +159,7 @@ on run argv
     -- the title-tagged lookup when the daemon is dead but the pane is
     -- still open, so we relaunch in-place instead of opening a new one.
     set reuseSession to my findSessionByPort(portStr)
+    set daemonAlive to (reuseSession is not missing value)
     if reuseSession is missing value then
         set reuseSession to my findSessionByTitle(sessionTitle)
     end if
@@ -164,10 +168,21 @@ on run argv
             activate
             tell reuseSession
                 select
-                write text reuseCmd
+                if not daemonAlive then
+                    write text reuseCmd
+                end if
             end tell
         end tell
         return
+    end if
+
+    -- No reuse pane found anywhere. If an orphan daemon is still bound
+    -- to this port (its pane was closed), kill it so the fresh spawn
+    -- below can bind cleanly.
+    if portStr is not "" then
+        try
+            do shell script "lsof -ti :" & portStr & " 2>/dev/null | xargs kill 2>/dev/null; sleep 0.4"
+        end try
     end if
 
     if mode is "split" then
@@ -182,16 +197,57 @@ on run argv
             activate
             tell current window
                 set origBounds to bounds
-                tell current session
-                    set newSession to (split vertically with default profile)
-                    tell newSession
+                set sourceSession to current session
+
+                if statusCmd is not "" then
+                    -- TOP-RIGHT: status pane created and written FIRST.
+                    -- Same proven pattern: write IMMEDIATELY after split,
+                    -- before any other operations touch other panes.
+                    tell sourceSession
+                        set rightPane to (split vertically with default profile)
+                    end tell
+                    tell rightPane
+                        try
+                            set columns to winCols
+                        end try
+                        set name to "cld-status"
+                        write text statusCmd
+                    end tell
+
+                    delay 0.5
+
+                    -- BOTTOM-RIGHT: builder-api pane. Split rightPane
+                    -- horizontally; new pane appears below. Write text
+                    -- to it IMMEDIATELY before touching anything else.
+                    tell rightPane
+                        set bottomPane to (split horizontally with default profile)
+                    end tell
+                    tell bottomPane
+                        set name to sessionTitle
+                        write text cmd
+                    end tell
+
+                    -- Finally shrink the TOP status pane to 15 rows.
+                    delay 0.2
+                    tell rightPane
+                        try
+                            set rows to 15
+                        end try
+                    end tell
+                else
+                    -- Single-pane HEAD code path (no status pane).
+                    tell sourceSession
+                        set rightPane to (split vertically with default profile)
+                    end tell
+                    tell rightPane
                         try
                             set columns to winCols
                         end try
                         set name to sessionTitle
                         write text cmd
                     end tell
-                end tell
+                end if
+
                 try
                     set bounds to origBounds
                 end try

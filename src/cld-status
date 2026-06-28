@@ -257,10 +257,13 @@ def render(
     play: int,
     spark_width: int,
 ) -> str:
+    """Compact two-lines-per-container render — fits a ~40-col × 15-row
+    iTerm split (1 header + 2*N container lines + 1 footer = 8 lines
+    for 3 containers; up to 6 containers fits in 14)."""
     out: list[str] = []
-    out.append(f"{P}  ◆ cld status{RST}  {D}{time.strftime('%H:%M:%S')}{RST}\n")
+    out.append(f"{P}◆ cld{RST} {D}{time.strftime('%H:%M:%S')}{RST}\n")
     if not containers:
-        out.append(f"{D}    no cld containers running{RST}\n")
+        out.append(f"{D}  no cld containers running{RST}\n")
     for cid, proj, created_at in containers:
         cid_short = cid[:12]
         s = stats.get(cid_short, {"cpu": 0.0, "mem": 0.0,
@@ -269,36 +272,60 @@ def render(
         spark = sparkline(list(history.get(cid, deque())), spark_width)
         cpu = s.get("cpu", 0.0)
         mem = s.get("mem", 0.0)
-        bar = mem_bar(mem)
         rx_kb = s.get("net_rx_rate", 0.0) / 1024
         tx_kb = s.get("net_tx_rate", 0.0) / 1024
         pids = s.get("pids", 0)
         uptime = fmt_uptime(created_at)
-        ctx_bytes, sess_id = claude_ctx_size(proj)
+        ctx_bytes, _sess = claude_ctx_size(proj)
+        ctx_short = fmt_bytes(ctx_bytes) if ctx_bytes else "—"
+        # Line 1: project + sparkline + cpu% + mem%
         out.append(
-            f"  {C}{proj:<14}{RST}  "
-            f"cpu {Y}{spark}{RST} {cpu:5.1f}%  "
-            f"mem [{bar}] {mem:5.1f}%\n"
+            f"{C}{proj:<11}{RST} {Y}{spark}{RST} "
+            f"{cpu:4.0f}% {D}m{RST}{mem:4.0f}%\n"
         )
+        # Line 2: net + up + pids + ctx (all dim labels)
         out.append(
-            f"  {'':<14}  net {D}↓{RST}{rx_kb:7.1f} kB/s   "
-            f"{D}↑{RST}{tx_kb:7.1f} kB/s\n"
+            f"  {D}↓{RST}{rx_kb:4.0f} {D}↑{RST}{tx_kb:4.0f}kB/s "
+            f"{D}up{RST}{uptime:<5} {D}p{RST}{pids:<3} "
+            f"{D}ctx{RST} {ctx_short}\n"
         )
-        ctx_str = (
-            f"{fmt_bytes(ctx_bytes)} {D}({sess_id}){RST}"
-            if ctx_bytes else f"{D}— no session{RST}"
-        )
-        out.append(
-            f"  {'':<14}  {D}up{RST} {uptime:<6}  "
-            f"{D}pids{RST} {pids:3d}  "
-            f"{D}ctx{RST} {ctx_str}\n"
-        )
-    out.append("\n")
     out.append(
-        f"  {D}CHRM:{RST} {G}{chrm}{RST}   "
-        f"{D}PLAY:{RST} {G}{play}{RST}\n"
+        f"{D}chrm{RST} {G}{chrm}{RST}  {D}play{RST} {G}{play}{RST}\n"
     )
     return "".join(out)
+
+
+def resize_iterm_pane(rows: int) -> bool:
+    """Resize the iTerm pane this script is running in. No-op outside
+    iTerm. Returns True if the resize was dispatched (regardless of
+    whether iTerm accepted it)."""
+    session_id = os.environ.get("ITERM_SESSION_ID")
+    if not session_id:
+        return False
+    script = f'''
+    tell application "iTerm"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    try
+                        if id of s is "{session_id}" then
+                            set rows of s to {rows}
+                            return
+                        end if
+                    end try
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    '''
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            timeout=2, capture_output=True,
+        )
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 
 # ── main loop ─────────────────────────────────────────────────────────
@@ -308,8 +335,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     ap.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S,
                     help="poll interval in seconds (default 5)")
-    ap.add_argument("--width", type=int, default=24,
-                    help="sparkline width (default 24)")
+    ap.add_argument("--width", type=int, default=12,
+                    help="sparkline width (default 12 — tuned for the ~40-col status pane)")
     args = ap.parse_args(argv)
 
     if shutil.which("docker") is None:
@@ -319,6 +346,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Per-container history: cpu samples + previous net counters (for rates).
     cpu_history: dict[str, deque] = {}
     last_net: dict[str, dict] = {}    # cid -> {rx, tx, ts}
+    last_rows = 0                     # last iTerm pane height we set
 
     def _exit(_signum, _frame):
         sys.stdout.write(f"\n{D}cld-status: exiting{RST}\n")
@@ -361,10 +389,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             cpu_history.pop(dead, None)
             last_net.pop(dead, None)
 
-        sys.stdout.write(CLEAR + render(
+        rendered = render(
             containers, stats, cpu_history, chrm, play, args.width
-        ))
+        )
+        sys.stdout.write(CLEAR + rendered)
         sys.stdout.flush()
+
+        # Auto-resize the iTerm pane to fit what we just rendered.
+        # +1 buffer row for breathing space. No-op when not in iTerm.
+        needed_rows = rendered.count("\n") + 1
+        if needed_rows != last_rows:
+            if resize_iterm_pane(needed_rows):
+                last_rows = needed_rows
+
         time.sleep(args.interval)
 
 

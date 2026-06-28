@@ -78,6 +78,18 @@ class BuildEntry:
     # Used by `BuildQueue.cancel_current()` to signal the running process
     # group from another thread. Never serialized.
     _proc: object = field(default=None, repr=False)
+    # Byte offset into the shared build log file where THIS entry's output
+    # starts. Captured before the subprocess is launched so the log-tail
+    # render at _finalize() can be scoped to just this build instead of
+    # leaking the tail of whatever previous build wrote into the same
+    # file. 0 = read from start (used when the build never reached
+    # subprocess launch — e.g. cwd-escape rejection in _execute()).
+    log_start_offset: int = field(default=0, repr=False)
+    # Why this entry reached its terminal state. Currently surfaces only
+    # via `wait()` to disambiguate `build_timed_out` (subprocess hit its
+    # own timeout_s) from `poll_timed_out` (the long-poll wait expired).
+    # None until `_finalize()` runs.
+    finished_reason: Optional[str] = None
 
     def to_public(self, *, include_log_tail: bool = True) -> dict:
         """Serialisable view. Built explicitly rather than via asdict()
@@ -255,7 +267,7 @@ class BuildQueue:
         }
         if job_name is not None:
             event_payload["job"] = job_name
-        self._events.append("build_enqueued", event_payload)
+        self._events.append("job_enqueued", event_payload)
         return entry
 
     def _find_dedupe(self, fingerprint: str) -> Optional[BuildEntry]:
@@ -338,7 +350,7 @@ class BuildQueue:
                     entry._done.set()
                     self._history.appendleft(entry)
                     self._events.append(
-                        "build_cancelled",
+                        "job_cancelled",
                         {"id": entry.id, "agent_id": entry.agent_id},
                     )
                     return True
@@ -347,18 +359,43 @@ class BuildQueue:
     def wait(self, build_id: str, wait_s: float) -> dict:
         """
         Long-poll a build's status. Blocks up to `wait_s` or until the entry
-        reaches a terminal state, whichever comes first. Returns the public
-        dict representation with an extra `timed_out` key.
+        reaches a terminal state, whichever comes first.
+
+        Returns the public dict with three terminal-state booleans so
+        callers don't have to interpret an ambiguous `timed_out` flag:
+
+          poll_timed_out — true when the long-poll wait expired while the
+                           build was still in a non-terminal state. Says
+                           NOTHING about the build itself; just means
+                           "keep polling".
+          build_timed_out — true when the daemon killed the subprocess
+                           because it exceeded its own `timeout_s`. The
+                           build IS finished; status will be `failed`.
+          timed_out       — legacy alias for poll_timed_out. Kept so
+                           pre-2.9 clients don't break; new callers
+                           should read `poll_timed_out`.
         """
         entry = self._get(build_id)
         if entry is None:
-            return {"id": build_id, "status": "gone", "timed_out": False}
+            return {
+                "id": build_id, "status": "gone",
+                "poll_timed_out": False,
+                "build_timed_out": False,
+                "timed_out": False,
+            }
 
         if entry.status not in TERMINAL and wait_s > 0:
             entry._done.wait(timeout=min(wait_s, 60.0))
 
         out = entry.to_public()
-        out["timed_out"] = entry.status not in TERMINAL
+        poll_to = entry.status not in TERMINAL
+        build_to = (
+            entry.status == STATUS_FAILED
+            and getattr(entry, "finished_reason", None) == "timeout"
+        )
+        out["poll_timed_out"] = poll_to
+        out["build_timed_out"] = build_to
+        out["timed_out"] = poll_to            # legacy alias — DEPRECATED
         return out
 
     def snapshot(self) -> dict:
@@ -421,7 +458,7 @@ class BuildQueue:
         }
         if entry.job_name:
             started_payload["job"] = entry.job_name
-        self._events.append("build_started", started_payload)
+        self._events.append("job_started", started_payload)
 
         # Snapshot at enqueue time. We never re-resolve at execute time, so
         # a hot-reload of the host toml between enqueue and execute can't
@@ -467,6 +504,14 @@ class BuildQueue:
 
         # Open the build log for append; subprocess writes stdout+stderr there.
         self._build_log.parent.mkdir(parents=True, exist_ok=True)
+        # Snapshot the file's current size as THIS build's start offset
+        # BEFORE we write the header. Used by _finalize() to scope the
+        # log_tail to just this build's output instead of leaking the
+        # previous build's tail through the shared file.
+        try:
+            entry.log_start_offset = self._build_log.stat().st_size
+        except OSError:
+            entry.log_start_offset = 0
         log_header = (
             f"\n=== build {entry.id} agent={entry.agent_id or '?'} "
             f"args={list(entry.args)} cwd={job_cwd} "
@@ -522,6 +567,7 @@ class BuildQueue:
     ) -> None:
         entry.returncode = returncode
         entry.finished_at = time.time()
+        entry.finished_reason = reason
         # Distinguish user-cancelled (DELETE /current/cancel → SIGTERM)
         # from a genuine failure. Both have rc<0; reason="cancelled"
         # is set by _execute() only when the kill came from cancel_current.
@@ -529,7 +575,10 @@ class BuildQueue:
             entry.status = STATUS_CANCELLED
         else:
             entry.status = STATUS_DONE if returncode == 0 else STATUS_FAILED
-        entry.log_tail = _tail_text(self._build_log, LOG_TAIL_LINES)
+        entry.log_tail = _tail_text(
+            self._build_log, LOG_TAIL_LINES,
+            start_offset=entry.log_start_offset,
+        )
 
         with self._lock:
             self._history.appendleft(entry)
@@ -554,7 +603,7 @@ class BuildQueue:
             event_payload["job"] = entry.job_name
         if reason:
             event_payload["reason"] = reason
-        self._events.append("build_finished", event_payload)
+        self._events.append("job_finished", event_payload)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -649,23 +698,35 @@ def _kill_process_group(proc: subprocess.Popen, *, grace_s: Optional[int] = None
         pass
 
 
-def _tail_text(path: Path, n: int) -> str:
-    """Small dup of logs._tail_text to avoid a circular import."""
+def _tail_text(path: Path, n: int, *, start_offset: int = 0) -> str:
+    """Read the last `n` lines of `path` starting at `start_offset` bytes.
+
+    `start_offset` scopes the tail to a per-build slice of a shared log
+    file — _execute() captures the file size before launching each build,
+    and _finalize() passes that offset back here so build N+1's log_tail
+    can't leak the end of build N's output. Pass 0 (default) to read the
+    whole file (matches the original behaviour).
+
+    Small duplicate of logs._tail_text to avoid a circular import.
+    """
     if not path.exists():
         return ""
     try:
         size = path.stat().st_size
     except OSError:
         return ""
-    if size == 0:
+    if size <= start_offset:
         return ""
+    span = size - start_offset
     block = 65536
     data = bytearray()
     newlines = 0
     with path.open("rb") as f:
         pos = size
-        while pos > 0 and newlines <= n:
-            read_size = block if pos >= block else pos
+        # Read backwards but never cross the per-build start offset —
+        # everything before it belongs to a prior build's output.
+        while pos > start_offset and newlines <= n:
+            read_size = block if (pos - start_offset) >= block else (pos - start_offset)
             pos -= read_size
             f.seek(pos)
             data[:0] = f.read(read_size)
