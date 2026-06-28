@@ -1,6 +1,6 @@
 # 🐳 llm-docker
 
-![Version](https://img.shields.io/badge/Version-v2.0-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-v2.9-blue?style=for-the-badge)
 ![OpenCode](https://img.shields.io/badge/OpenCode-Supported-00A86B?style=for-the-badge&logo=openai&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Supported-D1913C?style=for-the-badge&logo=anthropic&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Isolated-2496ED?style=for-the-badge&logo=docker&logoColor=white)
