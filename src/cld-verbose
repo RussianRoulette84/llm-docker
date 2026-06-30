@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""
+cld-verbose — live API traffic console for the builder-api (3rd side pane).
+
+A scrolling, ywizz-styled console: every meaningful API call prints with its
+response, and when a build/job runs its log lines stream in underneath. Fed by
+the daemon's `/ws` WebSocket (the `http_call` + `job_*` events + `log` frames).
+
+    HH:MM:SS  🎸 → POST /job/git-status  n=5
+                 ← 200  done · rc=0
+              │ <streamed build log line>
+
+Usage:
+    cld-verbose                 — connect to host.docker.internal:6666 (env-driven)
+    NO_COLOR=1 cld-verbose      — strip ANSI
+
+Env: BUILDER_API_HOST / BUILDER_API_PORT / BUILDER_API_PASSWORD (same as client.py).
+"""
+from __future__ import annotations
+
+import os
+import re
+import signal
+import sys
+import time
+
+# Import the daemon's client + banner (palette, _classify, _event_view) the
+# same way the daemon modules find each other — by putting builder-api/ on the
+# path. cld-verbose lives in src/, the modules live in src/builder-api/.
+_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "builder-api"))
+import client          # noqa: E402
+import banner as B     # noqa: E402
+
+# cld-verbose runs on the HOST (in an iTerm pane), so the daemon is reachable at
+# 127.0.0.1 — NOT host.docker.internal (that default is the in-CONTAINER view).
+client.DEFAULT_HOST = os.environ.get("BUILDER_API_HOST") or "127.0.0.1"
+client.DEFAULT_PORT = int(os.environ.get("BUILDER_API_PORT") or client.DEFAULT_PORT or 6666)
+
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_IND = "  "   # response/body/log lines nest under the request line
+
+
+def out(s: str) -> None:
+    if NO_COLOR:
+        s = _ANSI.sub("", s)
+    sys.stdout.write(s)
+    sys.stdout.flush()
+
+
+def _status_color(status: int) -> str:
+    if status >= 500:
+        return B.RED
+    if status >= 400:
+        return B.YELLOW
+    return B.GREEN
+
+
+def _subject_family(path: str):
+    """Family (emoji + color) for a path — by job name for /job/<name>, else
+    the first path segment, so traffic colors consistently with the jobs list."""
+    if path.startswith("/job/"):
+        name = path[len("/job/"):]
+    else:
+        name = path.strip("/").split("/", 1)[0] or path
+    return name, B._classify(name)
+
+
+def render_http_call(rec: dict) -> None:
+    # Pure scrollable output: the call, then its FULL response body — no
+    # timestamps (this is a console, not an event tail).
+    method = rec.get("method", "?")
+    path = rec.get("path", "")
+    status = rec.get("status", 0)
+    query = rec.get("query") or {}
+    body = rec.get("body", "")
+    _name, (family, color) = _subject_family(path)
+    emoji = B._family_emoji(family)
+    qs = "  ".join(f"{k}={v}" for k, v in query.items())
+    out(f"{color}{emoji} → {method} {path}{B.RST}"
+        + (f"  {B.C6}{qs}{B.RST}" if qs else "") + "\n")
+    sc = _status_color(status)
+    out(f"{_IND}{sc}← {status}{B.RST}\n")
+    if body:
+        for line in body.splitlines():
+            out(f"{_IND}{B.GREY}{line}{B.RST}\n")
+    out("\n")   # blank separator between entries
+
+
+def render_event(rec: dict) -> None:
+    t = rec.get("type", "")
+    if t == "http_call":
+        render_http_call(rec)
+        return
+    if t == "server_started":
+        return  # the header already says we're up
+    subject, msg = B._event_view(rec)
+    if t.startswith("job_"):
+        family, color = B._classify(rec.get("job") or rec.get("id") or "?")
+        glyph = B._family_emoji(family)
+        mc = B._status_color(rec)
+    else:
+        color, glyph, mc = B.C6, "•", B.GREY
+    out(f"{color}{glyph} {subject}{B.RST}  {mc}{msg}{B.RST}\n")
+
+
+def render_log(alias: str, line: str) -> None:
+    out(f"{_IND}{B.GREY}│ {line}{B.RST}\n")
+
+
+def on_message(obj: dict) -> None:
+    t = obj.get("type")
+    if t == "event":
+        render_event(obj.get("record") or {})
+    elif t == "log":
+        render_log(obj.get("file", ""), obj.get("line", ""))
+    elif t == "hello":
+        aliases = ", ".join(obj.get("logs") or []) or "—"
+        out(f"{B.DIM}{B.C6}subscribed: {aliases}{B.RST}\n")
+
+
+def _discover_project() -> str:
+    try:
+        info = client.api("GET", "/")
+        if isinstance(info, dict):
+            return info.get("project") or info.get("name") or "builder-api"
+    except Exception:
+        pass
+    return os.path.basename(os.getcwd()) or "builder-api"
+
+
+def _discover_log_aliases() -> list[str]:
+    """The build/job log aliases to stream. GET /logs with no file returns the
+    available list in its 400 body; fall back to ['build']."""
+    try:
+        client.api("GET", "/logs")
+    except client.BuilderAPIError as e:
+        body = e.body if isinstance(e.body, dict) else {}
+        avail = body.get("available")
+        if avail:
+            return list(avail)
+    except Exception:
+        pass
+    return ["build"]
+
+
+def _header(project: str) -> None:
+    out(B.title_bar(f"VERBOSE · {project}", "213"))
+    lines = [
+        f"{B.C6}live api console — calls · responses · build logs{B.RST}",
+    ]
+    out(B._frame(lines, B.C7))
+
+
+def main() -> int:
+    def _exit(_s, _f):
+        out(f"\n{B.C6}cld-verbose: exiting{B.RST}\n")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, _exit)
+    signal.signal(signal.SIGTERM, _exit)
+
+    # Clear screen + scrollback on start so the pane begins clean.
+    out("\033[2J\033[3J\033[H")
+    project = _discover_project()
+    aliases = _discover_log_aliases()
+    _header(project)
+    if not client.DEFAULT_PASSWORD:
+        out(f"{B.YELLOW}⚠ BUILDER_API_PASSWORD not set — /ws auth will be refused. "
+            f"Export it in this shell to see traffic.{B.RST}\n")
+
+    # Reconnect loop: ws() returns after duration_s or on drop; we re-attach.
+    while True:
+        try:
+            client.ws(logs_aliases=aliases, duration_s=3600.0, on_message=on_message)
+            time.sleep(2.0)   # clean return (duration elapsed) → quick re-attach
+        except client.BuilderAPIError as e:
+            # Auth-refused / rate-limited: back off HARD (60s). Retrying fast
+            # just trips the daemon's auth-failure lockout (10 fails/60s → 429)
+            # and spams the pane — exactly the failure we're avoiding.
+            st = getattr(e, "status", 0)
+            if st in (401, 403):
+                out(f"{B.YELLOW}⚠ /ws auth refused — check BUILDER_API_PASSWORD (retry 60s){B.RST}\n")
+            elif st == 429:
+                out(f"{B.YELLOW}⚠ rate limited — backing off 60s{B.RST}\n")
+            else:
+                out(f"{B.YELLOW}… reconnecting ({st}){B.RST}\n")
+            time.sleep(60.0 if st in (401, 403, 429) else 5.0)
+        except Exception as e:
+            out(f"{B.YELLOW}… reconnecting ({type(e).__name__}){B.RST}\n")
+            time.sleep(5.0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
