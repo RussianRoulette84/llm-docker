@@ -406,7 +406,9 @@ if [[ "$API_CHOICE" =~ ^[Yy] ]]; then
 
     CUR_API_AUTO="$(_read_env_var BUILDER_API_AUTOSTART "$SCRIPT_DIR/llm-docker.conf")"
     AUTO_PRESET="n"
-    [[ "${CUR_API_AUTO,,}" =~ ^(true|yes|on|1)$ ]] && AUTO_PRESET="y"
+    case "$(printf '%s' "$CUR_API_AUTO" | tr '[:upper:]' '[:lower:]')" in
+        true|yes|on|1) AUTO_PRESET="y" ;;
+    esac
     ask_yes_no_tui "Auto-start Builder API on every cld/ocd launch?" "$AUTO_PRESET" API_AUTO_CHOICE 1 0
     if [[ "$API_AUTO_CHOICE" =~ ^[Yy] ]]; then
         _update_conf_var BUILDER_API_AUTOSTART "true"
