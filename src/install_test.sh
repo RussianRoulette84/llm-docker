@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # install_test.sh — post-install health check for llm-docker.
-# Requires bash 4+; macOS `/bin/bash` is 3.2, so use env to find homebrew bash.
+# Runs on macOS bash 3.2 (no homebrew bash required).
 # Spins up a throwaway container with the same mounts cld uses, probes it,
-# and prints a categorized report (base, SECURITY, RUBY, CPP, LLVM_CLANG,
-# NS, MEDIA, sandbox, sshd, net, templates, persistence, image).
+# prints a categorized report (base, SECURITY, RUBY, CPP, LLVM_CLANG, NS,
+# MEDIA, sandbox, net, templates, persistence, image), and — when SSH is
+# enabled — runs the end-to-end SSH smoke test too.
 #
 # Usage:  ./src/install_test.sh
-# Exit:   0 = all green / skipped groups OK; 1 = image missing or probe failed.
+# Exit:   0 = report rendered (missing API key / no /login token are benign
+#         first-install warnings, NOT failures); 1 = image missing or probe
+#         could not run at all.
 
 set -u
 
@@ -72,7 +75,9 @@ fi
 
 # ── Container probe ──────────────────────────────────────────────────────────
 # Heredoc: single-quoted EOF so $vars are evaluated INSIDE the container.
-PROBE=$(cat <<'PROBE_EOF'
+# Assigned via `read -d ''` (NOT `$(cat <<EOF)`) — bash 3.2 mis-parses a
+# heredoc nested in command substitution and chokes on the `case …;;` below.
+read -r -d '' PROBE <<'PROBE_EOF' || true
 set -u
 _v() {
     case "$1" in
@@ -153,7 +158,6 @@ ls /opt/llm-docker/templates/ 2>/dev/null
 echo "== image =="
 cat /IMAGE_BUILD_DATE 2>/dev/null
 PROBE_EOF
-)
 
 OUT=$(docker run --rm -i \
     -v "$HOME/.llm-docker/claude/.claude:/root/.claude" \
@@ -203,10 +207,6 @@ _header "Sandbox"
 SBOX=$(_section sandbox | head -1)
 if [ -n "$SBOX" ]; then _ok "no-new-privs" "$SBOX"; else _warn "no-new-privs" "could not read /proc"; fi
 
-# sshd — skipped in the install_test probe because this container bypasses
-# the entrypoint (no /setup-ssh.sh run). Use ./src/smoke_test.sh for the
-# real end-to-end SSH check.
-
 # Network
 _header "Network"
 NET=$(_section net | head -1)
@@ -226,4 +226,17 @@ _header "Image timestamp"
 BD=$(_section image | head -1)
 _ok "IMAGE_BUILD_DATE" "$BD"
 
+# SSH end-to-end (only when enabled) — runs the real smoke test in-line so the
+# health check is the single place that exercises SSH. Uses an auto-picked free
+# host port, so a running cld/ocd container no longer blocks it. Non-fatal: a
+# failure here is reported visually but doesn't fail the overall health check.
+SSH_ENABLED=$(_read_conf LLM_DOCKER_SSH_ENABLED)
+if [ "$SSH_ENABLED" = "true" ] && [ -f "$SCRIPT_DIR/smoke_test.sh" ]; then
+    _header "SSH (end-to-end)"
+    bash "$SCRIPT_DIR/smoke_test.sh" || _warn "ssh smoke" "see output above (non-fatal)"
+fi
+
 printf "\n${GREEN}Health check complete.${RESET}\n"
+# Benign first-install states (no API key, no /login token, a missing optional
+# devpack) are warnings, not failures — always succeed once the report renders.
+exit 0

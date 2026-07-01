@@ -70,7 +70,7 @@ Usage: $0 <project-name>
        $0 list
 
 Examples:
-  $0 purpletech      Install just the purpletech shard
+  $0 projectX        Install just the projectX shard
   $0 base            Install the base host config
   $0 all             Install base + every shard
   $0 list            Show available shards

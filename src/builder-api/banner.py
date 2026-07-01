@@ -25,11 +25,9 @@ import time
 # Pane is rendered narrower if the terminal is genuinely smaller than this.
 BOX_WIDTH = 61
 
-# Fixed visible width of the event-row prefix:
-#   "  HH:MM:SS  " (12) + "▸ " (2) + type padded to 22 (22) + "  " (2) = 38.
-# Event/access-log message text is truncated to (cols - EV_PREFIX_W - 1).
-EV_PREFIX_W = 38
-EV_TYPE_W = 22
+# Event rows are NOT column-aligned (no tabulation — the pane is narrow, every
+# cell counts): "HH:MM:SS <emoji> subject message", single-spaced, message
+# truncated to whatever width is left so the row never wraps.
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -52,34 +50,41 @@ def _visible_len(s: str) -> int:
     return len(_ANSI_RE.sub("", s))
 
 
-# 256-color palette — ywizz purple/cyan/pink + a few accent slots.
-C1 = "\033[38;5;33m"
-C2 = "\033[38;5;39m"
-C3 = "\033[38;5;45m"
-C4 = "\033[38;5;51m"
-C5 = "\033[38;5;81m"
-C6 = "\033[38;5;87m"
-C7 = "\033[38;5;141m"   # purple — primary accent (frame, header glyphs)
+# 256-color palette — mirrors lib/ywizz/theme.sh (blues → light-purple →
+# purple → pink). No gray, no dark green: the theme is purple-accent + blue.
+C1 = "\033[38;5;33m"    # blue
+C2 = "\033[38;5;39m"    # blue
+C3 = "\033[38;5;45m"    # cyan
+C4 = "\033[38;5;81m"    # light cyan
+C5 = "\033[38;5;117m"   # sky blue
+C6 = "\033[38;5;147m"   # light purple
+C7 = "\033[38;5;177m"   # purple — primary accent (frame, header glyphs)
 C8 = "\033[38;5;213m"   # pink — project name highlight
+C9 = "\033[38;5;201m"   # magenta
 ORANGE = "\033[38;5;208m"
-GREEN  = "\033[38;5;82m"
+GREEN  = "\033[38;5;82m"    # bright — reserved for success status only
 RED    = "\033[38;5;196m"
 YELLOW = "\033[38;5;220m"
-GREY   = "\033[38;5;244m"
+GREY   = "\033[38;5;103m"   # muted slate-purple — replaces gray (theme has none)
 DIM    = "\033[2m"
 BOLD   = "\033[1m"
 RST    = "\033[0m"
 
+
+def title_bar(text: str, bg: str, fg: str = "16") -> str:
+    """Full-width panel title chip: bold `fg`-on-`bg` label with the background
+    filled to the pane edge (\\033[K). bg/fg are 256-color indices (strings)."""
+    return f"\033[48;5;{bg}m\033[38;5;{fg}m{BOLD} {text} \033[K{RST}\n"
+
 # LLM stacked over DOCKER. Always rendered the same shape — narrow pane
 # is the target, but the art also looks fine when the pane is wider.
 _ASCII_LINES = [
-    " ██     ██     ██▄  ▄██",
-    " ██     ██     ██ ▀▀ ██",
-    " ██████ ██████ ██    ██",
-    " ▄▄▄▄   ▄▄▄   ▄▄▄▄ ▄▄ ▄▄ ▄▄▄▄▄ ▄▄▄▄",
-    " ██▀██ ██▀██ ██▀▀▀ ██▄█▀ ██▄▄  ██▄█▄",
-    " ████▀ ▀███▀ ▀████ ██ ██ ██▄▄▄ ██ ██",
-    "             API",
+    "╻  ╻  ┏┳┓   ╺┳┓┏━┓┏━╸╻┏ ┏━╸┏━┓",
+    "┃  ┃  ┃┃┃╺━╸ ┃┃┃ ┃┃  ┣┻┓┣╸ ┣┳┛",
+    "┗━╸┗━╸╹ ╹   ╺┻┛┗━┛┗━╸╹ ╹┗━╸╹┗╸",
+    "            ┏━┓┏━┓╻",
+    "            ┣━┫┣━┛┃",
+    "            ╹ ╹╹  ╹",
 ]
 
 
@@ -88,14 +93,14 @@ def _frame(lines, color):
     corner; bottom is dashes flowing into a right corner only (no left
     connector, by design — leaves the box visually open on the left)."""
     width = min(_term_cols(), BOX_WIDTH)
-    dashes = width - 5                       # space for "  ◆ " + "╮"
-    content_w = width - 6                    # space inside │  …  │
+    dashes = width - 3                       # "◆ " (2) + dashes + "╮" (1) = width
+    content_w = width - 3                    # "│ " (2) + content + "│" (1) = width
     out = []
-    out.append(f"  {color}◆ {'─' * dashes}╮{RST}\n")
+    out.append(f"{color}◆ {'─' * dashes}╮{RST}\n")
     for line in lines:
         pad = max(0, content_w - _visible_len(line))
-        out.append(f"  {color}│{RST}  {line}{' ' * pad}{color}│{RST}\n")
-    out.append(f"    {color}{'─' * (dashes - 0)}╯{RST}\n")
+        out.append(f"{color}│{RST} {line}{' ' * pad}{color}│{RST}\n")
+    out.append(f"{color}{'─' * (width - 1)}╯{RST}\n")
     return "".join(out)
 
 
@@ -117,7 +122,7 @@ _EXACT_FAMILY = {
     "logs":     ("verbs",  C7),
     "status":   ("verbs",  C7),
     "deploy":   ("verbs",  C7),
-    "tree":     ("util",   GREEN),
+    "tree":     ("util",   C4),
     # PHP single-word tools
     "pint":     ("php",    C8),
     "phpstan":  ("php",    C8),
@@ -148,7 +153,7 @@ _PREFIX_FAMILY = {
     "docker":   ("compose", ORANGE),
     "compose":  ("compose", ORANGE),
     "ios":      ("ios",    C8),
-    "android":  ("android", GREEN),
+    "android":  ("android", C5),
     "angular":  ("angular", RED),
     "pt":       ("e2e",    C4),
     "db":       ("db",     C2),
@@ -163,8 +168,8 @@ _PREFIX_FAMILY = {
     # green/red verdict is the visual eye-catch, not the family color.
     "e2e":      ("e2e",     ORANGE),
     "playwright": ("e2e",   ORANGE),
-    "smoke":    ("test",    GREEN),
-    "test":     ("test",    GREEN),
+    "smoke":    ("test",    C4),
+    "test":     ("test",    C4),
     # Database family — cool blue/cyan, distinct from `db-*` (C2).
     "pg":       ("pg",      C1),
     "mysql":    ("mysql",   C1),
@@ -219,14 +224,14 @@ def _render_jobs(names, cols: int) -> str:
 
     label_w = max((len(f) for f in order), default=4)
     label_w = max(label_w, 6)
-    indent = "    "
+    indent = ""
     sep = "  "
     avail = max(40, cols) - len(indent) - label_w - 2
 
-    out = [f"  {DIM}jobs{RST}\n"]
+    out = []
     for fam in order:
         col = colors[fam]
-        label = f"{col}▸ {fam:<{label_w}}{RST}"
+        label = f"{col}{_family_emoji(fam)} {fam:<{label_w}}{RST}"
         line = ""
         width_used = 0
         for j in groups[fam]:
@@ -253,28 +258,32 @@ def show_banner(name: str, bind: str, port: int, jobs_names) -> None:
     Jobs flow to the actual terminal width below the box."""
     if isinstance(jobs_names, int):
         names: list[str] = []
-        jobs_count = jobs_names
     else:
         names = list(jobs_names)
-        jobs_count = len(names)
 
     cols = _term_cols()
 
+    # Center the ASCII block on the current pane width (recomputed every
+    # render / WINCH resize). Pad each line by the same amount so the art's
+    # internal alignment (the "API" under "DOCKER") is preserved.
     palette = [C1, C2, C3, C5, C6, C7]
+    block_w = max((len(ln) for ln in _ASCII_LINES), default=0)
+    pad = " " * max(0, (cols - block_w) // 2)
     art = []
     for i, line in enumerate(_ASCII_LINES):
         c = palette[min(i, len(palette) - 1)]
-        art.append(f"  {c}{line}{RST}\n")
+        art.append(f"{pad}{c}{line}{RST}\n")
 
     proj = f"{C8}{BOLD}{name}{RST}"
     listen = f"{C5}{bind}:{port}{RST}"
-    jobs = f"{DIM}jobs{RST} {C7}{jobs_count}{RST}"
     status = [
-        f"{C7}■{RST} {proj}  {DIM}·{RST}  {listen}",
-        f"{jobs}  {DIM}·  events live below{RST}",
+        f"{C7}■{RST} {proj} {C6}·{RST} {listen}",
     ]
 
-    sys.stderr.write("\n" + "".join(art) + "\n" + _frame(status, C7))
+    sys.stderr.write(
+        title_bar(f"BUILDER-API · {name}", "177")
+        + "\n" + "".join(art) + "\n" + _frame(status, C7)
+    )
 
     if names:
         sys.stderr.write(_render_jobs(names, cols))
@@ -283,36 +292,63 @@ def show_banner(name: str, bind: str, port: int, jobs_names) -> None:
 
 # ── event tail ─────────────────────────────────────────────────────────
 
-# event_type → (color, glyph). Unmapped types fall through to (GREY, "·").
-_EVENT_STYLE: dict[str, tuple[str, str]] = {
-    "server_started":           (C7,     "▲"),
-    "config_reloaded":          (C7,     "↻"),
-    "job_enqueued":             (C5,     "+"),
-    "job_started":              (ORANGE, "▸"),
-    "job_finished":             (GREEN,  "✓"),  # → RED below if failed
-    "job_cancelled":            (YELLOW, "⊘"),
-    "runtime_started":          (ORANGE, "▶"),
-    "runtime_stopped":          (YELLOW, "■"),
-    "runtime_exited":           (RED,    "▣"),
-    "auth_failure_lockout":     (RED,    "✗"),
+# Event styling. JOB rows take their emoji + name-color from the job's
+# FAMILY (_classify) so the tail scans by category at a glance; the outcome
+# text is tinted by STATUS (done=green/failed=red) independently. System
+# rows get their own emoji here.
+_FAMILY_EMOJI = {
+    "verbs": "⚙️",  "util": "🧰",   "git": "🎸",     "python": "🐍",
+    "django": "🕸️", "php": "🐘",    "node": "🟢",    "angular": "🅰️",
+    "ios": "🍎",    "android": "🤖", "xcode": "🔨",   "compose": "🐳",
+    "db": "🫙",     "pg": "🗄️",     "mysql": "🐬",   "redis": "🪫",
+    "test": "🧪",   "e2e": "🎭",    "lint": "🥛",    "format": "🧹",
+    "build": "🏗️",  "preview": "🔥", "deploy": "🚀",  "lounge": "🛋️",
+    "livekit": "🎥", "api": "🔌",    "sa": "🧩",
 }
+_FAMILY_EMOJI_DEFAULT = "📦"
+
+_SYS_STYLE = {  # system event type → (color, emoji)
+    "server_started":       (GREEN,  "🟢"),
+    "config_reloaded":      (C7,     "♻️"),
+    "auth_failure_lockout": (RED,    "🚫"),
+    "runtime_started":      (ORANGE, "▶️"),
+    "runtime_stopped":      (YELLOW, "⏹️"),
+    "runtime_exited":       (RED,    "🟥"),
+}
+_LOG_EMOJI = {"error": "‼️", "warning": "⚠️", "warn": "⚠️", "info": "ℹ️", "debug": "🔍"}
 
 
-def format_event_row(hms: str, color: str, glyph: str, typ: str, msg: str) -> str:
-    """Canonical event-tail row. Always ONE line:
-        "  HH:MM:SS  ▸ type<EV_TYPE_W>  message"
-    Message is truncated to fit (cols - EV_PREFIX_W - 1) so the row never
-    spills onto a second line, regardless of pane width. Shared by
-    `event_line()` and the HTTP access-log handler so events + access logs
-    align column-for-column."""
+def _family_emoji(family: str) -> str:
+    return _FAMILY_EMOJI.get(family, _FAMILY_EMOJI_DEFAULT)
+
+
+def _status_color(rec: dict) -> str:
+    t = rec.get("type")
+    if t == "job_finished":
+        return GREEN if rec.get("status") == "done" else RED
+    if t == "job_cancelled":
+        return YELLOW
+    if t == "job_started":
+        return ORANGE
+    return GREY
+
+
+def format_event_row(hms: str, color: str, glyph: str, typ: str, msg: str,
+                      msg_color: str = "") -> str:
+    """Canonical event-tail row, ONE line, NOT column-aligned:
+        "HH:MM:SS <emoji> subject message"
+    `color` tints the glyph + subject (the job's family color); `msg_color`
+    tints the outcome, defaulting to grey. The message is truncated to whatever
+    space is left after the (variable-width) prefix so the row never wraps."""
     cols = _term_cols()
-    avail = max(20, cols - EV_PREFIX_W - 1)
+    # Visible prefix = time(8) + " " + emoji(2 cells) + " " + subject + " ".
+    prefix_vis = len(hms) + 1 + 2 + 1 + len(typ) + 1
+    avail = max(8, cols - prefix_vis - 1)
     if len(msg) > avail:
         msg = msg[: max(0, avail - 1)] + "…"
-    short_typ = (typ if len(typ) <= EV_TYPE_W else typ[: EV_TYPE_W - 1] + "…")
     return (
-        f"  {DIM}{hms}{RST}  {color}{glyph} "
-        f"{short_typ:<{EV_TYPE_W}}{RST}  {GREY}{msg}{RST}\n"
+        f"{GREY}{hms}{RST} {color}{glyph} {typ}{RST} "
+        f"{msg_color or GREY}{msg}{RST}\n"
     )
 
 
@@ -320,69 +356,72 @@ def event_line(record: dict) -> None:
     """EventStore subscriber. Always single-line; message gets truncated
     rather than wrapped so the tail stays scannable."""
     typ = record.get("type", "?")
-    color, glyph = _EVENT_STYLE.get(typ, (GREY, "·"))
-    if typ == "job_finished" and record.get("status") != "done":
-        color, glyph = RED, "✗"
+    # http_call is per-request traffic for the verbose console (cld-verbose),
+    # NOT the api pane's state tail — skip it here or the tail floods.
+    if typ == "http_call":
+        return
     ts = record.get("ts", time.time())
     try:
         hms = time.strftime("%H:%M:%S", time.localtime(float(ts)))
     except (TypeError, ValueError):
         hms = "--:--:--"
-    sys.stderr.write(format_event_row(hms, color, glyph, typ, _summarize(record)))
+    subject, msg = _event_view(record)
+    if typ.startswith("job_"):
+        # Emoji + name-color from the job's family; outcome tinted by status.
+        family, color = _classify(record.get("job") or record.get("id") or "?")
+        glyph = _family_emoji(family)
+        msg_color = _status_color(record)
+    elif typ.endswith("_log"):
+        lvl = (record.get("level") or "info").lower()
+        glyph = _LOG_EMOJI.get(lvl, "•")
+        color = RED if lvl == "error" else YELLOW if lvl.startswith("warn") else GREY
+        msg_color = color
+    else:
+        color, glyph = _SYS_STYLE.get(typ, (GREY, "•"))
+        msg_color = GREY
+    sys.stderr.write(format_event_row(hms, color, glyph, subject, msg, msg_color))
     sys.stderr.flush()
 
 
-def _build_summary(rec: dict) -> str:
-    """Short one-liner for build_* events. Show id + job + the trailing
-    placeholder VALUE (almost always the last argv element — e.g.
-    `--filter DashCacheTest` → `DashCacheTest`). Never dumps the full
-    resolved argv: that's what `/events` is for."""
-    bits = [f"id={rec.get('id')}"]
-    job = rec.get("job")
-    if job:
-        bits.append(f"job={job}")
-    args = rec.get("args") or []
-    for a in reversed(args):
+def _trailing_value(rec: dict) -> str:
+    """The meaningful placeholder value — almost always the last non-flag
+    argv element (`--filter DashCacheTest` → `DashCacheTest`, `-n 5` → `5`).
+    What the operator scans for; the full argv is what `/events` is for."""
+    for a in reversed(rec.get("args") or []):
         if isinstance(a, str) and a and not a.startswith("-"):
-            bits.append(a)
-            break
-    return "  ".join(bits)
-
-
-def _summarize(rec: dict) -> str:
-    """One-liner per event type. Output is bounded — format_event_row
-    truncates anyway, but we still keep messages tight here so the
-    truncated suffix carries actual information rather than ellipsis."""
-    t = rec.get("type")
-    if t in ("job_enqueued", "job_started"):
-        return _build_summary(rec)
-    if t == "job_finished":
-        bits = [f"id={rec.get('id')}"]
-        job = rec.get("job")
-        if job:
-            bits.append(f"job={job}")
-        bits.append(f"rc={rec.get('returncode')}")
-        bits.append(f"{rec.get('elapsed_s')}s")
-        status = rec.get("status")
-        if status and status != "done":
-            bits.append(status)
-        reason = rec.get("reason")
-        if reason:
-            bits.append(f"({reason})")
-        return "  ".join(bits)
-    if t == "job_cancelled":
-        return f"id={rec.get('id')}"
-    if t == "config_reloaded":
-        return (
-            f"jobs={len(rec.get('jobs', []))}  "
-            f"aliases={len(rec.get('log_aliases', []))}"
-        )
-    if t == "server_started":
-        return f"{rec.get('bind')}:{rec.get('port')}  auth_reads={rec.get('auth_reads')}"
-    if t == "auth_failure_lockout":
-        return f"ip={rec.get('ip')}  for={rec.get('seconds')}s"
-    if t and t.endswith("_log"):
-        lvl = rec.get("level", "?")
-        msg = (rec.get("message") or "")[:80]
-        return f"{lvl}  {msg}"
+            return a
     return ""
+
+
+def _event_view(rec: dict) -> tuple[str, str]:
+    """(subject, message) for the event tail. SUBJECT is what the row is
+    about — the job name for job events, a short label for system events —
+    and goes in the prominent fixed column (NOT the redundant event type).
+    MESSAGE is the plain-English outcome a human scans for. No id=/rc=/job=
+    noise; `/events` carries the structured detail."""
+    t = rec.get("type")
+    job = rec.get("job") or rec.get("id") or "?"
+    val = _trailing_value(rec)
+    if t == "job_enqueued":
+        return job, "queued" + (f"·{val}" if val else "")
+    if t == "job_started":
+        return job, "running" + (f"·{val}" if val else "")
+    if t == "job_finished":
+        el = rec.get("elapsed_s")
+        if rec.get("status") == "done":
+            return job, f"done·{el}s"
+        bits = [rec.get("status") or "failed", f"rc={rec.get('returncode')}", f"{el}s"]
+        if rec.get("reason"):
+            bits.append(str(rec.get("reason")))
+        return job, "·".join(bits)
+    if t == "job_cancelled":
+        return job, "cancelled"
+    if t == "config_reloaded":
+        return "config", f"reloaded·{len(rec.get('jobs', []))} jobs"
+    if t == "server_started":
+        return "server", f"{rec.get('bind')}:{rec.get('port')}"
+    if t == "auth_failure_lockout":
+        return "lockout", f"{rec.get('ip')}·locked {rec.get('lockout_s')}s"
+    if t and t.endswith("_log"):
+        return rec.get("level", "log"), (rec.get("message") or "")[:80]
+    return t or "?", ""

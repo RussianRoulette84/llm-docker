@@ -245,6 +245,7 @@ Config splits across two files in `src/`. Secrets live in `.env` (gitignored); e
 | ------------------------------- | ----------------------------------------------------------------------- | ------------------------- |
 | `DOCKER_DIR`                    | Container-side parent for every bind-mount                              | `/root/Projects`          |
 | `WORKSPACE_DIR`                 | Host dir for persistent "all projects" mirror. Empty = disabled         | -                         |
+| `IS_S3C_GORILLA_ENABLED`        | `true` → cld/ocd inject secrets from the KeePassXC `llm-docker` vault via env-gorilla; `.env` becomes an optional fallback. Underscores only. | `false` |
 | `SANDBOX_ENABLED`               | Drop all caps + `no-new-privileges`. Disable for `gdb`/`ptrace`         | `true`                    |
 | `INTERNET_ACCESS`               | `false` → iptables blocks outbound internet, LAN still works            | `true`                    |
 | `NODE_ENV`                      | `production` / `development` — dev flips verbose logging in entrypoint  | `production`              |

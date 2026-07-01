@@ -169,6 +169,6 @@ run_with_progress_bar() {
     # Expose how many log lines were printed so callers can keep header_tui_collapse line math correct.
     # (If INSTALL_DEBUG is unset, we print no command output and this stays 0.)
     RUN_WITH_PROGRESS_BAR_LINES="$_printed_lines"
-    rm -f "$_out_file" "$_rc_file"
+    /bin/rm -f "$_out_file" "$_rc_file"
     return $_rc
 }

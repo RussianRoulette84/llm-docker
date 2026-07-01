@@ -2,133 +2,44 @@
 
 set -e
 
-# --- env-gorilla integration: inject KeePassXC-backed secrets before launch.
-# Loads the `llm-docker` profile (cage-wide keys) AND, if the CWD's basename
-# is a different name, that project's profile too — both merged into a single
-# chip-blob by env-gorilla v0.12+ so one Touch ID covers everything. A missing
-# project profile in kdbx is a non-fatal warning, not an error.
+# env-gorilla secret injection before launch (sourced; may re-exec the launcher
+# through env-gorilla). Needs $_self_dir because setup.sh isn't sourced yet.
 _self_dir="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
+source "$_self_dir/setup/preflight.sh"
 
-# --refresh-env: wipe env-gorilla's cached chip-blob before re-exec, so
-# newly-added KeePassXC entries propagate. Strip the flag from $@ either
-# way so downstream arg parsing doesn't see it.
-_refresh_env=false
-_new_args=()
-for _a in "$@"; do
-    case "$_a" in
-        --refresh-env) _refresh_env=true ;;
-        *) _new_args+=("$_a") ;;
-    esac
-done
-set -- "${_new_args[@]}"
-unset _new_args _a
-
-if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
-   && command -v env-gorilla >/dev/null 2>&1 \
-   && { [ "${USER:-}" = "yaro" ] || [ ! -f "$_self_dir/.env" ]; }; then
-    _proj_dir=""
-    for _a in "$@"; do
-        case "$_a" in
-            -*) ;;
-            *) [ -d "$_a" ] && { _proj_dir="$(realpath "$_a")"; break; } ;;
-        esac
-    done
-    [ -z "$_proj_dir" ] && _proj_dir="$(pwd)"
-    _proj_name="$(basename "$_proj_dir")"
-    unset _proj_dir _a
-
-    if [ -n "$_proj_name" ] && [ "$_proj_name" != "llm-docker" ]; then
-        _profiles="llm-docker,$_proj_name"
-    else
-        _profiles="llm-docker"
-    fi
-    if [ "$_refresh_env" = true ]; then
-        env-gorilla --clear "$_profiles" >/dev/null 2>&1 || true
-    fi
-    export LLM_DOCKER_ENV_GORILLA=1
-    exec env-gorilla "$_profiles" -- "$0" "$@"
-fi
-unset _self_dir _proj_name _profiles _refresh_env
-
-SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
+SCRIPT_DIR="$_self_dir"
+unset _self_dir
 
 source "$SCRIPT_DIR/setup.sh"
 
-# Serialize Docker Desktop launches across parallel cld sessions. Without this
-# lock, N terminals all firing `open -a Docker` simultaneously deliver stray
-# NSEvents into a Docker Desktop that's already mid-launch — Docker Desktop
-# crashes with "NSInternalInconsistencyException: Unrecognized event type 0"
-# on macOS Sequoia 15.6+ (and likely earlier). flock(1) on /tmp ensures only
-# the first cld actually launches Docker; the rest wait, then no-op when they
-# re-check inside the critical section.
-if ! docker info > /dev/null 2>&1; then
-    _cld_have_flock=true
-    if ! command -v flock > /dev/null 2>&1; then
-        _cld_have_flock=false
-        _log CLD WARNING "flock not found — running without launch-race protection. Install with: brew install flock"
-    fi
+# run_claude_container is tool-specific — kept in cld.run.sh, sourced here.
+[ -f "$SCRIPT_DIR/cld.run.sh" ] || { echo "cld: missing cld.run.sh — broken install?" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$SCRIPT_DIR/cld.run.sh"
 
-    if $_cld_have_flock; then
-        exec 9> "/tmp/cld-docker-start.lock"
-        if ! flock -n 9; then
-            _log CLD "Another cld is starting Docker — waiting..."
-            flock 9
+# Duplicate-memory merge tool (folder-name keying). Sourced best-effort.
+# shellcheck disable=SC1090
+[ -f "$SCRIPT_DIR/memory/memory.sh" ] && source "$SCRIPT_DIR/memory/memory.sh"
+
+# Host-side memory commands run WITHOUT a container — handle them before the
+# docker check / image build so `cld --merge-memory` is instant.
+case " $* " in
+    *" --merge-memory "*|*" --dry-run-merge "*|*" --restore-memory "*)
+        WORKSPACE_DIR=""; DOCKER_DIR=""
+        if [ -f "$SCRIPT_DIR/llm-docker.conf" ]; then
+            _w="$(_read_env_var WORKSPACE_DIR "$SCRIPT_DIR/llm-docker.conf")"; [ -n "$_w" ] && WORKSPACE_DIR="${_w/#\~/$HOME}"
+            _d="$(_read_env_var DOCKER_DIR "$SCRIPT_DIR/llm-docker.conf")"; [ -n "$_d" ] && DOCKER_DIR="$_d"
         fi
-    fi
+        : "${DOCKER_DIR:=/root}"; export WORKSPACE_DIR DOCKER_DIR
+        for _a in "$@"; do case "$_a" in
+            --merge-memory)   _memory_merge_manual manual; exit 0 ;;
+            --dry-run-merge)  _memory_merge_manual dry;    exit 0 ;;
+            --restore-memory) _mem_restore;                exit 0 ;;
+        esac; done ;;
+esac
 
-    # Re-check inside the lock: an earlier holder may have already started Docker.
-    if ! docker info > /dev/null 2>&1; then
-        _log CLD WARNING "Docker is not running — starting Docker Desktop..."
-
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            # `open -a Docker` relies on LaunchServices. If Docker.app lives in
-            # a subfolder (e.g. /Applications/Utilities/) or LS's index is
-            # stale, it silently fails — we'd then wait 60s for `docker info`
-            # that never comes. Fall back to an absolute-path launch.
-            if ! open -a Docker 2>/dev/null; then
-                _docker_app=""
-                if command -v mdfind >/dev/null 2>&1; then
-                    _docker_app="$(mdfind -name 'Docker.app' 2>/dev/null \
-                        | grep -E '/Docker\.app$' | head -1)"
-                fi
-                if [ -z "$_docker_app" ]; then
-                    _docker_app="$(find /Applications -maxdepth 4 \
-                        -name 'Docker.app' -type d 2>/dev/null | head -1)"
-                fi
-                if [ -n "$_docker_app" ]; then
-                    _log CLD "Found Docker at $_docker_app — launching..."
-                    open "$_docker_app"
-                else
-                    _log CLD ERROR "Could not find Docker.app under /Applications. Install Docker Desktop or move it into /Applications."
-                    exit 1
-                fi
-                unset _docker_app
-            fi
-        else
-            _log CLD ERROR "Please start Docker manually on your system"
-            exit 1
-        fi
-
-        _log CLD "Waiting for Docker to start (this may take a minute)..."
-        max_wait=60
-        waited=0
-        until docker info > /dev/null 2>&1; do
-            if [ $waited -ge $max_wait ]; then
-                _log CLD ERROR "Docker did not start within $max_wait seconds"
-                exit 1
-            fi
-            echo -n "."
-            sleep 2
-            waited=$((waited + 2))
-        done
-        _log CLD "Docker is ready!"
-    fi
-
-    if $_cld_have_flock; then
-        exec 9>&-
-    fi
-    unset _cld_have_flock
-fi
+# Ensure Docker is running (shared helper — see setup/docker.sh).
+_ensure_docker_running CLD
 
 # Quick pre-scan for the two rebuild flags:
 #   --build         smart rebuild: re-runs install scripts inside the existing
@@ -161,16 +72,7 @@ unset _arg
 # pick them up. Otherwise prompt before rebuilding.
 _tmux_flip_kvs=""
 _tmux_flip_labels=""
-_register_tmux_flip() {
-    local flag="$1" label="$2"
-    local cur
-    cur="$(_read_env_var "$flag" "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
-    [ "$cur" = "true" ] && return 0
-    case " $_tmux_flip_kvs " in *" ${flag}=true "*) return 0 ;; esac
-    _tmux_flip_kvs+="${flag}=true "
-    [ -n "$_tmux_flip_labels" ] && _tmux_flip_labels+=", "
-    _tmux_flip_labels+="$label"
-}
+# _register_tmux_flip lives in setup.sh (shared with ocd).
 for _arg in "$@"; do
     case "$_arg" in
         -t|--tmux)          _register_tmux_flip INSTALL_TMUX_VANILLA "-t (vanilla tmux)" ;;
@@ -556,163 +458,9 @@ _spin() {
     done
 }
 
-_status() { printf "  ${C1}%s${RST} %s\n" "$1" "$2"; }
 
-# Background the daemon with a log file. Used by the `-ab` path and as
-# the final macOS fallback when no terminal app cooperates.
-_spawn_api_bg() {
-    local launcher="$1" project_dir="$2"
-    local log="/tmp/builder-api-$$.log"
-    nohup bash "$launcher" "$project_dir" >"$log" 2>&1 &
-    local pid=$!
-    disown "$pid" 2>/dev/null || true
-    _log CLD "builder-api in background — PID $pid  ·  log: ${C2}$log${RST}"
-}
+# _spawn_api_bg + _write_secret_handoff live in setup.sh (shared with ocd).
 
-# _write_secret_handoff — when `-a` opens a new iTerm/Terminal window,
-# that fresh shell does NOT inherit our env, so run-local.sh's
-# "BUILDER_API_PASSWORD already loaded" sentinel misses and env-gorilla
-# runs again (= extra Touch ID). Instead we dump our forwarding-eligible
-# env to a short-lived file under /tmp/s3c-gorilla/ (mode 0600, owner-
-# only, same dir as the chip-blobs). The spawned window sources it and
-# immediately deletes it. ~1 second on disk.
-# Echoes the file path on stdout, or empty if nothing was written.
-_write_secret_handoff() {
-    local dir="/tmp/s3c-gorilla"
-    mkdir -p "$dir" 2>/dev/null || return 0
-    chmod 700 "$dir" 2>/dev/null
-    local f
-    f=$(mktemp "$dir/handoff-XXXXXXXX" 2>/dev/null) || return 0
-    chmod 600 "$f"
-    local _block='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
-    local n=0 k v
-    while IFS='=' read -r k v; do
-        [ -z "$k" ] && continue
-        [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-        [[ "$k" =~ $_block ]] && continue
-        printf 'export %s=%q\n' "$k" "$v" >>"$f"
-        n=$((n+1))
-    done < <(env)
-    if [ "$n" -eq 0 ]; then
-        rm -f "$f"
-        return 0
-    fi
-    echo "$f"
-}
-
-# _maybe_start_api — spawn the builder-api server if --api / -a was passed
-# AND one isn't already on the configured port. macOS spawn chain:
-# AppleScript (positioned) → `open -a iTerm <.command>` (unpositioned) →
-# `open -a Terminal` → background-with-log. `-ab` skips straight to last.
-_maybe_start_api() {
-    [ "$START_API" = true ] || return 0
-
-    local project_dir="$1"
-    local project_name
-    project_name="$(basename "$project_dir")"
-    local port
-    # Port precedence (v3.0): per-project shard
-    # ~/.llm-docker/projects/<name>.toml → base ~/.llm-docker/builder-api.toml
-    # → llm-docker.conf → default 6666. The project block moved to per-project
-    # shards in v3.0; the base only holds defaults, globals, language packs,
-    # and verb declarations. Per-project .builder-api.toml files INSIDE the
-    # project tree are still NOT read (security: jobs/commands must be host-
-    # defined; nothing inside a container-writable path is trusted).
-    local host_shard="${HOME}/.llm-docker/api_config/${project_name}.toml"
-    local host_base="${HOME}/.llm-docker/api_config/builder-api.toml"
-    local _f
-    for _f in "$host_shard" "$host_base"; do
-        [ -f "$_f" ] || continue
-        port=$(awk -v p="project.$project_name" '
-            $0 ~ "^\\[" p "\\]" { in_block=1; next }
-            in_block && /^\[/ { in_block=0 }
-            in_block && /^[[:space:]]*port[[:space:]]*=/ {
-                gsub(/^[[:space:]]*port[[:space:]]*=[[:space:]]*/, "")
-                gsub(/[^0-9].*$/, "")
-                print; exit
-            }
-        ' "$_f")
-        [ -n "${port:-}" ] && break
-    done
-    unset _f
-    if [ -z "${port:-}" ]; then
-        port="$(_read_env_var BUILDER_API_PORT "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
-    fi
-    port="${port:-6666}"
-
-    local launcher="$SCRIPT_DIR/builder-api/run-local.sh"
-    if [ ! -f "$launcher" ]; then
-        echo "[cld] warning: $launcher not found; skipping --api spawn" >&2
-        return 0
-    fi
-
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        if [ "$START_API_BG" = true ]; then
-            _spawn_api_bg "$launcher" "$project_dir"
-            return 0
-        fi
-
-        # Hand our already-unwrapped secrets to the new Terminal window
-        # via a short-lived file, so run-local.sh's sentinel skips its
-        # own env-gorilla call (= no extra Touch ID).
-        local handoff
-        handoff="$(_write_secret_handoff)"
-
-        # When the cld-status dashboard exists, spawn it alongside the
-        # builder-api panel in a second new pane (horizontal split off
-        # the source). Empty string skips it.
-        local status_cmd=""
-        if [ -x "$SCRIPT_DIR/cld-status" ]; then
-            status_cmd="exec $SCRIPT_DIR/cld-status"
-        fi
-
-        # 1a) Already inside iTerm? Split the current window left/right.
-        # The AppleScript handles its own reuse (existing pane found by
-        # daemon tty or pane title) and orphan-daemon cleanup before
-        # spawning a fresh pane.
-        if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
-            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" "$status_cmd" >/dev/null 2>&1; then
-                _status "api" "builder-api split into right pane (port $port)"
-                return 0
-            fi
-        fi
-
-        # 1b) Not in iTerm, or split denied: positioned new window.
-        if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" new-window "$port" "$handoff" "$status_cmd" >/dev/null 2>&1; then
-            _status "api" "builder-api spawned in positioned iTerm window (port $port)"
-            return 0
-        fi
-
-        # 2) AppleScript denied (macOS TCC). Open a .command file via
-        # LaunchServices instead — no AppleEvents permission needed,
-        # but loses window positioning.
-        local cmd_file
-        cmd_file=$(mktemp -t builder-api.XXXXXX).command
-        cat >"$cmd_file" <<EOF
-#!/bin/bash
-cd "$project_dir"
-exec bash "$launcher" "$project_dir" "$handoff"
-EOF
-        chmod +x "$cmd_file"
-        if [ -d "/Applications/iTerm.app" ] && open -a iTerm "$cmd_file" 2>/dev/null; then
-            _log CLD WARNING "AppleScript blocked by macOS — opened iTerm without positioning. Enable iTerm in Settings → Privacy → Automation to restore."
-            return 0
-        fi
-        if open -a Terminal "$cmd_file" 2>/dev/null; then
-            _log CLD WARNING "Opened Terminal.app instead of iTerm."
-            return 0
-        fi
-
-        # 3) No terminal cooperated — background it.
-        _log CLD WARNING "No terminal app available. Backgrounding."
-        _spawn_api_bg "$launcher" "$project_dir"
-    else
-        # Linux/other: no universal terminal, so background it.
-        local log="/tmp/builder-api-$$.log"
-        nohup bash "$launcher" "$project_dir" > "$log" 2>&1 &
-        _status "api" "builder-api started in background (pid $!, log: $log)"
-    fi
-}
 
 # If --slot is set, try to restore saved session. Predict DOCKER_WORKDIR
 # (same logic as run_claude_container below) so we can find Claude's
@@ -724,38 +472,23 @@ CLAUDE_HOME="$HOME/.llm-docker/claude"
 # from the same terminal where a session started resumes THAT session,
 # not whichever session was used most recently across all terminals.
 _TERM_SESSIONS_FILE="$CLAUDE_HOME/.claude/terminal-sessions.tsv"
+# _terminal_id + _lookup_terminal_session live in setup.sh (shared with ocd).
 
-_terminal_id() {
-    if [ -n "${ITERM_SESSION_ID:-}" ]; then
-        printf '%s' "$ITERM_SESSION_ID"
-    elif [ -n "${TMUX_PANE:-}" ]; then
-        printf 'tmux:%s' "$TMUX_PANE"
-    else
-        tty 2>/dev/null || printf 'unknown'
-    fi
-}
-
-# Compute claude's per-project session directory for a given host workdir.
+# Compute claude's per-project session dir for a host workdir, using the SAME
+# stable-token logic as _compute_workspace_mounts so the path matches the
+# container workdir (and survives WORKSPACE_DIR changes).
 _claude_session_dir() {
-    local workdir="$1"
-    local docker_wd
-    if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$workdir" == "$WORKSPACE_DIR"* ]]; then
-        local rel="${workdir#$WORKSPACE_DIR}"
-        rel="${rel#/}"
+    local workdir="$1" root token rel docker_wd
+    root="$(_project_root "$workdir" "$WORKSPACE_DIR")"
+    if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [ "$root" = "$WORKSPACE_DIR" ]; then
+        rel="${workdir#$WORKSPACE_DIR}"; rel="${rel#/}"
         docker_wd="${DOCKER_WORKSPACE_TARGET}${rel:+/$rel}"
     else
-        docker_wd="$DOCKER_DIR/$(basename "$workdir")"
+        token="$(_project_token "$root")"
+        rel="${workdir#$root}"; rel="${rel#/}"
+        docker_wd="$DOCKER_DIR/$token${rel:+/$rel}"
     fi
-    local dpath="${docker_wd#/}"
-    dpath="${dpath//\//-}"
-    printf '%s/.claude/projects/-%s' "$CLAUDE_HOME" "$dpath"
-}
-
-# Look up the saved session UUID for (terminal_id, project_path).
-_lookup_terminal_session() {
-    local tid="$1" proj="$2"
-    [ -f "$_TERM_SESSIONS_FILE" ] || return 0
-    awk -F'\t' -v t="$tid" -v p="$proj" '$1==t && $2==p {u=$3} END{if(u) print u}' "$_TERM_SESSIONS_FILE"
+    _dashed_session_dir "$CLAUDE_HOME" "$docker_wd"
 }
 
 # Find the newest jsonl in `sess_dir` and save its UUID for (terminal, project).
@@ -780,16 +513,7 @@ if [ -n "$SLOT" ]; then
     SLOT_FILE="$CLAUDE_HOME/.claude/slot_${SLOT}.id"
     if [ -f "$SLOT_FILE" ] && [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" = true ]; then
         SAVED_ID=$(cat "$SLOT_FILE")
-        if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$CURRENT_DIR" == "$WORKSPACE_DIR"* ]]; then
-            REL_CHECK="${CURRENT_DIR#$WORKSPACE_DIR}"
-            REL_CHECK="${REL_CHECK#/}"
-            DOCKER_WD_PREDICT="${DOCKER_WORKSPACE_TARGET}${REL_CHECK:+/$REL_CHECK}"
-        else
-            DOCKER_WD_PREDICT="$DOCKER_DIR/$(basename "$CURRENT_DIR")"
-        fi
-        DOCKER_PATH_CHECK="${DOCKER_WD_PREDICT#/}"
-        DOCKER_PATH_CHECK="${DOCKER_PATH_CHECK//\//-}"
-        SESSION_DIR="$CLAUDE_HOME/.claude/projects/-$DOCKER_PATH_CHECK"
+        SESSION_DIR="$(_claude_session_dir "$CURRENT_DIR")"
         if [ -f "$SESSION_DIR/$SAVED_ID.jsonl" ]; then
             RESUME_SESSION="$SAVED_ID"
         fi
@@ -801,7 +525,7 @@ fi
 # project, resume that specific session — not "most recent in project".
 if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ]; then
     _TS_TID=$(_terminal_id)
-    _TS_SAVED=$(_lookup_terminal_session "$_TS_TID" "$CURRENT_DIR")
+    _TS_SAVED=$(_lookup_terminal_session "$_TS_TID" "$(_project_key "$CURRENT_DIR")")
     if [ -n "$_TS_SAVED" ]; then
         _TS_SDIR=$(_claude_session_dir "$CURRENT_DIR")
         if [ -f "$_TS_SDIR/$_TS_SAVED.jsonl" ]; then
@@ -812,271 +536,6 @@ if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ];
 fi
 
 # Function to run a single Claude container
-run_claude_container() {
-    local WORKDIR="$1"
-    shift
-    cd "$SCRIPT_DIR"
-
-    _tmux_nested_prompt
-
-    CONTAINER_NAME="claude-$$"
-
-    _iterm_tag "Claude" "$WORKDIR"
-
-    # Cleanup on exit: kill watchdog, stop container
-    cleanup_container() {
-        [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
-        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-        _iterm_untag
-    }
-    trap cleanup_container EXIT INT TERM HUP
-
-    # Build claude flags + optional initial-prompt positional.
-    # Positional prompt (claude "query") starts interactive + sends it as the
-    # first user message, so Claude responds immediately. --append-system-prompt
-    # only modifies behavior — it doesn't trigger a turn. See claude CLI docs.
-    CLAUDE_FLAGS=()
-    INIT_PROMPT=()
-    if [ -n "$RESUME_SESSION" ]; then
-        CLAUDE_FLAGS=(--resume "$RESUME_SESSION")
-    elif [ "$CONTINUE_SESSION" = true ]; then
-        CLAUDE_FLAGS=(--continue)
-    elif [ -f "$WORKDIR/BOOT.md" ]; then
-        INIT_PROMPT=("$(cat "$WORKDIR/BOOT.md")")
-    elif [ -f "$WORKDIR/CLAUDE.md" ]; then
-        INIT_PROMPT=("Read ./CLAUDE.md in full and follow its instructions.")
-    fi
-
-    # Compute per-invocation mount target from CWD's basename.
-    CWD_BASE="$(basename "$WORKDIR")"
-    PER_INVOKE_TARGET="$DOCKER_DIR/$CWD_BASE"
-    ADD_PER_INVOKE_MOUNT=false
-
-    if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$WORKDIR" == "$WORKSPACE_DIR"* ]]; then
-        # CWD is inside the persistent workspace — no extra mount needed.
-        RELATIVE_PATH="${WORKDIR#$WORKSPACE_DIR}"
-        RELATIVE_PATH="${RELATIVE_PATH#/}"
-        if [ -z "$RELATIVE_PATH" ]; then
-            DOCKER_WORKDIR="$DOCKER_WORKSPACE_TARGET"
-        else
-            DOCKER_WORKDIR="$DOCKER_WORKSPACE_TARGET/$RELATIVE_PATH"
-        fi
-    else
-        # CWD outside workspace (or persistent disabled). Need a per-invoke mount.
-        if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [ "$PER_INVOKE_TARGET" = "$DOCKER_WORKSPACE_TARGET" ]; then
-            _log CLD ERROR "CWD basename '$CWD_BASE' collides with persistent workspace mount at $DOCKER_WORKSPACE_TARGET. Rename the folder or launch from elsewhere."
-            exit 1
-        fi
-        if ! _validate_workspace_paths "$WORKDIR" "$PER_INVOKE_TARGET"; then
-            _log CLD ERROR "Launch cld from inside a specific project folder and try again."
-            exit 1
-        fi
-        ADD_PER_INVOKE_MOUNT=true
-        DOCKER_WORKDIR="$PER_INVOKE_TARGET"
-    fi
-
-    # Background watchdog: survives CMD+Q / crashes
-    # - Periodically finds active session via lsof inside the container (process-specific, no race)
-    # - If parent shell dies, kills the container
-    WATCHDOG_PID=""
-    DOCKER_SESSION_DIR="/root/.claude/projects/$(echo "$DOCKER_WORKDIR" | sed 's|/|-|g')"
-    (
-        set +e
-        PARENT_PID=$$
-        sleep 10
-        while kill -0 "$PARENT_PID" 2>/dev/null; do
-            if [ -n "$SLOT" ]; then
-                # Find which .jsonl the claude process has open via /proc (unique to THIS container)
-                SID=$(docker exec "$CONTAINER_NAME" sh -c \
-                    "for f in /proc/*/fd/*; do readlink \"\$f\" 2>/dev/null; done | grep '$DOCKER_SESSION_DIR/.*\.jsonl' | sort -u | tail -1" \
-                    2>/dev/null)
-                if [ -n "$SID" ]; then
-                    basename "$SID" .jsonl > "$CLAUDE_HOME/.claude/slot_${SLOT}.id"
-                fi
-            fi
-            sleep 5
-        done
-        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    ) &
-    WATCHDOG_PID=$!
-    disown "$WATCHDOG_PID"
-
-    if [ -n "$SLOT" ]; then
-        if [ -n "$RESUME_SESSION" ]; then
-            _status "${GRN}[restore]${RST}" "slot ${CYN}$SLOT${RST}  session ${DIM}${RESUME_SESSION:0:8}...${RST}"
-        else
-            _status "${C2}[new]${RST}" "slot ${CYN}$SLOT${RST}"
-        fi
-    fi
-    _status ">" "$DOCKER_WORKDIR"
-    printf "\n"
-    sleep 0.3
-    # Clear screen right before Claude takes over
-    clear
-
-    # Forward terminal environment variables
-    if command -v stty > /dev/null 2>&1; then
-        TERM_SIZE=$(stty size 2>/dev/null || echo "24 80")
-        export LINES=$(echo $TERM_SIZE | cut -d' ' -f1)
-        export COLUMNS=$(echo $TERM_SIZE | cut -d' ' -f2)
-    fi
-
-    export TERM=${TERM:-xterm-256color}
-
-    # Load llm-docker.conf (non-secret config) then .env (secrets + overrides).
-    # Order matters: .env wins when a var is set in both. See setup.sh.
-    ENV_FILES=""
-    SANDBOX_ENABLED="true"
-    INTERNET_ACCESS="true"
-    NETWORK_MODE="host"
-
-    _source_all_config
-    SANDBOX_ENABLED=${SANDBOX_ENABLED:-true}
-    INTERNET_ACCESS=${INTERNET_ACCESS:-true}
-    [ -f "$SCRIPT_DIR/llm-docker.conf" ] && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/llm-docker.conf"
-    [ -f "$SCRIPT_DIR/.env" ]            && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/.env"
-
-    # Single source of truth for cap/security flags (see setup.sh).
-    _compute_cap_flags "$SANDBOX_ENABLED" "$INTERNET_ACCESS" "${LLM_DOCKER_SSH_ENABLED:-false}" CAP_DROP CAP_ADD SECURITY_OPT
-
-    # SSH port publish requires bridge networking (`-p` can't be used with host).
-    # With SLOT: offset host port by (SLOT - 1) → slot 1=8884, slot 2=8885, etc.
-    # Without SLOT: start at base port and auto-bump upward if it's taken (so
-    # a second `cld` without --slot just works instead of erroring on bind).
-    SSH_PORT_MAPPING=""
-    SSH_HOST_KEY_MOUNT=""
-    if [ "${LLM_DOCKER_SSH_ENABLED:-false}" = "true" ]; then
-        _SSH_BASE="${LLM_DOCKER_SSH_HOST_PORT:-8884}"
-        _SSH_CONTAINER="${LLM_DOCKER_SSH_PORT:-22}"
-        if [ -n "$SLOT" ]; then
-            _SSH_HOST_PORT=$(( _SSH_BASE + SLOT - 1 ))
-        else
-            _SSH_HOST_PORT="$_SSH_BASE"
-            _SSH_MAX=$(( _SSH_BASE + 50 ))
-            while (timeout 1 bash -c "</dev/tcp/127.0.0.1/$_SSH_HOST_PORT") 2>/dev/null; do
-                _SSH_HOST_PORT=$(( _SSH_HOST_PORT + 1 ))
-                if [ "$_SSH_HOST_PORT" -gt "$_SSH_MAX" ]; then
-                    _log CLD ERROR "No free SSH port in $_SSH_BASE-$_SSH_MAX. Stop some containers or pass --slot N."
-                    exit 1
-                fi
-            done
-            if [ "$_SSH_HOST_PORT" != "$_SSH_BASE" ]; then
-                _log CLD "SSH port $_SSH_BASE busy — using $_SSH_HOST_PORT (ssh -p $_SSH_HOST_PORT root@localhost)"
-            fi
-        fi
-        SSH_PORT_MAPPING="-p ${_SSH_HOST_PORT}:${_SSH_CONTAINER}"
-        SSH_HOST_KEY_MOUNT="-v $HOME/.llm-docker/ssh:/etc/ssh/keys"
-    fi
-
-    # Codeman exposes its web UI on port 3000 — needs bridge networking to
-    # publish with `-p`. In host mode the port is already reachable on localhost.
-    CODEMAN_PORT_MAPPING=""
-    if [ "$TMUX_CODEMAN" = true ]; then
-        CODEMAN_PORT_MAPPING="-p 3000:3000"
-    fi
-
-    if [ "$INTERNET_ACCESS" = "false" ] || [ -n "$SSH_PORT_MAPPING" ] || [ -n "$CODEMAN_PORT_MAPPING" ]; then
-        NETWORK_MODE="bridge"
-    else
-        NETWORK_MODE="host"
-    fi
-
-    PORT_MAPPING="$SSH_PORT_MAPPING $CODEMAN_PORT_MAPPING"
-
-    # SLOT env var tells the entrypoint to save session ID on exit
-    # SLOT_RESUME_ID tells it which session was resumed (so it can identify THIS container's session)
-    SLOT_ENV=""
-    if [ -n "$SLOT" ]; then
-        SLOT_ENV="-e SLOT=$SLOT"
-        if [ -n "$RESUME_SESSION" ]; then
-            SLOT_ENV="$SLOT_ENV -e SLOT_RESUME_ID=$RESUME_SESSION"
-        fi
-    fi
-
-    # Fresh-session detector: if we're NOT continuing or resuming, tell the
-    # entrypoint to re-seed /root/.claude/settings.local.json from the
-    # repo-bundled defaults. Resuming keeps whatever permissions the user
-    # accumulated in-session.
-    NEW_CLAUDE_SESSION="true"
-    [ -n "$RESUME_SESSION" ] && NEW_CLAUDE_SESSION="false"
-    [ "$CONTINUE_SESSION" = true ] && NEW_CLAUDE_SESSION="false"
-
-    # Build the mount args. Persistent always mounted when active;
-    # per-invoke added only when CWD is outside the persistent tree.
-    WORKSPACE_MOUNT=""
-    [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && WORKSPACE_MOUNT="-v $WORKSPACE_DIR:$DOCKER_WORKSPACE_TARGET"
-    [ "$ADD_PER_INVOKE_MOUNT" = true ]   && WORKSPACE_MOUNT="$WORKSPACE_MOUNT -v $WORKDIR:$PER_INVOKE_TARGET"
-
-    TMUX_CONF_MOUNT=""
-    [ -f "$HOME/.tmux.conf" ] && TMUX_CONF_MOUNT="-v $HOME/.tmux.conf:/root/.tmux.conf:ro"
-
-    P10K_MOUNT=""
-    [ -f "$HOME/.p10k.zsh" ] && P10K_MOUNT="-v $HOME/.p10k.zsh:/root/.p10k.zsh:ro"
-
-    # Resolve image tag: prefer the claude-only image, fall back to the
-    # combined llm-docker:latest if that's what install.sh produced.
-    IMAGE_TAG="$(_llm-docker_image_for_tool claude)"
-
-    # Forward every env var into the container. Tiny blocklist: only vars
-    # that would BREAK the container if a Mac value leaked in (PATH points
-    # at /Users/yaro/..., HOME points at a path that doesn't exist, loader
-    # hijack via LD_/DYLD_, etc.) plus the env-gorilla re-exec guard.
-    EXTRA_ENV=""
-    _ENV_BLOCK='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
-    while IFS='=' read -r _ename _; do
-        [ -z "$_ename" ] && continue
-        [[ "$_ename" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-        [[ "$_ename" =~ $_ENV_BLOCK ]] && continue
-        EXTRA_ENV="$EXTRA_ENV -e $_ename"
-    done < <(env)
-    unset _ename _ENV_BLOCK
-
-    docker run --rm -it \
-        --label com.docker.compose.project=llm-docker \
-        --label "llm-docker-project=$CWD_BASE" \
-        --hostname llm-docker \
-        --name "$CONTAINER_NAME" \
-        -w "$DOCKER_WORKDIR" \
-        $WORKSPACE_MOUNT \
-        $TMUX_CONF_MOUNT \
-        $P10K_MOUNT \
-        -v ~/.llm-docker/claude/.claude:/root/.claude \
-        -v ~/.llm-docker/claude/.config:/root/.config \
-        -v ~/.llm-docker/claude/.claude.json:/root/.claude.json \
-        -v "$SCRIPT_DIR/docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
-        -v "$SCRIPT_DIR/../README.md:/opt/llm-docker/README.md:ro" \
-        -v "$SCRIPT_DIR/ascii/llm-docker.txt:/opt/llm-docker/ascii.txt:ro" \
-        -v "$SCRIPT_DIR/docker/colorize.sh:/opt/llm-docker/colorize.sh:ro" \
-        -v "$SCRIPT_DIR/llm-container-claude-settings.json:/opt/llm-docker/templates/claude-settings.json:ro" \
-        $SSH_HOST_KEY_MOUNT \
-        --network "$NETWORK_MODE" \
-        $PORT_MAPPING \
-        $CAP_DROP \
-        $CAP_ADD \
-        $SECURITY_OPT \
-        -e TERM \
-        -e COLUMNS \
-        -e LINES \
-        -e COLORTERM=truecolor \
-        -e TOOL=claude \
-        -e NEW_CLAUDE_SESSION="$NEW_CLAUDE_SESSION" \
-        -e USE_TMUX="$USE_TMUX" \
-        -e TMUX_TEAM="$TMUX_TEAM" \
-        -e TMUX_TEAM_SIZE="$TMUX_TEAM_SIZE" \
-        -e TMUX_RECON="$TMUX_RECON" \
-        -e TMUX_CODEMAN="$TMUX_CODEMAN" \
-        -e TMUX_CLAUDE="$TMUX_CLAUDE" \
-        -e DANGER_MODE="$DANGER_MODE" \
-        $SLOT_ENV \
-        $ENV_FILES \
-        $EXTRA_ENV \
-        "$IMAGE_TAG" "${CLAUDE_FLAGS[@]}" "$@" "${INIT_PROMPT[@]}"
-
-    # Save THIS terminal's claude session UUID so a subsequent `cld -c`
-    # in the same pane resumes here, not whichever session was most
-    # recent globally. Non-blocking: silently no-ops on any error.
-    _save_terminal_session "$(_terminal_id)" "$WORKDIR" "$(_claude_session_dir "$WORKDIR")" 2>/dev/null || true
-}
 
 # --api: start the builder-api BEFORE fan-out so we spawn it exactly once
 # (multi-llm-docker.applescript's children don't inherit START_API).
@@ -1089,32 +548,15 @@ if [ "$START_API_EXPLICIT" = false ]; then
     esac
     unset _autostart
 fi
-_maybe_start_api "$CURRENT_DIR"
+# Color-code this pane's iTerm tab by project (same hue as cld-status).
+_set_tab_color "$_LLM_PROJECT_TOKEN"
+_maybe_start_api CLD "$CURRENT_DIR"
 
-# If WINDOW_COUNT > 1 and we're on macOS, use multi-llm-docker layout
-if [ "$WINDOW_COUNT" -gt 1 ] && [[ "$OSTYPE" == "darwin"* ]]; then
-    SLOT_MODE="new"
-    [ "$CONTINUE_SESSION" = true ] && SLOT_MODE="restore"
-    _log CLD "Opening $WINDOW_COUNT terminal windows ($SLOT_MODE mode)..."
-    _OSA_ERR=$(osascript "$SCRIPT_DIR/multi-llm-docker.applescript" "$SCRIPT_DIR/cld" "$WINDOW_COUNT" "$CURRENT_DIR" "$SLOT_MODE" 2>&1)
-    _OSA_RC=$?
-    if [ "$_OSA_RC" -ne 0 ]; then
-        # macOS AppleEvents permission denied (-1743 or "Not authorised to send Apple events to iTerm").
-        if printf '%s' "$_OSA_ERR" | grep -qE -- '-1743|Not authori[sz]ed'; then
-            _log CLD ERROR "macOS blocked AppleScript from controlling iTerm."
-            _log CLD "Resetting the permission now so macOS will re-prompt..."
-            tccutil reset AppleEvents com.googlecode.iterm2 2>/dev/null || true
-            _log CLD "Now rerun: ${C2}cld $WINDOW_COUNT${RST}"
-            _log CLD "macOS will prompt 'iTerm wants to control iTerm' — click Allow."
-            _log CLD "Permanent fix: System Settings → Privacy & Security → Automation → iTerm → check iTerm."
-        else
-            _log CLD ERROR "multi-window layout failed:"
-            printf '%s\n' "$_OSA_ERR" | sed 's/^/    /'
-        fi
-        exit 1
-    fi
-    exit 0
-fi
+# Multi-window fan-out (shared, see setup/launcher.sh).
+spawn_multi_windows CLD
+
+# Tidy duplicate memory for this project before launch (best-effort, never blocks).
+command -v _memory_merge_autorun >/dev/null 2>&1 && { _memory_merge_autorun || true; }
 
 # Single window - run directly
 run_claude_container "$CURRENT_DIR"

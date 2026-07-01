@@ -1,12 +1,14 @@
 # ──────────────────────────────────────────────────────────────────────
-# builder-api host config — copy to ~/.llm-docker/builder-api.toml
+# builder-api host config — copy to ~/.llm-docker/api_config/builder-api.toml
 # ──────────────────────────────────────────────────────────────────────
 #
 # This file is the SINGLE SOURCE OF TRUTH for every command the
 # builder-api daemon will ever execute on your Mac, across every project.
 #
-#   * Lives at ~/.llm-docker/builder-api.toml — host-owned, never bind-
-#     mounted into any container.
+#   * Lives at ~/.llm-docker/api_config/builder-api.toml — host-owned, never
+#     bind-mounted into any container. Per-project [project.<name>] blocks
+#     can live here OR in their own ~/.llm-docker/api_config/<name>.toml
+#     shard (every *.toml in that dir is merged).
 #   * Containers (Claude / OpenCode) can read the resolved job list via
 #     GET /jobs and execute via POST /job/<name>, but they CANNOT change
 #     which jobs exist or what command each runs. Auditable in one file.
@@ -19,10 +21,10 @@
 # Daemon launch:  `python3 server.py --project <name>`
 #                 (cld / ocd derive <name> from $(basename "$project_dir"))
 #
-# Hot-reload:     NONE. Daemon reads this file once at startup. Edit it,
-#                 then kill the daemon and let cld/ocd relaunch — that
-#                 way the cage's job surface only changes on a deliberate
-#                 operator action, never silently via a file write.
+# Hot-reload:     YES for jobs. The daemon polls ~/.llm-docker/api_config/
+#                 mtimes (~1.5s) and re-resolves this project's view; added
+#                 or edited [jobs.*] apply to the NEXT enqueue. Bind / port /
+#                 runtime changes still need a deliberate daemon restart.
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -63,6 +65,22 @@ description = "Filesystem tree, N levels deep, respecting .gitignore"
 regex       = "^[1-5]$"
 required    = true
 description = "Tree depth 1..5"
+
+# Host-side trash — the in-container rm-guard (/usr/local/bin/rm) routes deletes
+# here so files land in the HOST trash (recoverable), instead of being destroyed
+# through the bind-mount. {path} is RELATIVE to the project root (jobs run with
+# cwd=project_root); the regex forbids a leading / and any "..", so it can't
+# escape the project tree. execvp (no shell) keeps metacharacters inert.
+[jobs.trash]
+command     = "trash"
+args        = ["{path}"]
+timeout_s   = 20
+description = "Move a path (relative to project root) to the host trash — recoverable"
+[jobs.trash.placeholders.path]
+regex       = "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/ @+-]+$"
+max_len     = 512
+required    = true
+description = "Path relative to project root (no leading /, no ..)"
 
 
 # ──────────────────────────────────────────────────────────────────────

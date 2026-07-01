@@ -86,12 +86,17 @@ class EventStore:
     # Write side
     # ------------------------------------------------------------------
 
-    def append(self, type_: str, payload: Optional[dict] = None) -> None:
+    def append(self, type_: str, payload: Optional[dict] = None,
+               *, persist: bool = True) -> None:
         """
         Append one event. Fans out to live subscribers regardless of whether
         a persistence path is configured (so /ws tunneling still works even
         with events.path unset). File write is skipped if path is None.
         Triggers rotation on file when appended bytes would exceed max_bytes.
+
+        `persist=False` streams the event to live subscribers WITHOUT writing
+        it to the JSONL — used for high-volume, ephemeral events (per-request
+        `http_call`) that would otherwise bloat the log.
         """
         record = {"ts": time.time(), "type": str(type_)}
         if payload:
@@ -102,8 +107,8 @@ class EventStore:
                     continue
                 record[k] = v
 
-        # Persist (if configured).
-        if self._path is not None:
+        # Persist (if configured + caller didn't opt out).
+        if persist and self._path is not None:
             line = json.dumps(record, ensure_ascii=False, default=_json_safe) + "\n"
             data = line.encode("utf-8")
             with self._lock:

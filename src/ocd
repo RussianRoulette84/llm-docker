@@ -2,132 +2,44 @@
 
 set -e
 
-# --- env-gorilla integration: inject KeePassXC-backed secrets before launch.
-# Loads the `llm-docker` profile (cage-wide keys) AND, if the CWD's basename
-# is a different name, that project's profile too — both merged into a single
-# chip-blob by env-gorilla v0.12+ so one Touch ID covers everything. A missing
-# project profile in kdbx is a non-fatal warning, not an error.
+# env-gorilla secret injection before launch (sourced; may re-exec the launcher
+# through env-gorilla). Needs $_self_dir because setup.sh isn't sourced yet.
 _self_dir="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
-# --refresh-env: wipe env-gorilla's cached chip-blob before re-exec, so
-# newly-added KeePassXC entries propagate. Strip the flag from $@ either
-# way so downstream arg parsing doesn't see it.
-_refresh_env=false
-_new_args=()
-for _a in "$@"; do
-    case "$_a" in
-        --refresh-env) _refresh_env=true ;;
-        *) _new_args+=("$_a") ;;
-    esac
-done
-set -- "${_new_args[@]}"
-unset _new_args _a
+source "$_self_dir/setup/preflight.sh"
 
-if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
-   && command -v env-gorilla >/dev/null 2>&1 \
-   && { [ "${USER:-}" = "yaro" ] || [ ! -f "$_self_dir/.env" ]; }; then
-    _proj_dir=""
-    for _a in "$@"; do
-        case "$_a" in
-            -*) ;;
-            *) [ -d "$_a" ] && { _proj_dir="$(realpath "$_a")"; break; } ;;
-        esac
-    done
-    [ -z "$_proj_dir" ] && _proj_dir="$(pwd)"
-    _proj_name="$(basename "$_proj_dir")"
-    unset _proj_dir _a
-
-    if [ -n "$_proj_name" ] && [ "$_proj_name" != "llm-docker" ]; then
-        _profiles="llm-docker,$_proj_name"
-    else
-        _profiles="llm-docker"
-    fi
-    if [ "$_refresh_env" = true ]; then
-        env-gorilla --clear "$_profiles" >/dev/null 2>&1 || true
-    fi
-    export LLM_DOCKER_ENV_GORILLA=1
-    exec env-gorilla "$_profiles" -- "$0" "$@"
-fi
-unset _self_dir _proj_name _profiles _refresh_env
-
-SCRIPT_DIR="$( cd "$( dirname "$( realpath "${BASH_SOURCE[0]}" )" )" && pwd )"
+SCRIPT_DIR="$_self_dir"
+unset _self_dir
 
 source "$SCRIPT_DIR/setup.sh"
 
-# Serialize Docker Desktop launches across parallel cld/ocd sessions. Without
-# this lock, N terminals all firing `open -a Docker` simultaneously deliver
-# stray NSEvents into a Docker Desktop that's already mid-launch — Docker
-# Desktop crashes with "NSInternalInconsistencyException: Unrecognized event
-# type 0" on macOS Sequoia 15.6+ (and likely earlier). The lock file is
-# shared with cld so a `cld` + `ocd` race is handled too.
-if ! docker info > /dev/null 2>&1; then
-    _ocd_have_flock=true
-    if ! command -v flock > /dev/null 2>&1; then
-        _ocd_have_flock=false
-        _log OCD WARNING "flock not found — running without launch-race protection. Install with: brew install flock"
-    fi
+# run_opencode_container is tool-specific — kept in ocd.run.sh, sourced here.
+[ -f "$SCRIPT_DIR/ocd.run.sh" ] || { echo "ocd: missing ocd.run.sh — broken install?" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$SCRIPT_DIR/ocd.run.sh"
 
-    if $_ocd_have_flock; then
-        exec 9> "/tmp/cld-docker-start.lock"
-        if ! flock -n 9; then
-            _log OCD "Another cld/ocd is starting Docker — waiting..."
-            flock 9
+# Duplicate-memory merge tool (folder-name keying). Sourced best-effort.
+# shellcheck disable=SC1090
+[ -f "$SCRIPT_DIR/memory/memory.sh" ] && source "$SCRIPT_DIR/memory/memory.sh"
+
+# Host-side memory commands run WITHOUT a container — handle them before the
+# docker check / image build so `ocd --merge-memory` is instant.
+case " $* " in
+    *" --merge-memory "*|*" --dry-run-merge "*|*" --restore-memory "*)
+        WORKSPACE_DIR=""; DOCKER_DIR=""
+        if [ -f "$SCRIPT_DIR/llm-docker.conf" ]; then
+            _w="$(_read_env_var WORKSPACE_DIR "$SCRIPT_DIR/llm-docker.conf")"; [ -n "$_w" ] && WORKSPACE_DIR="${_w/#\~/$HOME}"
+            _d="$(_read_env_var DOCKER_DIR "$SCRIPT_DIR/llm-docker.conf")"; [ -n "$_d" ] && DOCKER_DIR="$_d"
         fi
-    fi
+        : "${DOCKER_DIR:=/root}"; export WORKSPACE_DIR DOCKER_DIR
+        for _a in "$@"; do case "$_a" in
+            --merge-memory)   _memory_merge_manual manual; exit 0 ;;
+            --dry-run-merge)  _memory_merge_manual dry;    exit 0 ;;
+            --restore-memory) _mem_restore;                exit 0 ;;
+        esac; done ;;
+esac
 
-    # Re-check inside the lock: an earlier holder may have already started Docker.
-    if ! docker info > /dev/null 2>&1; then
-        _log OCD WARNING "Docker is not running — starting Docker Desktop..."
-
-    # Start Docker Desktop on macOS
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # `open -a Docker` relies on LaunchServices. If Docker.app lives in
-        # a subfolder (e.g. /Applications/Utilities/) or LS's index is
-        # stale, it silently fails — we'd then wait 60s for `docker info`
-        # that never comes. Fall back to an absolute-path launch.
-        if ! open -a Docker 2>/dev/null; then
-            _docker_app=""
-            if command -v mdfind >/dev/null 2>&1; then
-                _docker_app="$(mdfind -name 'Docker.app' 2>/dev/null \
-                    | grep -E '/Docker\.app$' | head -1)"
-            fi
-            if [ -z "$_docker_app" ]; then
-                _docker_app="$(find /Applications -maxdepth 4 \
-                    -name 'Docker.app' -type d 2>/dev/null | head -1)"
-            fi
-            if [ -n "$_docker_app" ]; then
-                _log OCD "Found Docker at $_docker_app — launching..."
-                open "$_docker_app"
-            else
-                _log OCD ERROR "Could not find Docker.app under /Applications. Install Docker Desktop or move it into /Applications."
-                exit 1
-            fi
-            unset _docker_app
-        fi
-    else
-        _log OCD ERROR "Please start Docker manually on your system"
-        exit 1
-    fi
-
-    _log OCD "Waiting for Docker to start (this may take a minute)..."
-    max_wait=60
-    waited=0
-    until docker info > /dev/null 2>&1; do
-        if [ $waited -ge $max_wait ]; then
-            _log OCD ERROR "Docker did not start within $max_wait seconds"
-            exit 1
-        fi
-        echo -n "."
-        sleep 2
-        waited=$((waited + 2))
-    done
-    _log OCD "Docker is ready!"
-    fi
-
-    if $_ocd_have_flock; then
-        exec 9>&-
-    fi
-    unset _ocd_have_flock
-fi
+# Ensure Docker is running (shared helper — see setup/docker.sh).
+_ensure_docker_running OCD
 
 # Quick pre-scan for the two rebuild flags:
 #   --build         smart rebuild: re-runs install scripts inside the existing
@@ -157,16 +69,7 @@ unset _arg
 # the flag and rebuild.
 _tmux_flip_kvs=""
 _tmux_flip_labels=""
-_register_tmux_flip() {
-    local flag="$1" label="$2"
-    local cur
-    cur="$(_read_env_var "$flag" "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
-    [ "$cur" = "true" ] && return 0
-    case " $_tmux_flip_kvs " in *" ${flag}=true "*) return 0 ;; esac
-    _tmux_flip_kvs+="${flag}=true "
-    [ -n "$_tmux_flip_labels" ] && _tmux_flip_labels+=", "
-    _tmux_flip_labels+="$label"
-}
+# _register_tmux_flip lives in setup.sh (shared with cld).
 for _arg in "$@"; do
     case "$_arg" in
         -t|--tmux)          _register_tmux_flip INSTALL_TMUX_VANILLA "-t (vanilla tmux)" ;;
@@ -477,39 +380,14 @@ fi
 # from the same terminal where a session started resumes THAT session,
 # not whichever session was used most recently across all terminals.
 _TERM_SESSIONS_FILE="$HOME/.llm-docker/opencode/.local/share/opencode/terminal-sessions.tsv"
+# _terminal_id + _lookup_terminal_session live in setup.sh (shared with cld).
 
-_terminal_id() {
-    if [ -n "${ITERM_SESSION_ID:-}" ]; then
-        printf '%s' "$ITERM_SESSION_ID"
-    elif [ -n "${TMUX_PANE:-}" ]; then
-        printf 'tmux:%s' "$TMUX_PANE"
-    else
-        tty 2>/dev/null || printf 'unknown'
-    fi
-}
-
-# Predict the container-side DOCKER_WORKDIR for a host workdir. Mirrors
-# the resolution at run_opencode_container's top so we can match the
-# `directory` column opencode wrote to its sqlite db.
+# Predict the container-side DOCKER_WORKDIR for a host workdir, using the same
+# stable-token logic as the mount builder, so we match the `directory` column
+# opencode wrote to its sqlite db (and it survives WORKSPACE_DIR changes).
 _docker_workdir_for() {
-    local workdir="$1"
-    if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$workdir" == "$WORKSPACE_DIR"* ]]; then
-        local rel="${workdir#$WORKSPACE_DIR}"
-        rel="${rel#/}"
-        if [ -z "$rel" ]; then
-            printf '%s' "$DOCKER_WORKSPACE_TARGET"
-        else
-            printf '%s/%s' "$DOCKER_WORKSPACE_TARGET" "$rel"
-        fi
-    else
-        printf '%s/%s' "$DOCKER_DIR" "$(basename "$workdir")"
-    fi
-}
-
-_lookup_terminal_session() {
-    local tid="$1" proj="$2"
-    [ -f "$_TERM_SESSIONS_FILE" ] || return 0
-    awk -F'\t' -v t="$tid" -v p="$proj" '$1==t && $2==p {u=$3} END{if(u) print u}' "$_TERM_SESSIONS_FILE"
+    _project_docker_workdir "$1" "$WORKSPACE_DIR" "$DOCKER_DIR" \
+        "$WORKSPACE_MOUNT_ACTIVE" "$DOCKER_WORKSPACE_TARGET"
 }
 
 # Query opencode's sqlite db for the newest session in `docker_wd` and
@@ -534,374 +412,13 @@ _save_terminal_session() {
 }
 
 # Function to run a single OpenCode container
-run_opencode_container() {
-    local WORKDIR="$1"
-    shift
-    cd "$SCRIPT_DIR"
 
-    _tmux_nested_prompt
-
-    CWD_BASE="$(basename "$WORKDIR")"
-    PER_INVOKE_TARGET="$DOCKER_DIR/$CWD_BASE"
-    ADD_PER_INVOKE_MOUNT=false
-
-    if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [[ "$WORKDIR" == "$WORKSPACE_DIR"* ]]; then
-        RELATIVE_PATH="${WORKDIR#$WORKSPACE_DIR}"
-        RELATIVE_PATH="${RELATIVE_PATH#/}"
-        if [ -z "$RELATIVE_PATH" ]; then
-            DOCKER_WORKDIR="$DOCKER_WORKSPACE_TARGET"
-        else
-            DOCKER_WORKDIR="$DOCKER_WORKSPACE_TARGET/$RELATIVE_PATH"
-        fi
-    else
-        if [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && [ "$PER_INVOKE_TARGET" = "$DOCKER_WORKSPACE_TARGET" ]; then
-            _log OCD ERROR "CWD basename '$CWD_BASE' collides with persistent workspace mount at $DOCKER_WORKSPACE_TARGET. Rename the folder or launch from elsewhere."
-            exit 1
-        fi
-        if ! _validate_workspace_paths "$WORKDIR" "$PER_INVOKE_TARGET"; then
-            _log OCD ERROR "Launch ocd from inside a specific project folder and try again."
-            exit 1
-        fi
-        ADD_PER_INVOKE_MOUNT=true
-        DOCKER_WORKDIR="$PER_INVOKE_TARGET"
-    fi
-
-    _log OCD "Starting OpenCode sandbox in $DOCKER_WORKDIR..."
-
-    # Forward terminal environment variables for proper mouse reporting and scrolling
-    if command -v stty > /dev/null 2>&1; then
-        TERM_SIZE=$(stty size 2>/dev/null || echo "24 80")
-        export LINES=$(echo $TERM_SIZE | cut -d' ' -f1)
-        export COLUMNS=$(echo $TERM_SIZE | cut -d' ' -f2)
-    fi
-
-    export TERM=${TERM:-xterm-256color}
-
-    # Load llm-docker.conf (config) + .env (secrets) into shell env.
-    # Order: conf first, .env second — .env wins on conflicts.
-    _source_all_config
-
-    # SSH port publish requires bridge networking.
-    # Slot N → 8884 + (N - 1). No slot → base port with auto-bump when taken.
-    # See cld for the same logic.
-    SSH_PORT_MAPPING=""
-    SSH_HOST_KEY_MOUNT=""
-    if [ "${LLM_DOCKER_SSH_ENABLED:-false}" = "true" ]; then
-        _SSH_BASE="${LLM_DOCKER_SSH_HOST_PORT:-8884}"
-        _SSH_CONTAINER="${LLM_DOCKER_SSH_PORT:-22}"
-        if [ -n "$SLOT" ]; then
-            _SSH_HOST_PORT=$(( _SSH_BASE + SLOT - 1 ))
-        else
-            _SSH_HOST_PORT="$_SSH_BASE"
-            _SSH_MAX=$(( _SSH_BASE + 50 ))
-            while (timeout 1 bash -c "</dev/tcp/127.0.0.1/$_SSH_HOST_PORT") 2>/dev/null; do
-                _SSH_HOST_PORT=$(( _SSH_HOST_PORT + 1 ))
-                if [ "$_SSH_HOST_PORT" -gt "$_SSH_MAX" ]; then
-                    _log OCD ERROR "No free SSH port in $_SSH_BASE-$_SSH_MAX. Stop some containers or pass --slot N."
-                    exit 1
-                fi
-            done
-            if [ "$_SSH_HOST_PORT" != "$_SSH_BASE" ]; then
-                _log OCD "SSH port $_SSH_BASE busy — using $_SSH_HOST_PORT (ssh -p $_SSH_HOST_PORT root@localhost)"
-            fi
-        fi
-        SSH_PORT_MAPPING="-p ${_SSH_HOST_PORT}:${_SSH_CONTAINER}"
-        SSH_HOST_KEY_MOUNT="-v $HOME/.llm-docker/ssh:/etc/ssh/keys"
-    fi
-
-    # Session restore resolution:
-    #   -c <UUID>     → RESUME_SESSION (direct)
-    #   -c -s N       → read slot file, fall into RESUME_SESSION
-    # Whatever ends up in RESUME_SESSION is forwarded as SLOT_RESUME_ID.
-    if [ -z "$RESUME_SESSION" ] && [ -n "$SLOT" ] && [ "$CONTINUE_SESSION" = true ]; then
-        local SLOT_FILE="$HOME/.llm-docker/opencode/.local/share/opencode/slot_${SLOT}.id"
-        [ -f "$SLOT_FILE" ] && RESUME_SESSION="$(cat "$SLOT_FILE")"
-    fi
-
-    # Per-terminal continue: if `-c` was used without --slot and without
-    # an explicit UUID, and we've saved a session for THIS iTerm pane in
-    # this project, resume that specific session.
-    if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ]; then
-        local _TS_TID _TS_SAVED
-        _TS_TID=$(_terminal_id)
-        _TS_SAVED=$(_lookup_terminal_session "$_TS_TID" "$WORKDIR")
-        [ -n "$_TS_SAVED" ] && RESUME_SESSION="$_TS_SAVED"
-    fi
-
-    SLOT_ENV=""
-    [ -n "$SLOT" ]           && SLOT_ENV="$SLOT_ENV -e SLOT=$SLOT"
-    [ -n "$RESUME_SESSION" ] && SLOT_ENV="$SLOT_ENV -e SLOT_RESUME_ID=$RESUME_SESSION"
-
-    # Fresh session only → entrypoint injects --prompt. Prefer BOOT.md contents, fall back to CLAUDE.md default.
-    export OPENCODE_INIT_PROMPT=""
-    if [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" != true ]; then
-        if [ -f "$WORKDIR/BOOT.md" ]; then
-            export OPENCODE_INIT_PROMPT="$(cat "$WORKDIR/BOOT.md")"
-        elif [ -f "$WORKDIR/CLAUDE.md" ]; then
-            export OPENCODE_INIT_PROMPT="Read ./CLAUDE.md in full and follow its BOOT steps before anything else."
-        fi
-    fi
-
-    # Codeman web UI on port 3000 needs bridge networking to publish with `-p`.
-    CODEMAN_PORT_MAPPING=""
-    [ "$TMUX_CODEMAN" = true ] && CODEMAN_PORT_MAPPING="-p 3000:3000"
-
-    if [ "${INTERNET_ACCESS:-true}" = "false" ] || [ -n "$SSH_PORT_MAPPING" ] || [ -n "$CODEMAN_PORT_MAPPING" ]; then
-        export NETWORK_MODE=bridge
-    else
-        export NETWORK_MODE=host
-    fi
-
-    # Cap/security flags from the same source-of-truth cld uses.
-    _compute_cap_flags "${SANDBOX_ENABLED:-true}" "${INTERNET_ACCESS:-true}" "${LLM_DOCKER_SSH_ENABLED:-false}" CAP_DROP CAP_ADD SECURITY_OPT
-
-    # Forward both config files into the container as env. Docker accepts
-    # multiple --env-file flags; conf first so .env can still override.
-    ENV_FILES=""
-    [ -f "$SCRIPT_DIR/llm-docker.conf" ] && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/llm-docker.conf"
-    [ -f "$SCRIPT_DIR/.env" ]            && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/.env"
-
-    # Workspace bind: persistent pair if configured, else just the current dir.
-    WORKSPACE_MOUNT_ARG=()
-    [ "$WORKSPACE_MOUNT_ACTIVE" = true ] && WORKSPACE_MOUNT_ARG+=(-v "$WORKSPACE_DIR:$DOCKER_WORKSPACE_TARGET")
-    [ "$ADD_PER_INVOKE_MOUNT" = true ]   && WORKSPACE_MOUNT_ARG+=(-v "$WORKDIR:$PER_INVOKE_TARGET")
-
-    TMUX_CONF_MOUNT_ARG=()
-    [ -f "$HOME/.tmux.conf" ] && TMUX_CONF_MOUNT_ARG=(-v "$HOME/.tmux.conf:/root/.tmux.conf:ro")
-
-    P10K_MOUNT_ARG=()
-    [ -f "$HOME/.p10k.zsh" ] && P10K_MOUNT_ARG=(-v "$HOME/.p10k.zsh:/root/.p10k.zsh:ro")
-
-    # CAP_* / SECURITY_OPT are unquoted on purpose — they word-split into
-    # multiple --cap-add / --cap-drop / --security-opt args.
-    local CONTAINER_NAME="llm-docker-opencode-$$"
-
-    _iterm_tag "OpenCode" "$WORKDIR"
-    trap '_iterm_untag' EXIT INT TERM HUP
-
-    # Resolve image tag: prefer the opencode-only image, fall back to the
-    # combined llm-docker:latest if that's what install.sh produced.
-    local IMAGE_TAG
-    IMAGE_TAG="$(_llm-docker_image_for_tool opencode)"
-
-    # Forward every env var into the container. Tiny blocklist: only vars
-    # that would BREAK the container if a Mac value leaked in (PATH points
-    # at /Users/yaro/..., HOME points at a path that doesn't exist, loader
-    # hijack via LD_/DYLD_, etc.) plus the env-gorilla re-exec guard.
-    local EXTRA_ENV=""
-    local _ENV_BLOCK _ename
-    _ENV_BLOCK='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
-    while IFS='=' read -r _ename _; do
-        [ -z "$_ename" ] && continue
-        [[ "$_ename" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-        [[ "$_ename" =~ $_ENV_BLOCK ]] && continue
-        EXTRA_ENV="$EXTRA_ENV -e $_ename"
-    done < <(env)
-
-    docker run --rm -it \
-        --label com.docker.compose.project=llm-docker \
-        --label "llm-docker-project=$CWD_BASE" \
-        --hostname llm-docker \
-        --name "$CONTAINER_NAME" \
-        -w "$DOCKER_WORKDIR" \
-        --network "$NETWORK_MODE" \
-        $SSH_PORT_MAPPING \
-        $CODEMAN_PORT_MAPPING \
-        $CAP_DROP \
-        $CAP_ADD \
-        $SECURITY_OPT \
-        "${WORKSPACE_MOUNT_ARG[@]}" \
-        "${TMUX_CONF_MOUNT_ARG[@]}" \
-        "${P10K_MOUNT_ARG[@]}" \
-        -v "$HOME/.llm-docker/opencode/.config/opencode:/root/.config/opencode" \
-        -v "$HOME/.llm-docker/opencode/.local/share/opencode:/root/.local/share/opencode" \
-        -v "$HOME/.llm-docker/opencode/.cache/opencode:/root/.cache/opencode" \
-        -v "$SCRIPT_DIR/llm-container-opencode-config.jsonc:/opt/llm-docker/templates/opencode.config.jsonc:ro" \
-        -v "$SCRIPT_DIR/docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
-        -v "$SCRIPT_DIR/../README.md:/opt/llm-docker/README.md:ro" \
-        -v "$SCRIPT_DIR/ascii/llm-docker.txt:/opt/llm-docker/ascii.txt:ro" \
-        -v "$SCRIPT_DIR/docker/colorize.sh:/opt/llm-docker/colorize.sh:ro" \
-        $SSH_HOST_KEY_MOUNT \
-        -e NODE_ENV="${NODE_ENV:-production}" \
-        -e SANDBOX_ENABLED="${SANDBOX_ENABLED:-true}" \
-        -e INTERNET_ACCESS="${INTERNET_ACCESS:-true}" \
-        -e TERM \
-        -e COLUMNS \
-        -e LINES \
-        -e COLORTERM=truecolor \
-        -e TOOL=opencode \
-        -e USE_TMUX="$USE_TMUX" \
-        -e TMUX_TEAM="$TMUX_TEAM" \
-        -e TMUX_TEAM_SIZE="$TMUX_TEAM_SIZE" \
-        -e TMUX_CODEMAN="$TMUX_CODEMAN" \
-        -e BUILDER_API_HOST="${BUILDER_API_HOST:-host.docker.internal}" \
-        -e BUILDER_API_PORT="${BUILDER_API_PORT:-6666}" \
-        -e CONTINUE_SESSION="$CONTINUE_SESSION" \
-        -e OPENCODE_INIT_PROMPT \
-        $SLOT_ENV \
-        $ENV_FILES \
-        $EXTRA_ENV \
-        "$IMAGE_TAG" "$@"
-
-    # Save THIS terminal's opencode session ID so a subsequent `ocd -c`
-    # in the same pane resumes here, not whichever session was most
-    # recent globally. Non-blocking: silently no-ops on any error.
-    _save_terminal_session "$(_terminal_id)" "$WORKDIR" "$DOCKER_WORKDIR" 2>/dev/null || true
-}
-
-# _write_secret_handoff — when `-a` opens a new iTerm/Terminal window,
-# that fresh shell does NOT inherit our env, so run-local.sh's
-# "BUILDER_API_PASSWORD already loaded" sentinel misses and env-gorilla
-# runs again (= extra Touch ID). Dump our forwarding-eligible env to a
-# short-lived file under /tmp/s3c-gorilla/ (mode 0600, owner-only, same
-# dir as the chip-blobs). The spawned window sources it and immediately
-# deletes it. ~1 second on disk. Echoes path, or empty if nothing written.
-_write_secret_handoff() {
-    local dir="/tmp/s3c-gorilla"
-    mkdir -p "$dir" 2>/dev/null || return 0
-    chmod 700 "$dir" 2>/dev/null
-    local f
-    f=$(mktemp "$dir/handoff-XXXXXXXX" 2>/dev/null) || return 0
-    chmod 600 "$f"
-    local _block='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
-    local n=0 k v
-    while IFS='=' read -r k v; do
-        [ -z "$k" ] && continue
-        [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-        [[ "$k" =~ $_block ]] && continue
-        printf 'export %s=%q\n' "$k" "$v" >>"$f"
-        n=$((n+1))
-    done < <(env)
-    if [ "$n" -eq 0 ]; then
-        rm -f "$f"
-        return 0
-    fi
-    echo "$f"
-}
+# _write_secret_handoff + _teardown_builder_api live in setup.sh (shared with cld).
 
 # _maybe_start_api — spawn the builder-api server in a separate window if
 # --api was passed AND one isn't already listening on the configured port.
 # macOS: osascript opens a new Terminal window. Otherwise: background + log.
-_maybe_start_api() {
-    [ "$START_API" = true ] || return 0
 
-    local project_dir="$1"
-    local project_name
-    project_name="$(basename "$project_dir")"
-    local port
-    # Port precedence (v3.0): per-project shard
-    # ~/.llm-docker/projects/<name>.toml → base ~/.llm-docker/builder-api.toml
-    # → llm-docker.conf → default 6666. Project blocks moved to per-project
-    # shards in v3.0; the base only holds defaults, globals, language packs,
-    # verb declarations.
-    local host_shard="${HOME}/.llm-docker/api_config/${project_name}.toml"
-    local host_base="${HOME}/.llm-docker/api_config/builder-api.toml"
-    local _f
-    for _f in "$host_shard" "$host_base"; do
-        [ -f "$_f" ] || continue
-        port=$(awk -v p="project.$project_name" '
-            $0 ~ "^\\[" p "\\]" { in_block=1; next }
-            in_block && /^\[/ { in_block=0 }
-            in_block && /^[[:space:]]*port[[:space:]]*=/ {
-                gsub(/^[[:space:]]*port[[:space:]]*=[[:space:]]*/, "")
-                gsub(/[^0-9].*$/, "")
-                print; exit
-            }
-        ' "$_f")
-        [ -n "${port:-}" ] && break
-    done
-    unset _f
-    if [ -z "${port:-}" ]; then
-        port="$(_read_env_var BUILDER_API_PORT "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null)"
-    fi
-    port="${port:-6666}"
-
-    local launcher="$SCRIPT_DIR/builder-api/run-local.sh"
-    if [ ! -f "$launcher" ]; then
-        echo "[ocd] warning: $launcher not found; skipping --api spawn" >&2
-        return 0
-    fi
-
-    # Orphan-daemon cleanup: kill any previous daemon still bound to this
-    # project's port so the fresh spawn below binds clean. AppleScript's
-    # reuse path handles the pane-still-alive case; this handles
-    # "daemon backgrounded, pane gone" so the user reliably gets new
-    # panels every ocd -a instead of "no panels" silence.
-    if command -v lsof >/dev/null 2>&1; then
-        local _api_existing_pid
-        _api_existing_pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
-        if [ -n "$_api_existing_pid" ]; then
-            kill "$_api_existing_pid" 2>/dev/null
-            sleep 0.4
-        fi
-        unset _api_existing_pid
-    fi
-
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        local log="/tmp/builder-api-$$.log"
-
-        if [ "$START_API_BG" = true ]; then
-            nohup bash "$launcher" "$project_dir" >"$log" 2>&1 &
-            disown $! 2>/dev/null || true
-            echo "[ocd] builder-api in background — PID $! · log: $log"
-            return 0
-        fi
-
-        # Hand our already-unwrapped secrets to the new Terminal window
-        # via a short-lived file, so run-local.sh's sentinel skips its
-        # own env-gorilla call (= no extra Touch ID).
-        local handoff
-        handoff="$(_write_secret_handoff)"
-
-        # Optional cld-status dashboard alongside the builder-api panel.
-        local status_cmd=""
-        if [ -x "$SCRIPT_DIR/cld-status" ]; then
-            status_cmd="exec $SCRIPT_DIR/cld-status"
-        fi
-
-        # 1a) Already inside iTerm? Split the current window left/right.
-        if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
-            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" "$status_cmd" >/dev/null 2>&1; then
-                echo "[ocd] builder-api split into right pane (port $port)"
-                return 0
-            fi
-        fi
-
-        # 1b) Not in iTerm, or split denied: positioned new window.
-        if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" new-window "$port" "$handoff" "$status_cmd" >/dev/null 2>&1; then
-            echo "[ocd] builder-api spawned in positioned iTerm window (port $port)"
-            return 0
-        fi
-
-        # 2) AppleScript denied — `open` a .command file via LaunchServices.
-        local cmd_file
-        cmd_file=$(mktemp -t builder-api.XXXXXX).command
-        cat >"$cmd_file" <<EOF
-#!/bin/bash
-cd "$project_dir"
-exec bash "$launcher" "$project_dir" "$handoff"
-EOF
-        chmod +x "$cmd_file"
-        if [ -d "/Applications/iTerm.app" ] && open -a iTerm "$cmd_file" 2>/dev/null; then
-            echo "[ocd] WARNING: AppleScript blocked — opened iTerm without positioning." >&2
-            return 0
-        fi
-        if open -a Terminal "$cmd_file" 2>/dev/null; then
-            echo "[ocd] WARNING: Opened Terminal.app instead of iTerm." >&2
-            return 0
-        fi
-
-        # 3) Background fallback.
-        echo "[ocd] WARNING: No terminal app available. Backgrounding." >&2
-        nohup bash "$launcher" "$project_dir" >"$log" 2>&1 &
-        disown $! 2>/dev/null || true
-        echo "[ocd] builder-api in background — PID $! · log: $log"
-    else
-        local log="/tmp/builder-api-$$.log"
-        nohup bash "$launcher" "$project_dir" > "$log" 2>&1 &
-        echo "[ocd] builder-api started in background (pid $!, log: $log)"
-    fi
-}
 
 # --api: start the builder-api BEFORE fan-out so we spawn it exactly once
 # (multi-llm-docker.applescript's children don't inherit START_API).
@@ -914,32 +431,15 @@ if [ "$START_API_EXPLICIT" = false ]; then
     esac
     unset _autostart
 fi
-_maybe_start_api "$CURRENT_DIR"
+# Color-code this pane's iTerm tab by project (same hue as cld-status).
+_set_tab_color "$_LLM_PROJECT_TOKEN"
+_maybe_start_api OCD "$CURRENT_DIR"
 
-# If WINDOW_COUNT > 1 and we're on macOS with iTerm2, open multiple windows
-# If WINDOW_COUNT > 1 and we're on macOS, use multi-llm-docker layout
-if [ "$WINDOW_COUNT" -gt 1 ] && [[ "$OSTYPE" == "darwin"* ]]; then
-    SLOT_MODE="new"
-    [ "$CONTINUE_SESSION" = true ] && SLOT_MODE="restore"
-    _log OCD "Opening $WINDOW_COUNT terminal windows ($SLOT_MODE mode)..."
-    _OSA_ERR=$(osascript "$SCRIPT_DIR/multi-llm-docker.applescript" "$SCRIPT_DIR/ocd" "$WINDOW_COUNT" "$CURRENT_DIR" "$SLOT_MODE" 2>&1)
-    _OSA_RC=$?
-    if [ "$_OSA_RC" -ne 0 ]; then
-        if printf '%s' "$_OSA_ERR" | grep -qE -- '-1743|Not authori[sz]ed'; then
-            _log OCD ERROR "macOS blocked AppleScript from controlling iTerm."
-            _log OCD "Resetting the permission now so macOS will re-prompt..."
-            tccutil reset AppleEvents com.googlecode.iterm2 2>/dev/null || true
-            _log OCD "Now rerun: ${C2}ocd $WINDOW_COUNT${RST}"
-            _log OCD "macOS will prompt 'iTerm wants to control iTerm' — click Allow."
-            _log OCD "Permanent fix: System Settings → Privacy & Security → Automation → iTerm → check iTerm."
-        else
-            _log OCD ERROR "multi-window layout failed:"
-            printf '%s\n' "$_OSA_ERR" | sed 's/^/    /'
-        fi
-        exit 1
-    fi
-    exit 0
-fi
+# Multi-window fan-out (shared, see setup/launcher.sh).
+spawn_multi_windows OCD
+
+# Tidy duplicate memory for this project before launch (best-effort, never blocks).
+command -v _memory_merge_autorun >/dev/null 2>&1 && { _memory_merge_autorun || true; }
 
 # Single window - run directly
 run_opencode_container "$CURRENT_DIR" "$@"

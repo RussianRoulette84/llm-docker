@@ -10,121 +10,22 @@ blocks on a per-entry Event instead of sleep-looping.
 
 from __future__ import annotations
 
-import os
-import secrets
+import os  # noqa: F401
+import secrets  # noqa: F401
 import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path  # noqa: F401
 from typing import Optional
 
-
-# Statuses form a simple lifecycle:
-#   queued  → building → done | failed | cancelled
-STATUS_QUEUED    = "queued"
-STATUS_BUILDING  = "building"
-STATUS_DONE      = "done"
-STATUS_FAILED    = "failed"
-STATUS_CANCELLED = "cancelled"
-TERMINAL = {STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED}
-
-HISTORY_CAP = 20
-LOG_TAIL_LINES = 40
-
-
-class QueueFull(Exception):
-    """Raised by BuildQueue.enqueue when the pending deque is at max_pending.
-    server.py maps this to HTTP 429 so authed-but-abusive clients can't
-    exhaust memory by spamming POST /build."""
-
-
-@dataclass
-class BuildEntry:
-    id: str
-    agent_id: str
-    args: tuple[str, ...]
-    status: str = STATUS_QUEUED
-    returncode: Optional[int] = None
-    queued_at: float = field(default_factory=time.time)
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-    log_tail: str = ""
-    # Per-entry command + timeout snapshot. Set at enqueue time so a
-    # hot-reload of `.builder-api.toml` between enqueue and execute can't
-    # change what's running. Legacy [build] callers fill these from
-    # cfg.build; job callers fill them from the resolved Job.
-    command: str = ""
-    timeout_s: int = 0
-    # SIGTERM→SIGKILL grace window (seconds). 0 = use the helper's default (3s).
-    kill_after_s: int = 0
-    # Subdir (relative to project_root) the subprocess runs in. "." = project
-    # root. Snapshotted at enqueue time so a mid-flight hot-reload can't move
-    # the goalposts on a building job.
-    cwd: str = "."
-    # Set when this entry came from POST /job/<name>; None for legacy /build.
-    # Surfaces in to_public() so /queue and /build_status callers can tell
-    # which job a build came from.
-    job_name: Optional[str] = None
-    # Echo of validated placeholder values (jobs only) — useful for audit
-    # trail and debugging. None for legacy build.
-    params: Optional[dict] = None
-    # Stable fingerprint for the dedupe window. Derived from job_name+args
-    # at enqueue time. Internal; not exposed in to_public().
-    fingerprint: str = field(default="", repr=False)
-    _done: threading.Event = field(default_factory=threading.Event, repr=False)
-    # Live subprocess handle. Populated only while the entry is `building`.
-    # Used by `BuildQueue.cancel_current()` to signal the running process
-    # group from another thread. Never serialized.
-    _proc: object = field(default=None, repr=False)
-    # Byte offset into the shared build log file where THIS entry's output
-    # starts. Captured before the subprocess is launched so the log-tail
-    # render at _finalize() can be scoped to just this build instead of
-    # leaking the tail of whatever previous build wrote into the same
-    # file. 0 = read from start (used when the build never reached
-    # subprocess launch — e.g. cwd-escape rejection in _execute()).
-    log_start_offset: int = field(default=0, repr=False)
-    # Why this entry reached its terminal state. Currently surfaces only
-    # via `wait()` to disambiguate `build_timed_out` (subprocess hit its
-    # own timeout_s) from `poll_timed_out` (the long-poll wait expired).
-    # None until `_finalize()` runs.
-    finished_reason: Optional[str] = None
-
-    def to_public(self, *, include_log_tail: bool = True) -> dict:
-        """Serialisable view. Built explicitly rather than via asdict()
-        because asdict() deep-copies every field, and threading.Event
-        contains a non-picklable Lock — it crashes before we get a chance
-        to drop the field.
-
-        `include_log_tail=False` is used by /queue's history view to keep
-        per-poll responses tight (every history entry was carrying ~3 KB
-        of log text; on a busy day /queue ballooned past 100 KB). The
-        full log_tail is still available via /build_status?id=<id>.
-        """
-        d: dict = {
-            "id": self.id,
-            "agent_id": self.agent_id,
-            "args": list(self.args),
-            "status": self.status,
-            "returncode": self.returncode,
-            "queued_at": self.queued_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "command": self.command,
-            "timeout_s": self.timeout_s,
-            "elapsed_s": _elapsed(self),
-            "queued_at_iso": _iso(self.queued_at),
-            "started_at_iso": _iso(self.started_at),
-            "finished_at_iso": _iso(self.finished_at),
-        }
-        if include_log_tail:
-            d["log_tail"] = self.log_tail
-        if self.job_name is not None:
-            d["job_name"] = self.job_name
-            d["params"] = self.params or {}
-        return d
-
+from build_models import (  # noqa: F401
+    STATUS_QUEUED, STATUS_BUILDING, STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED,
+    TERMINAL, HISTORY_CAP, LOG_TAIL_LINES, QueueFull, BuildEntry, _iso, _elapsed,
+)
+from build_helpers import (  # noqa: F401
+    _short_id, _fingerprint, _resolve_managed_container, _kill_process_group, _tail_text,
+)
 
 class BuildQueue:
     """
@@ -619,119 +520,3 @@ class BuildQueue:
 # ---------------------------------------------------------------------------
 
 
-def _short_id() -> str:
-    # 8 hex chars is plenty for "recent build" cardinality; avoids full uuids.
-    return secrets.token_hex(4)
-
-
-def _fingerprint(*, job_name: Optional[str], args) -> str:
-    """Stable hash of the request shape, used as the dedupe key. We hash
-    rather than concatenate so the key length is bounded regardless of how
-    long the args end up. agent_id is intentionally excluded — two agents
-    racing to enqueue the same operation should collapse onto one queue_id,
-    not run twice."""
-    import hashlib
-    h = hashlib.sha256()
-    h.update((job_name or "__build__").encode("utf-8"))
-    h.update(b"\0")
-    for a in args:
-        h.update(a.encode("utf-8"))
-        h.update(b"\0")
-    return h.hexdigest()[:16]
-
-
-def _iso(ts: Optional[float]) -> Optional[str]:
-    if ts is None:
-        return None
-    import datetime as _dt
-    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).isoformat()
-
-
-def _elapsed(entry: BuildEntry) -> Optional[float]:
-    if entry.started_at is None:
-        return None
-    end = entry.finished_at if entry.finished_at is not None else time.time()
-    return round(end - entry.started_at, 3)
-
-
-def _resolve_managed_container(project_name: str) -> str:
-    """Return the container ID of the running container labelled
-    `llm-docker-project=<project_name>`, or empty string if none found.
-    cld/ocd set this label at `docker run` time so wrapper jobs can
-    `docker exec {{container}} ...` without hardcoding the volatile
-    `claude-<PID>` container name."""
-    try:
-        r = subprocess.run(
-            [
-                "docker", "ps",
-                "--filter", f"label=llm-docker-project={project_name}",
-                "-q",
-            ],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return ""
-    if r.returncode != 0:
-        return ""
-    ids = [ln.strip() for ln in r.stdout.split("\n") if ln.strip()]
-    return ids[0] if ids else ""
-
-
-def _kill_process_group(proc: subprocess.Popen, *, grace_s: Optional[int] = None) -> None:
-    """Kill the whole process group we spawned; otherwise timed-out builds
-    leave child processes running. `grace_s` is the SIGTERM→SIGKILL window
-    (default 3s, configurable per-job via `[jobs.<name>].kill_after_s`)."""
-    import signal
-    grace = grace_s if grace_s and grace_s > 0 else 3
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
-    # Poll every 100 ms for `grace` seconds, then SIGKILL stragglers.
-    for _ in range(int(grace * 10)):
-        if proc.poll() is not None:
-            return
-        time.sleep(0.1)
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
-def _tail_text(path: Path, n: int, *, start_offset: int = 0) -> str:
-    """Read the last `n` lines of `path` starting at `start_offset` bytes.
-
-    `start_offset` scopes the tail to a per-build slice of a shared log
-    file — _execute() captures the file size before launching each build,
-    and _finalize() passes that offset back here so build N+1's log_tail
-    can't leak the end of build N's output. Pass 0 (default) to read the
-    whole file (matches the original behaviour).
-
-    Small duplicate of logs._tail_text to avoid a circular import.
-    """
-    if not path.exists():
-        return ""
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return ""
-    if size <= start_offset:
-        return ""
-    span = size - start_offset
-    block = 65536
-    data = bytearray()
-    newlines = 0
-    with path.open("rb") as f:
-        pos = size
-        # Read backwards but never cross the per-build start offset —
-        # everything before it belongs to a prior build's output.
-        while pos > start_offset and newlines <= n:
-            read_size = block if (pos - start_offset) >= block else (pos - start_offset)
-            pos -= read_size
-            f.seek(pos)
-            data[:0] = f.read(read_size)
-            newlines = data.count(b"\n")
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    if len(lines) > n:
-        lines = lines[-n:]
-    return "\n".join(lines)

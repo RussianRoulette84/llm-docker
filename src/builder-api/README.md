@@ -13,10 +13,11 @@ doesn't have your toolchain.
 
 ```sh
 # 1. Drop the host config template into place (one-time, per host)
-mkdir -p ~/.llm-docker
+mkdir -p ~/.llm-docker/api_config
 cp /path/to/llm-docker/src/builder-api/builder-api.host.toml.example \
-   ~/.llm-docker/builder-api.toml
-vim ~/.llm-docker/builder-api.toml   # add a [project.<your-project>] block
+   ~/.llm-docker/api_config/builder-api.toml
+# Add each project as its own shard file in the same dir:
+#   ~/.llm-docker/api_config/<your-project>.toml  with a [project.<name>] block
 export BUILDER_API_PASSWORD=$(openssl rand -hex 16)   # or set in shell rc
 
 # 2. Launch (cld / ocd do this for you when you pass `-a`)
@@ -32,7 +33,7 @@ print(res["log_tail"])              # last 40 lines of build.log
 ```
 
 Per-project `.builder-api.toml` files in your repos are NOT read — the
-host config at `~/.llm-docker/builder-api.toml` is the only source of
+host config at `~/.llm-docker/api_config/builder-api.toml` is the only source of
 truth. A prompt-injected agent inside a project container cannot add or
 modify jobs.
 
@@ -96,8 +97,11 @@ site that strangers can load.
 
 ## Configuration
 
-The daemon reads ONE file: `~/.llm-docker/builder-api.toml`. Override the
-location with `$BUILDER_API_CONFIG` or `--config <path>`. See
+The daemon reads from `~/.llm-docker/api_config/`: the base file
+`builder-api.toml` (defaults, global jobs, language packs) plus one
+`<project>.toml` shard per project (each holding its `[project.<name>]`
+block — `*.toml` in that dir is merged). Override the base location with
+`$BUILDER_API_CONFIG` or `--config <path>`. See
 [`builder-api.host.toml.example`](builder-api.host.toml.example) for a
 heavily-commented reference.
 
@@ -140,8 +144,8 @@ plugin feature was removed — see "Removed features" below.
 
 ### Hot-reload
 
-The daemon polls `~/.llm-docker/builder-api.toml`'s mtime every ~1.5s.
-When it changes, the file is re-parsed for THIS daemon's project view
+The daemon polls the `~/.llm-docker/api_config/` files' mtimes every ~1.5s
+(base + this project's shard). When any changes, they're re-parsed for THIS daemon's project view
 and (on success) atomically swapped into place. The following take
 effect for **new** enqueues:
 
@@ -330,7 +334,7 @@ Anything less than careful thinking here turns it into an escape vector.
 
 **What the API cannot do via HTTP:**
 
-- Add or modify jobs. The config lives at `~/.llm-docker/builder-api.toml`
+- Add or modify jobs. The config lives at `~/.llm-docker/api_config/builder-api.toml`
   on the host — outside every container bind-mount. No agent inside any
   project can reach it, period.
 - Run arbitrary shell commands. The only commands ever executed are
@@ -360,7 +364,7 @@ Anything less than careful thinking here turns it into an escape vector.
   `password = "${BUILDER_API_PASSWORD}"` and export it in your shell.
 - If your build needs shell features (`cd foo && make`), wrap them in
   a script (`./build.sh`) that the API invokes. `execvp` is not a shell.
-- Keep `~/.llm-docker/builder-api.toml` outside any container mount and
+- Keep `~/.llm-docker/api_config/builder-api.toml` outside any container mount and
   user-only-writable (`chmod 600`). It IS the trust boundary.
 - Audit it like sudoers — every job declared there is something Claude
   can execute on your Mac.
@@ -396,7 +400,7 @@ already; you just set them in `.env`.
 There's no daemoniser — you start it in a terminal:
 
 ```sh
-python3 server.py --project <name>                # reads ~/.llm-docker/builder-api.toml
+python3 server.py --project <name>                # reads ~/.llm-docker/api_config/builder-api.toml
 BUILDER_API_PASSWORD=secret python3 server.py --project my-project
 python3 server.py --project foo --config /custom/path.toml
 ```

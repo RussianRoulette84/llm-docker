@@ -29,6 +29,7 @@ import datetime as _dt
 import os
 import shutil
 import signal
+import hashlib
 import subprocess
 import sys
 import time
@@ -45,13 +46,63 @@ MEM_BAR_WIDTH = 10               # cells
 
 # ── ANSI ──────────────────────────────────────────────────────────────
 if os.environ.get("NO_COLOR"):
-    P = G = R = Y = C = D = BOLD = RST = ""
+    P = R = D = RST = ""
+    def _titlebar(text): return f"{text}\n"
 else:
-    P = "\033[1;35m"; G = "\033[1;32m"; R = "\033[31m"
-    Y = "\033[33m";   C = "\033[1;36m"; D = "\033[2m"
-    BOLD = "\033[1m"; RST = "\033[0m"
+    P = "\033[1;35m"; R = "\033[31m"; D = "\033[2m"; RST = "\033[0m"
+    def _titlebar(text):  # bright-blue chip, dark bold text, filled to edge
+        return f"\033[48;5;39m\033[38;5;16;1m {text} \033[K\033[0m\n"
 
 CLEAR = "\033[2J\033[H"
+
+# Per-project color, deterministic from the name so a project keeps the same
+# color across refreshes. Applied to the name + sparkline only (stats stay
+# in their semantic colors). Red is reserved for errors, so it's not here.
+if os.environ.get("NO_COLOR"):
+    PALETTE: list[int] = []
+else:
+    # 24 visually distinct 256-color hues (no red — reserved for errors).
+    PALETTE = [39, 208, 48, 141, 220, 45, 205, 112, 111, 215,
+               33, 202, 118, 213, 87, 228, 154, 201, 123, 214,
+               51, 165, 82, 209]
+
+
+def _project_palette_index(name: str):
+    """The 256-color index this project hashes to (None when NO_COLOR/empty)."""
+    if not PALETTE or not name:
+        return None
+    return PALETTE[int(hashlib.md5(name.encode()).hexdigest(), 16) % len(PALETTE)]
+
+
+def project_color(name: str) -> str:
+    """Stable per-project ANSI color picked from PALETTE by hashing the name.
+    md5 (not Python's randomized hash) keeps the choice consistent across runs
+    and spreads short names evenly. Empty string when NO_COLOR or no name."""
+    idx = _project_palette_index(name)
+    return f"\033[38;5;{idx}m" if idx is not None else ""
+
+
+def _xterm256_rgb(idx: int) -> tuple:
+    """xterm 256-color index → (r, g, b). PALETTE uses only the 16-231 color
+    cube; the 232-255 grey ramp is handled too for completeness."""
+    if idx >= 232:
+        v = 8 + 10 * (idx - 232)
+        return (v, v, v)
+    i = idx - 16
+    levels = (0, 95, 135, 175, 215, 255)
+    return (levels[i // 36], levels[(i // 6) % 6], levels[i % 6])
+
+
+def iterm_tab_color(name: str) -> str:
+    """iTerm2 tab-color control sequences tinting the tab with the project's
+    own hue (same one cld-status uses) — so the main Claude pane is always
+    color-coded by project. Empty string when NO_COLOR / unknown."""
+    idx = _project_palette_index(name)
+    if idx is None:
+        return ""
+    r, g, b = _xterm256_rgb(idx)
+    esc = "\033]6;1;bg;{};brightness;{}\a"
+    return esc.format("red", r) + esc.format("green", g) + esc.format("blue", b)
 
 
 # ── docker introspection ──────────────────────────────────────────────
@@ -255,13 +306,17 @@ def render(
     history: dict[str, deque],
     chrm: int,
     play: int,
-    spark_width: int,
 ) -> str:
     """Compact two-lines-per-container render — fits a ~40-col × 15-row
     iTerm split (1 header + 2*N container lines + 1 footer = 8 lines
     for 3 containers; up to 6 containers fits in 14)."""
+    # Sparkline STRETCHES to the current pane width: total minus the fixed
+    # prefix ("proj:<11" + space = 12) and the stats suffix
+    # (" NNN% mNNN%" = 13). Recomputed every render so it tracks resizes.
+    cols = shutil.get_terminal_size((40, 20)).columns
+    spark_width = max(8, cols - 25)
     out: list[str] = []
-    out.append(f"{P}◆ cld{RST} {D}{time.strftime('%H:%M:%S')}{RST}\n")
+    out.append(_titlebar(f"cld · status · {time.strftime('%H:%M:%S')}"))
     if not containers:
         out.append(f"{D}  no cld containers running{RST}\n")
     for cid, proj, created_at in containers:
@@ -278,9 +333,10 @@ def render(
         uptime = fmt_uptime(created_at)
         ctx_bytes, _sess = claude_ctx_size(proj)
         ctx_short = fmt_bytes(ctx_bytes) if ctx_bytes else "—"
-        # Line 1: project + sparkline + cpu% + mem%
+        # Line 1: project + sparkline (both in the project's own color) + cpu% + mem%
+        col = project_color(proj)
         out.append(
-            f"{C}{proj:<11}{RST} {Y}{spark}{RST} "
+            f"{col}{proj:<11}{RST} {col}{spark}{RST} "
             f"{cpu:4.0f}% {D}m{RST}{mem:4.0f}%\n"
         )
         # Line 2: net + up + pids + ctx (all dim labels)
@@ -290,7 +346,7 @@ def render(
             f"{D}ctx{RST} {ctx_short}\n"
         )
     out.append(
-        f"{D}chrm{RST} {G}{chrm}{RST}  {D}play{RST} {G}{play}{RST}\n"
+        f"{D}chrm{RST} {P}{chrm}{RST}  {D}play{RST} {P}{play}{RST}\n"
     )
     return "".join(out)
 
@@ -335,9 +391,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     ap.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S,
                     help="poll interval in seconds (default 5)")
-    ap.add_argument("--width", type=int, default=12,
-                    help="sparkline width (default 12 — tuned for the ~40-col status pane)")
+    ap.add_argument("--tab-color", metavar="PROJECT",
+                    help="print the iTerm tab-color escape for PROJECT and exit")
     args = ap.parse_args(argv)
+
+    if args.tab_color is not None:
+        sys.stdout.write(iterm_tab_color(args.tab_color))
+        sys.stdout.flush()
+        return 0
 
     if shutil.which("docker") is None:
         sys.stderr.write(f"{R}cld-status: docker not on PATH{RST}\n")
@@ -355,6 +416,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     signal.signal(signal.SIGINT, _exit)
     signal.signal(signal.SIGTERM, _exit)
+
+    # Clear screen + scrollback once on start so the pane begins clean (the
+    # per-render CLEAR below only wipes the visible screen, not scrollback).
+    sys.stdout.write("\033[2J\033[3J\033[H")
+    sys.stdout.flush()
 
     while True:
         containers = list_cld_containers()
@@ -390,7 +456,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             last_net.pop(dead, None)
 
         rendered = render(
-            containers, stats, cpu_history, chrm, play, args.width
+            containers, stats, cpu_history, chrm, play
         )
         sys.stdout.write(CLEAR + rendered)
         sys.stdout.flush()

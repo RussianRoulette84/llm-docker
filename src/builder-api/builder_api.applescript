@@ -124,6 +124,13 @@ on run argv
     if (count of argv) >= 6 then
         set statusCmd to item 6 of argv
     end if
+    -- Optional 7th arg: shell command for a THIRD pane (verbose console),
+    -- horizontally-split BELOW the builder-api pane. Empty = skip. Split
+    -- mode only (new-window mode has no source pane to stack onto).
+    set verboseCmd to ""
+    if (count of argv) >= 7 then
+        set verboseCmd to item 7 of argv
+    end if
 
     -- Build the shell command that needs to run in the new pane.
     -- We invoke via `bash` so run-local.sh doesn't need the execute bit
@@ -206,6 +213,12 @@ on run argv
                     tell sourceSession
                         set rightPane to (split vertically with default profile)
                     end tell
+                    -- Settle delay BEFORE the first write (placed outside the
+                    -- session tell, like the 0.5 below). Each new terminal runs
+                    -- a Matrix intro animation whose terminal output otherwise
+                    -- lands in front of the command as `?exec` (zsh: no matches
+                    -- found). 2.5s lets the animation finish before we type.
+                    delay 2.5
                     tell rightPane
                         try
                             set columns to winCols
@@ -227,13 +240,42 @@ on run argv
                         write text cmd
                     end tell
 
-                    -- Finally shrink the TOP status pane to 15 rows.
+                    -- THIRD pane: verbose console, split horizontally BELOW the
+                    -- builder-api pane. Write IMMEDIATELY after the split, same
+                    -- proven pattern as the panes above.
+                    if verboseCmd is not "" then
+                        delay 0.5
+                        tell bottomPane
+                            set verbosePane to (split horizontally with default profile)
+                        end tell
+                        tell verbosePane
+                            set name to "verbose"
+                            write text verboseCmd
+                        end tell
+                    end if
+
+                    -- Rebalance row heights. With a verbose pane the stack is
+                    -- status / api / verbose; give the scrolling console the
+                    -- remainder. Without it, keep the original status=15.
                     delay 0.2
-                    tell rightPane
-                        try
-                            set rows to 15
-                        end try
-                    end tell
+                    if verboseCmd is not "" then
+                        tell rightPane
+                            try
+                                set rows to 12
+                            end try
+                        end tell
+                        tell bottomPane
+                            try
+                                set rows to 14
+                            end try
+                        end tell
+                    else
+                        tell rightPane
+                            try
+                                set rows to 15
+                            end try
+                        end tell
+                    end if
                 else
                     -- Single-pane HEAD code path (no status pane).
                     tell sourceSession

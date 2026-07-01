@@ -152,6 +152,21 @@ regex       = "^[1-5]$"
 required    = true
 description = "Tree depth 1..5"
 
+# Host-side trash — the in-container rm-guard routes deletes here so files land
+# in the host trash (recoverable) instead of being destroyed via the bind-mount.
+# {path} is relative to project root (cwd=project_root); regex forbids leading /
+# and "..". execvp, no shell.
+[jobs.trash]
+command     = "trash"
+args        = ["{path}"]
+timeout_s   = 20
+description = "Move a path (relative to project root) to the host trash — recoverable"
+[jobs.trash.placeholders.path]
+regex       = "^(?!/)(?!.*\\.\\.)[A-Za-z0-9._/ @+-]+$"
+max_len     = 512
+required    = true
+description = "Path relative to project root (no leading /, no ..)"
+
 
 # ══════════════════════════════════════════════════════════════════════
 # LANGUAGE PACKS — opt-in per project via `languages = [...]`

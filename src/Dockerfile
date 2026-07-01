@@ -128,4 +128,6 @@ EXPOSE 22
 # Entro pointo
 COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY docker/entrypoint-lib.sh /usr/local/bin/entrypoint-lib.sh
+RUN chmod +x /usr/local/bin/entrypoint-lib.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

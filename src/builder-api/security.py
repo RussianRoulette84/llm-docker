@@ -201,6 +201,22 @@ class AuthGate:
             handler.wfile.write(body)
         except BrokenPipeError:
             pass
+        # Mirror rejected calls (401/429) into the verbose console — they
+        # bypass _serve_json. Live-only; never break the request path.
+        try:
+            from urllib.parse import urlsplit, parse_qs
+            split = urlsplit(handler.path or "")
+            self._events("http_call", {
+                "method": getattr(handler, "command", "?"),
+                "path": split.path,
+                "query": {k: v[0] for k, v in parse_qs(split.query).items()},
+                "status": status,
+                "summary": message,
+                "body": message,
+                "ip": handler.client_address[0] if handler.client_address else None,
+            }, persist=False)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

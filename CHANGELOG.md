@@ -1,3 +1,28 @@
+# v3.0 (2026-06-28)
+
+## cld & ocd
+- [NEW] First-class s3c-gorilla (KeePassXC vault) opt-in via `IS_S3C_GORILLA_ENABLED=true` in `llm-docker.conf`. When set, `cld`/`ocd`/`run-local.sh` re-exec through `env-gorilla llm-docker -- …` regardless of `USER`. Underscore key only — a hyphen is silently dropped by the conf parser.
+- [NEW] Graceful fallback: vault opted-in but `env-gorilla` not installed → fall back to `.env` (or just launch). One dim warning, only on a fresh launch with no `.env`; `-c`/`--continue`/`--resume` stay silent.
+
+## Installer
+- [NEW] Step 3 secrets-source toggle: "Use s3c-gorilla vault instead of a plain .env?" (default ON). Writes the conf flag.
+- [NEW] End-of-install onboarding for vault mode: prints a paste-ready `.env` block (built from the secrets you entered) for the KeePassXC `llm-docker` entry, explains env-gorilla injection, then offers to run the s3c-gorilla installer (`bash <(curl -fsSL …/s3c-gorilla/master/src/install.sh)`).
+- [NEW] Codeman web-UI password prompt — fires only when codeman (`-tc`) is selected; saved to `.env`.
+- [BUG] Installer no longer crashes on macOS bash 3.2 at step 7 — replaced a bash-4-only `${VAR,,}` lowercase with a portable `tr`.
+
+## Builder API panel
+- [BUG] `cld -a` / `ocd -a`: the `cld-status` dashboard pane failed on the FIRST spawn with `zsh: no matches found: ?exec …` (the fresh shell's terminal handshake garbling the command), then worked on retry. Added a `delay 0.6` before the first write to that pane — placed outside the session `tell`, mirroring the existing settle delay the api pane already uses.
+- [NEW] Auto-teardown on exit: quitting `cld`/`ocd` (e.g. Ctrl+C twice) now stops THIS project's builder-api daemon and closes both its panes — the builder-api panel AND the `cld-status` dashboard — so you don't close three panes by hand. Implemented as a SEPARATE script (`builder-api/close_api_panes.applescript`) so it cannot affect the spawn path; scoped to the project's port (other projects' panes untouched), kills each pane's processes before closing so iTerm shows no confirmation. Best-effort — never blocks the shell's own exit. (Single-window run path; multi-window `cld 4` panes are managed per child.)
+
+## Health check & SSH smoke
+- [BUG] `install_test.sh` crashed on macOS bash 3.2 (`syntax error near ';;'`) — the container probe used a heredoc nested in `$( … )`, which bash 3.2 mis-parses. Switched to `read -r -d '' PROBE <<'EOF'`. Both `install_test.sh` and `smoke_test.sh` now run on stock 3.2; no homebrew bash required.
+- [TWEAK] Health check is now "smart": missing API key / no `/login` token / a missing optional devpack are warnings, not failures — a fresh first install passes (`exit 0` once the report renders).
+- [NEW] SSH smoke test folded INTO the health check — one "Run health check?" prompt now also exercises SSH end-to-end when enabled (removed the separate SSH-smoke prompt).
+- [BUG] SSH smoke test no longer dies with "port 8884 already in use" when a cld/ocd container is running — it auto-advances to the next free host port (scans +1…+20) for its ephemeral test container.
+
+## Build
+- [BUG] Image rebuilt on every launch "for no reason": `docker build` now passes `--provenance=false --sbom=false` so buildx produces a plain tag instead of a manifest-list the classic image store can't expose — the existence check finds it and skips the rebuild.
+
 # v2.9 (2026-06-19)
 
 ## API
@@ -77,7 +102,7 @@ Generic commands across every project, per-project settings, and a live status p
 - [CHANGE] `src/cld` + `src/ocd` port resolution reads `~/.llm-docker/api_config/<name>.toml` first, base second, `BUILDER_API_PORT` env third, default 6666 last. Both probe `lsof -ti :$port` before spawning and skip cleanly if anything is bound.
 - [CHANGE] `src/ocd` ported `flock`-based Docker-launch serialization from `src/cld`. Shared lock at `/tmp/cld-docker-start.lock`.
 - [CHANGE] `src/builder-api/builder_api.applescript` — split path snapshots the outer iTerm window bounds, applies `set columns to winCols`, then restores bounds. `winCols` cut to 40. `clear;` removed from the typed cmd.
-- [CHANGE] Repo layout: `api_config/builder-api.toml` (base) + `api_config/{llm-docker,purpletech,slav-ai}.toml` (shards). The legacy `projects/` directory and root-level `builder-api.toml` are gone.
+- [CHANGE] Repo layout: `api_config/builder-api.toml` (base) + `api_config/{llm-docker,slav-ai}.toml` (shards). The legacy `projects/` directory and root-level `builder-api.toml` are gone.
 - [TWEAK] CLAUDE.md gains a "No auto daemon restart in examples" rule: install commands never chain `&& cld -c -a`. Yaro picks the restart timing himself across multiple terminals.
 - [TWEAK] Banner subtitle rebranded "Builder API" → "LLM-docker API". Internal env vars + Python identifiers + paths under `src/builder-api/` keep their names for back-compat.
 

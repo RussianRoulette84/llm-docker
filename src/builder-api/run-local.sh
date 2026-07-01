@@ -18,7 +18,7 @@ set -e
 # prepend `clear;` to the typed cmd, but some zsh setups glob-mangle the first
 # pasted word (`?clear` → NOMATCH). Doing it here, AFTER bash has taken over,
 # is unconditional and immune to that bug.
-printf '\033[2J\033[H'
+printf '\033[2J\033[3J\033[H'   # clear screen + scrollback so the pane starts clean
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="${1:-$(pwd)}"
@@ -37,7 +37,7 @@ _row()  { printf "${DIM}  ·${NC} %-9s %s\n" "$1" "$2"; }
 if [ -n "$HANDOFF_PATH" ] && [ -f "$HANDOFF_PATH" ]; then
     # shellcheck disable=SC1090
     . "$HANDOFF_PATH"
-    rm -f "$HANDOFF_PATH"
+    /bin/rm -f "$HANDOFF_PATH"
 fi
 
 # --- env-gorilla integration ---
@@ -47,12 +47,16 @@ fi
 PROJECT_DIR_RAW="${1:-$(pwd)}"
 PROJECT_NAME="$(basename "$(cd "$PROJECT_DIR_RAW" 2>/dev/null && pwd)" 2>/dev/null || basename "$PROJECT_DIR_RAW")"
 
+# Explicit opt-in via llm-docker.conf (underscores only — a hyphen is dropped).
+_gorilla_on=false
+grep -q '^IS_S3C_GORILLA_ENABLED=true' "$SCRIPT_DIR/../llm-docker.conf" 2>/dev/null && _gorilla_on=true
+
 if [ -n "${BUILDER_API_PASSWORD:-}" ]; then
     export LLM_DOCKER_ENV_GORILLA=1
     ENV_SRC="parent"
 elif [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
      && command -v env-gorilla >/dev/null 2>&1 \
-     && { [ "${USER:-}" = "yaro" ] || [ ! -f "$SCRIPT_DIR/../.env" ]; }; then
+     && { [ "${USER:-}" = "yaro" ] || [ ! -f "$SCRIPT_DIR/../.env" ] || [ "$_gorilla_on" = true ]; }; then
     export LLM_DOCKER_ENV_GORILLA=1
     if [ -n "$PROJECT_NAME" ] && [ "$PROJECT_NAME" != "llm-docker" ]; then
         _profiles="llm-docker,$PROJECT_NAME"
@@ -63,6 +67,12 @@ elif [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
     exec env-gorilla "$_profiles" -- bash "$0" "$@"
 else
     ENV_SRC=".env"
+    # Opted into the vault but env-gorilla is absent: quiet fall back to .env.
+    # Warn only when there's no .env to fall back to.
+    if [ "$_gorilla_on" = true ] && ! command -v env-gorilla >/dev/null 2>&1 \
+       && [ ! -f "$SCRIPT_DIR/../.env" ]; then
+        printf '\033[2m  s3c-gorilla enabled but env-gorilla not found — no vault, no .env.\033[0m\n' >&2
+    fi
 fi
 
 if [ ! -d "$PROJECT_DIR" ]; then
@@ -84,7 +94,7 @@ for CONF_FILE in "$SCRIPT_DIR/../llm-docker.conf" "$SCRIPT_DIR/../.env" "./.env"
     done < "$CONF_FILE"
 done
 
-CFG="${BUILDER_API_CONFIG:-$HOME/.llm-docker/builder-api.toml}"
+CFG="${BUILDER_API_CONFIG:-$HOME/.llm-docker/api_config/builder-api.toml}"
 CFG_SHORT="${CFG/#$HOME/~}"
 
 _head "builder-api" "$PROJECT_NAME"

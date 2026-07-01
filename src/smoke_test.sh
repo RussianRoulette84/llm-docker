@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # smoke_test.sh — verify SSH end-to-end against the built llm-docker image.
-# Requires bash 4+; macOS `/bin/bash` is 3.2, so use env to find homebrew bash.
-# Starts an ephemeral container with sshd on an unused host port, probes the
-# TCP listener, tries key-based `ssh root@localhost whoami`, tears down.
+# Runs on macOS bash 3.2 (no homebrew bash required).
+# Starts an ephemeral container with sshd on an auto-picked free host port,
+# probes the TCP listener, tries key-based `ssh root@localhost whoami`, tears
+# down. Invoked standalone or from install_test.sh's health check.
 #
 # Usage:  ./src/smoke_test.sh
 # Exit:   0 = SSH login works; 1 = any check failed; skipped if SSH disabled.
@@ -40,13 +41,23 @@ if [ "$SSH_ENABLED" != "true" ]; then
     exit 0
 fi
 
-# Always test against the configured host port. If it's taken (e.g. a cld
-# container is running), fail loudly — testing a different port doesn't
-# validate the real setup.
+# Pick a free host port for the ephemeral test container. Prefer the configured
+# port; if it's taken (e.g. a real cld/ocd container is already running on it),
+# auto-advance to the next free port instead of failing. The test spins up its
+# OWN container, so any free port validates that sshd binds + key login works.
+_port_busy() { (timeout 1 bash -c "</dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 TEST_HOST_PORT="$SSH_HOST_PORT"
-if (timeout 1 bash -c "</dev/tcp/127.0.0.1/$TEST_HOST_PORT") 2>/dev/null; then
-    _fail "port $SSH_HOST_PORT is already in use — stop the running cld/ocd container and rerun."
-    exit 1
+if _port_busy "$TEST_HOST_PORT"; then
+    _orig="$TEST_HOST_PORT"
+    for _p in $(seq $((SSH_HOST_PORT + 1)) $((SSH_HOST_PORT + 20))); do
+        if ! _port_busy "$_p"; then TEST_HOST_PORT="$_p"; break; fi
+    done
+    if [ "$TEST_HOST_PORT" = "$_orig" ]; then
+        _fail "no free host port in ${_orig}-$((_orig + 20)) — stop some containers and rerun."
+        exit 1
+    fi
+    _warn "port $_orig in use (cld/ocd running?) — testing on free port $TEST_HOST_PORT instead."
+    unset _orig _p
 fi
 
 printf "\n${BOLD}${PURPLE}llm-docker · SSH smoke test${RESET}\n"

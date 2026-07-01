@@ -275,14 +275,29 @@ timeout. Bind / port / runtime changes require a daemon restart.
 If you use [s3c-gorilla](https://github.com/RussianRoulette84/s3c-gorilla)
 for KeePassXC-backed secret injection, `cld`, `ocd`, and `run-local.sh`
 auto-detect it and re-exec themselves through `env-gorilla llm-docker --`
-when:
+when `env-gorilla` is on PATH AND any of:
 
+- `IS_S3C_GORILLA_ENABLED=true` in `llm-docker.conf` (the explicit opt-in —
+  set it via the installer's step 3, or by hand), OR
 - `USER=yaro` (always inject, gorilla overrides `.env`), OR
-- `.env` is missing AND `env-gorilla` is on PATH (fallback for any user)
+- `.env` is missing (fallback for any user)
 
 The re-exec is gated by an `LLM_DOCKER_ENV_GORILLA=1` env var to prevent
 infinite loops. If you don't have env-gorilla installed, `setup_env()` seeds
 `.env` from `.env.example` and you edit it directly.
+
+**Vault opt-in, binary missing:** if `IS_S3C_GORILLA_ENABLED=true` but
+`env-gorilla` isn't installed, `cld`/`ocd` don't fail — they fall back to
+`.env` (or just launch and let Claude/OpenCode `/login`). A single dim warning
+prints only on a fresh launch with no `.env`; continue/resume (`-c`) launches
+stay silent. The installer's step 3 toggle writes the flag and, at the end,
+prints a paste-ready `.env` block for your KeePassXC `llm-docker` entry plus an
+offer to run the s3c-gorilla installer
+(`bash <(curl -fsSL …/s3c-gorilla/master/src/install.sh)`).
+
+**Note on the conf key:** it must be `IS_S3C_GORILLA_ENABLED` with
+underscores. The host-side conf parser (`_source_all_config`) validates keys
+against `^[A-Za-z_][A-Za-z0-9_]*$` and silently drops anything with a hyphen.
 
 For builder-api's `run-local.sh`, the re-exec uses `bash "$0" "$@"` rather
 than bare `"$0"` — the script is intentionally non-executable (mode 0644)
