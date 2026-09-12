@@ -333,6 +333,33 @@ if [ "$_tmux_need_rustup" = true ]; then
     export PATH="/root/.cargo/bin:$PATH"
 fi
 
+# Litestream — SQLite WAL streamer for continuous opencode DB mirroring
+# (see src/docker/opencode-db.sh). Always on; pinned version, sha256-verified.
+if [ -x /usr/local/bin/litestream ]; then
+    echo "[DEVPACK] litestream already installed — skipping"
+else
+    _ls_ver="0.5.17"
+    case "$(uname -m)" in
+        x86_64) _ls_arch="x86_64"; _ls_sha="cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d" ;;
+        aarch64|arm64) _ls_arch="arm64"; _ls_sha="f8ca4a050095c1efbda2c4365172e61bf9d955ea0d9ac42f448b52e51819baa5" ;;
+        *) echo "[DEVPACK][WARNING] litestream: unsupported arch $(uname -m) — skipping"; _ls_arch="" ;;
+    esac
+    if [ -n "$_ls_arch" ]; then
+        echo "[DEVPACK] installing litestream v$_ls_ver ($_ls_arch)..."
+        _ls_tmp="$(mktemp -d)"
+        if curl -sSL -o "$_ls_tmp/litestream.tar.gz" \
+             "https://github.com/benbjohnson/litestream/releases/download/v$_ls_ver/litestream-$_ls_ver-linux-$_ls_arch.tar.gz" \
+           && echo "$_ls_sha  $_ls_tmp/litestream.tar.gz" | sha256sum -c - \
+           && tar xzf "$_ls_tmp/litestream.tar.gz" -C "$_ls_tmp" \
+           && install -m 755 "$_ls_tmp/litestream" /usr/local/bin/litestream; then
+            echo "[DEVPACK] litestream v$_ls_ver installed"
+        else
+            echo "[DEVPACK][WARNING] litestream install failed — opencode-db.sh falls back to slow .backup mirroring"
+        fi
+        /bin/rm -rf "$_ls_tmp"
+    fi
+fi
+
 if _is_true "${INSTALL_TMUX_RECON:-false}"; then
     if [ -x /usr/local/bin/recon ]; then
         echo "[DEVPACK] recon already installed — skipping"

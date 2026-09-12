@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This project (primary) claude.md file is used in pair with global ` ~/.claude/CLAUDE.md` file.
+This project (primary) `CLAUDE.md` / `AGENTS.md` (symlink) file is used in pair with global `~/.claude/CLAUDE.md` file for ClaudeCode OR `~/.config/opencode/AGENTS.md` for OpenCode.
 
 This file provides guidance to Claude Code / OpenCode when working with user & code in this repository using `agentic development`, `feedback loops`, `autonomy (YALO skill)`, `orchestrator agents`, `MCP Tools`, `LLM-Docker Builder API`.
 
@@ -10,11 +10,11 @@ This file provides guidance to Claude Code / OpenCode when working with user & c
 
 For each new session or after context compaction please do **STEP 1, 2, 3, 4, 5** with **NO EXCEPTIONS**:
 
-**STEP 1**: read this `CLAUDE.md` file from top to bottom
+**STEP 1**: read this file from top to bottom
 
 **STEP 2**: read `README.md` file and understand the project scope
 
-**STEP 3**: now you can do "your" usual claude boot process with `memory/MEMORY.md`, etc
+**STEP 3**: now you can do "your" usual boot process
 
 **STEP 4**: read `docs/LLM-DOCKER.md`
 
@@ -23,7 +23,7 @@ For each new session or after context compaction please do **STEP 1, 2, 3, 4, 5*
 NOTE: `**text**` means bold text above
 
 ```
-Claude Agent loaded 🔫! 
+Agento loaded 🔫! 
 
 I promise not to forget your rules Master! I will dial my `PERFORMANCE` setting to super AI level because you are an exceptional power-user and pay 200/month.
 
@@ -100,6 +100,8 @@ Read global GIT rules. Stop fucking around with my GIT repo. You are READ only w
 ## Lessons Learned
 
 - **LESSON 1:** we can wipe the host ~/Projects directory from Docker if we are not careful. Like mirroring the whole Projects folder then calling 'rm' inside Docker whiich wipes if from MacOS host system too.
+
+- **LESSON 2:** NEVER launch the opencode TUI with `&` + `wait` in the entrypoint (the claude `& + wait` signal shape does NOT translate). A backgrounded opencode loses raw-mode TTY ownership → arrow keys / mouse events leak as literal escape garbage in iTerm2 (junk while scrolling, `%%` at the prompt). opencode runs FOREGROUND; single Ctrl+C still exits fine because SIGINT hits the TUI directly and the deferred bash trap runs cleanup after it quits. Corollary: exit-path worker stops need short grace + `disown` (litestream ignores SIGTERM — 5s grace = 5s exit hang + `Killed` job spam).
 
 ---
 

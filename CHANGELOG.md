@@ -1,3 +1,41 @@
+# v4.0.0 (2026-09-12)
+
+It's OpenCode's time to shine. Starting from >4.x it's ONLY OpenCode development.
+
+I switched to OpenCode (Z.AI GLM models) because Claude's 5.X models are very very bad, irritating and dangereus! Issues:
+ - it talks too much. Even for a simple YES or NO questions it writes novels. Unstoppable. I tried stopping it with CLAUDE.md, pre-hooks, post-hooks. Nothing worked.
+ - you ask it to do X and it will do X Y Z. Very dangereus.
+
+## OpenCode — terminal + exit
+- [BUG] `ocd` spewed random escape garbage in iTerm2 (junk while scrolling, `%%` at the prompt, arrows typing `^[[A`) — opencode was backgrounded `& + wait` for the Ctrl+C fix, which breaks its raw-mode TTY ownership. It runs in the foreground again; Ctrl+C still exits on one press (SIGINT reaches the TUI directly, the shell's cleanup runs after it quits).
+- [BUG] Exit took 5+ seconds with an ugly `NNN Killed ( litestream … )` line — the DB mirror's replicator ignores SIGTERM and burned the full 5s grace, then bash printed the job-kill notification. Workers are now disowned (no notification) and get a 0.2s grace before SIGKILL — exit sync drops from ~5.1s to ~0.3s.
+
+## OpenCode — database
+- [BUG] The "database disk image is malformed" crashes are fixed. The chat history kept corrupting when several opencode terminals ran at once — the Mac-shared folder can't safely handle this database type under parallel writes (upstream issue #14970). The history now lives on Docker's internal disk, where it's safe.
+- [NEW] Litestream streams a live copy of that history back to your Mac — continuously, not on timers. If Docker's disk is ever wiped, the next launch rebuilds automatically from your Mac's copy.
+- [NEW] `ocd --dbrestore` opens the interactive repair menu (freshest litestream replica, backups, dumps — your pick); `ocd --dbbackup` takes a quick safety backup. Same tool runs standalone: `scripts/ocd_db_restore.sh`.
+- [NEW] Mirroring logs to `db-mirror.log` under `~/.llm-docker` with timings and sizes — watch it live with `tail -f`.
+- [NEW] Interactive repair tool for a corrupted database: `scripts/ocd_db_restore.sh`, follow the menu. Never deletes — everything lands in backups.
+
+## Sessions
+- [CHANGE] `cld -c` / `ocd -c` restore the session THIS terminal pane last used — terminal B no longer wakes up inside terminal A's chat.
+- [TWEAK] Nothing to restore (fresh project, or a remembered session that's gone) starts a new chat instead of erroring out.
+
+## Updates
+- [BUG] The launch update check never actually updated opencode if you also use claude — one shared timer let `cld` launches reset `ocd`'s. Each tool now has its own.
+- [CHANGE] Update checks run at most weekly now. New `CHECK_UPDATE_EVERY_X_DAYS` setting; `UPDATE_FORCE=1` for an instant check.
+- [BUG] OpenCode's in-app "upgrade available → YES" silently did nothing inside the cage. The offer is gone — `ocd` keeps the tool current at launch instead.
+- [BUG] OpenCode's config file was overwritten on every launch, throwing away model changes made on the Mac. Seeded once, first launch only.
+
+## Builder API panel
+- [BUG] A second `cld`/`ocd` window in the same project used to kill the first window's builder-api panel and steal it. Windows now share the running daemon — each keeps its own status and console views.
+- [CHANGE] The `-a` status panel lists OpenCode containers too, not just claude's.
+
+### Dev logs
+- [TWEAK] Containers carry a `llm-docker-tool` label for panel + status detection.
+- [TWEAK] Litestream baked into every image by default (pinned v0.5.17, sha256-verified); `src/docker/opencode-db.sh` orchestrates volume seeding + mirroring, falls back loudly to full-file backups when the binary is missing.
+- [TWEAK] Container exports `sessions-index.tsv` on every sync so host-side session lookups work without touching the stale mirror database.
+
 # v3.0.4 (2026-07-22)
 
 Vault-aware install: the installer, health check, and SSH smoke test all wrap themselves through your KeePassXC vault when you opt in, so every secret prompt pre-fills automatically.

@@ -197,7 +197,7 @@ run_claude_container() {
 
     # Forward every env var into the container. Tiny blocklist: only vars
     # that would BREAK the container if a Mac value leaked in (PATH points
-    # at /Users/yaro/..., HOME points at a path that doesn't exist, loader
+    # at ~/... on the host, HOME points at a path that doesn't exist in the container, loader
     # hijack via LD_/DYLD_, etc.) plus the env-gorilla re-exec guard.
     EXTRA_ENV=""
     _ENV_BLOCK='^(PATH|HOME|TMPDIR|PWD|OLDPWD|SHELL|USER|LOGNAME|HOSTNAME|SHLVL|LD_.+|DYLD_.+|LLM_DOCKER_ENV_GORILLA)$'
@@ -209,9 +209,15 @@ run_claude_container() {
     done < <(env)
     unset _ename _ENV_BLOCK
 
+    # Per-terminal session tracking: marker created just before launch so
+    # the exit-side save only picks jsonl files touched by THIS run.
+    local _TS_MARKER=""
+    _TS_MARKER="$(mktemp)" && touch "$_TS_MARKER"
+
     docker run --rm -it \
         --label com.docker.compose.project=llm-docker \
         --label "llm-docker-project=$_LLM_PROJECT_TOKEN" \
+        --label "llm-docker-tool=claude" \
         --hostname llm-docker \
         --name "$CONTAINER_NAME" \
         -w "$DOCKER_WORKDIR" \
@@ -254,5 +260,6 @@ run_claude_container() {
     # Save THIS terminal's claude session UUID so a subsequent `cld -c`
     # in the same pane resumes here, not whichever session was most
     # recent globally. Non-blocking: silently no-ops on any error.
-    _save_terminal_session "$(_terminal_id)" "$(_project_key "$WORKDIR")" "$(_claude_session_dir "$WORKDIR")" 2>/dev/null || true
+    _save_terminal_session "$(_terminal_id)" "$(_project_key "$WORKDIR")" "$(_claude_session_dir "$WORKDIR")" "$_TS_MARKER" "$RESUME_SESSION" 2>/dev/null || true
+    [ -n "$_TS_MARKER" ] && /bin/rm -f "$_TS_MARKER" 2>/dev/null
 }

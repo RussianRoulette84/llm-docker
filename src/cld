@@ -474,6 +474,15 @@ CLAUDE_HOME="$HOME/.llm-docker/claude"
 _TERM_SESSIONS_FILE="$CLAUDE_HOME/.claude/terminal-sessions.tsv"
 # _terminal_id + _lookup_terminal_session live in setup.sh (shared with ocd).
 
+# Self-heal: v2.9-era launcher keyed rows by the full host path instead of
+# the project token — re-key them (idempotent).
+if [ -f "$_TERM_SESSIONS_FILE" ]; then
+    _tsv_tmp="$(mktemp)"
+    awk -F'\t' -v OFS='\t' '{ if ($2 ~ /^\//) { n=$2; sub(/.*\//, "", n); $2=n } print }' \
+        "$_TERM_SESSIONS_FILE" > "$_tsv_tmp" && mv "$_tsv_tmp" "$_TERM_SESSIONS_FILE"
+    unset _tsv_tmp
+fi
+
 # Compute claude's per-project session dir for a host workdir, using the SAME
 # stable-token logic as _compute_workspace_mounts so the path matches the
 # container workdir (and survives WORKSPACE_DIR changes).
@@ -491,21 +500,26 @@ _claude_session_dir() {
     _dashed_session_dir "$CLAUDE_HOME" "$docker_wd"
 }
 
-# Find the newest jsonl in `sess_dir` and save its UUID for (terminal, project).
+# Save the session THIS terminal used for (terminal, project):
+#   - resumed a known session (`exact`) → that exact UUID
+#   - fresh launch → newest jsonl modified since `marker` (created just
+#     before the container started)
+#   - nothing touched this run → keep the previous binding untouched.
 _save_terminal_session() {
-    local tid="$1" proj="$2" sess_dir="$3"
-    [ -d "$sess_dir" ] || return 0
-    local newest
-    newest=$(ls -t "$sess_dir"/*.jsonl 2>/dev/null | head -1)
-    [ -z "$newest" ] && return 0
-    newest=$(basename "$newest" .jsonl)
+    local tid="$1" proj="$2" sess_dir="$3" marker="${4:-}" exact="${5:-}"
+    local sid="$exact" newest
+    if [ -z "$sid" ] && [ -d "$sess_dir" ] && [ -n "$marker" ] && [ -f "$marker" ]; then
+        newest=$(find "$sess_dir" -name '*.jsonl' -newer "$marker" 2>/dev/null | head -1)
+        [ -n "$newest" ] && sid=$(basename "$newest" .jsonl)
+    fi
+    [ -z "$sid" ] && return 0
     mkdir -p "$(dirname "$_TERM_SESSIONS_FILE")"
     local tmp
     tmp="$(mktemp)"
     if [ -f "$_TERM_SESSIONS_FILE" ]; then
         awk -F'\t' -v t="$tid" -v p="$proj" '!($1==t && $2==p)' "$_TERM_SESSIONS_FILE" > "$tmp"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$tid" "$proj" "$newest" "$(date +%s)" >> "$tmp"
+    printf '%s\t%s\t%s\t%s\n' "$tid" "$proj" "$sid" "$(date +%s)" >> "$tmp"
     mv "$tmp" "$_TERM_SESSIONS_FILE"
 }
 
@@ -520,9 +534,9 @@ if [ -n "$SLOT" ]; then
     fi
 fi
 
-# Per-terminal continue: if `-c` was used without --slot and without an
-# explicit UUID, and we've saved a session for THIS iTerm pane in this
-# project, resume that specific session — not "most recent in project".
+# Per-terminal continue: `-c` without --slot/UUID resumes THIS pane's own
+# session. A pane with no memory yet starts FRESH (and binds it on exit) —
+# never silently joins the last-used one.
 if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ]; then
     _TS_TID=$(_terminal_id)
     _TS_SAVED=$(_lookup_terminal_session "$_TS_TID" "$(_project_key "$CURRENT_DIR")")
@@ -532,7 +546,26 @@ if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ];
             RESUME_SESSION="$_TS_SAVED"
         fi
     fi
+    if [ -z "$RESUME_SESSION" ]; then
+        CONTINUE_SESSION=false
+        _log CLAUDE "no session memory for this pane — starting a fresh one"
+    fi
     unset _TS_TID _TS_SAVED _TS_SDIR
+fi
+
+# Degrade-to-fresh guards: resume targets that no longer exist (or `-c`
+# with zero sessions in this project) must start FRESH, not error out.
+if [ -n "$RESUME_SESSION" ]; then
+    if [ ! -f "$(_claude_session_dir "$CURRENT_DIR")/$RESUME_SESSION.jsonl" ]; then
+        _log CLAUDE "remembered session $RESUME_SESSION not found — starting fresh"
+        RESUME_SESSION=""
+    fi
+fi
+if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ]; then
+    if ! ls "$(_claude_session_dir "$CURRENT_DIR")"/*.jsonl >/dev/null 2>&1; then
+        _log CLAUDE "no sessions in this project yet — starting fresh"
+        CONTINUE_SESSION=false
+    fi
 fi
 
 # Function to run a single Claude container

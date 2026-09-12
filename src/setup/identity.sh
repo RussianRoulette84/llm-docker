@@ -88,7 +88,7 @@ _compute_workspace_mounts() {
 _dashed_session_dir() {
     local claude_home="$1" docker_wd="$2"
     # Claude normalizes its on-disk project dir by replacing / _ . with - .
-    # (e.g. /root/Projects/oc_docker -> -root-Projects-oc-docker). Match that
+    # (e.g. /root/Projects/llm-docker -> -root-Projects-llm-docker). Match that
     # exactly or slot-restore silently misses for names containing _ or . .
     local dpath="${docker_wd#/}"; dpath="$(printf '%s' "$dpath" | tr '/_.' '-')"
     printf '%s/.claude/projects/-%s' "$claude_home" "$dpath"

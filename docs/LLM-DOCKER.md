@@ -163,7 +163,9 @@ finds the same chats.
 │   └── .claude.json
 ├── opencode/
 │   ├── .config/opencode/               ← OpenCode config
-│   ├── .local/share/opencode/          ← OpenCode SQLite + slot_N.id
+│       ├── .local/share/opencode/          ← OpenCode SQLite + slot_N.id
+    │   (live copy on Docker volume "llm-docker-opencode-data"; the host
+    │    dir below is the disaster-recovery mirror — see opencode-db.sh)
 │   │   └── opencode.db
 │   └── .cache/opencode/
 ├── ssh/                                ← SSHD host keys mount (populated from vault at launch)
@@ -569,6 +571,6 @@ useful examples of how this project leverages Claude in roles beyond chat.
 
 ---
 
-*Last updated: v3.0.4 (2026-07-22). When you make a meaningful change to
+*Last updated: v4.0.0 (2026-09-12). When you make a meaningful change to
 how llm-docker boots / configures / rebuilds, update this doc and the
 CHANGELOG.*

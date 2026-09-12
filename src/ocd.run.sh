@@ -74,14 +74,22 @@ run_opencode_container() {
         [ -f "$SLOT_FILE" ] && RESUME_SESSION="$(cat "$SLOT_FILE")"
     fi
 
-    # Per-terminal continue: if `-c` was used without --slot and without
-    # an explicit UUID, and we've saved a session for THIS iTerm pane in
-    # this project, resume that specific session.
+    # Per-terminal continue: `-c` without --slot/UUID restores THIS pane's
+    # own session. A pane with no memory yet starts a FRESH session (and
+    # binds it on exit) — never silently joins the last-used one.
+    _TS_FRESH=""
     if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ]; then
         local _TS_TID _TS_SAVED
         _TS_TID=$(_terminal_id)
         _TS_SAVED=$(_lookup_terminal_session "$_TS_TID" "$_LLM_PROJECT_TOKEN")
-        [ -n "$_TS_SAVED" ] && RESUME_SESSION="$_TS_SAVED"
+        if [ -n "$_TS_SAVED" ]; then
+            RESUME_SESSION="$_TS_SAVED"
+            echo "[OCD][terminal] pane ${_TS_TID%%:*} memory -> ${_TS_SAVED:0:24}"
+        else
+            CONTINUE_SESSION=false
+            _TS_FRESH=1
+            echo "[OCD][terminal] no session memory for pane ${_TS_TID%%:*} — starting a fresh one"
+        fi
     fi
 
     SLOT_ENV=""
@@ -90,7 +98,7 @@ run_opencode_container() {
 
     # Fresh session only → entrypoint injects --prompt. Prefer BOOT.md contents, fall back to CLAUDE.md default.
     export OPENCODE_INIT_PROMPT=""
-    if [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" != true ]; then
+    if [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" != true ] && [ -z "${DB_MAINTAIN:-}" ] && [ -z "$_TS_FRESH" ]; then
         if [ -f "$WORKDIR/BOOT.md" ]; then
             export OPENCODE_INIT_PROMPT="$(cat "$WORKDIR/BOOT.md")"
         elif [ -f "$WORKDIR/CLAUDE.md" ]; then
@@ -129,6 +137,7 @@ run_opencode_container() {
     # CAP_* / SECURITY_OPT are unquoted on purpose — they word-split into
     # multiple --cap-add / --cap-drop / --security-opt args.
     local CONTAINER_NAME="llm-docker-opencode-$$"
+    export CONTAINER_NAME
 
     _iterm_tag "OpenCode" "$WORKDIR"
     trap '_teardown_builder_api; _iterm_untag' EXIT INT TERM HUP
@@ -140,7 +149,7 @@ run_opencode_container() {
 
     # Forward every env var into the container. Tiny blocklist: only vars
     # that would BREAK the container if a Mac value leaked in (PATH points
-    # at /Users/yaro/..., HOME points at a path that doesn't exist, loader
+    # at ~/... on the host (HOME points at a path that doesn't exist in the container, loader
     # hijack via LD_/DYLD_, etc.) plus the env-gorilla re-exec guard.
     local EXTRA_ENV=""
     local _ENV_BLOCK _ename
@@ -152,9 +161,17 @@ run_opencode_container() {
         EXTRA_ENV="$EXTRA_ENV -e $_ename"
     done < <(env)
 
+    # Per-terminal session tracking: baseline = highest session time_UPDATED
+    # before this launch, so the exit-side save binds the session you last
+    # chatted in (switches included), never stale ones.
+    local _TS_BASELINE=0
+    local _ts_idx="$HOME/.llm-docker/opencode/.local/share/opencode/sessions-index.tsv"
+    [ -f "$_ts_idx" ] && _TS_BASELINE="$(awk -F'\t' 'NF>=4 {b=$4} END{print b+0}' "$_ts_idx")"
+
     docker run --rm -it \
         --label com.docker.compose.project=llm-docker \
         --label "llm-docker-project=$_LLM_PROJECT_TOKEN" \
+        --label "llm-docker-tool=opencode" \
         --hostname llm-docker \
         --name "$CONTAINER_NAME" \
         -w "$DOCKER_WORKDIR" \
@@ -168,11 +185,15 @@ run_opencode_container() {
         "${TMUX_CONF_MOUNT_ARG[@]}" \
         "${P10K_MOUNT_ARG[@]}" \
         -v "$HOME/.llm-docker/opencode/.config/opencode:/root/.config/opencode" \
-        -v "$HOME/.llm-docker/opencode/.local/share/opencode:/root/.local/share/opencode" \
+        -v llm-docker-opencode-data:/root/.local/share/opencode \
+        -v "$HOME/.llm-docker/opencode/.local/share/opencode:/mnt/opencode-mirror" \
         -v "$HOME/.llm-docker/opencode/.cache/opencode:/root/.cache/opencode" \
         -v "$SCRIPT_DIR/llm-container-opencode-config.jsonc:/opt/llm-docker/templates/opencode.config.jsonc:ro" \
         -v "$SCRIPT_DIR/docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
         -v "$SCRIPT_DIR/docker/entrypoint-lib.sh:/usr/local/bin/entrypoint-lib.sh:ro" \
+        -v "$SCRIPT_DIR/docker/opencode-db.sh:/usr/local/bin/opencode-db.sh:ro" \
+        -v "$SCRIPT_DIR/docker/opencode-pane-session.js:/root/.config/opencode/plugins/pane-session.js:ro" \
+        -v "$SCRIPT_DIR/../scripts/ocd_db_restore.sh:/usr/local/bin/ocd-db-maintain.sh:ro" \
         -v "$SCRIPT_DIR/docker/rm-guard.sh:/usr/local/bin/rm:ro" \
         -v "$SCRIPT_DIR/../README.md:/opt/llm-docker/README.md:ro" \
         -v "$SCRIPT_DIR/ascii/llm-docker.txt:/opt/llm-docker/ascii.txt:ro" \
@@ -201,5 +222,6 @@ run_opencode_container() {
     # Save THIS terminal's opencode session ID so a subsequent `ocd -c`
     # in the same pane resumes here, not whichever session was most
     # recent globally. Non-blocking: silently no-ops on any error.
-    _save_terminal_session "$(_terminal_id)" "$_LLM_PROJECT_TOKEN" "$DOCKER_WORKDIR" 2>/dev/null || true
+    _save_terminal_session "$(_terminal_id)" "$_LLM_PROJECT_TOKEN" "$DOCKER_WORKDIR" "$_TS_BASELINE" "$RESUME_SESSION" \
+        "$HOME/.llm-docker/opencode/.local/share/opencode/pane-${CONTAINER_NAME}.session" 2>/dev/null || true
 }

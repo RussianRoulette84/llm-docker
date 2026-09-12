@@ -105,4 +105,13 @@ fi
 _row  "config"  "$CFG_SHORT"
 _row  "starting" "server.py…"
 
+# Mirror daemon output to a shared log when BUILDER_API_LOG is set (set by
+# the launcher: /tmp/builder-api-<port>.log). Other cld/ocd windows in "share"
+# mode tail this file for their own api-view pane instead of starting a
+# second daemon. Fresh file per daemon boot so viewers never read stale runs.
+if [ -n "${BUILDER_API_LOG:-}" ]; then
+    : > "$BUILDER_API_LOG" 2>/dev/null || true
+    exec > >(tee -a "$BUILDER_API_LOG") 2>&1
+fi
+
 exec python3 "$SCRIPT_DIR/server.py" --project "$PROJECT_NAME"

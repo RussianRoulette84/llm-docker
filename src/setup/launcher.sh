@@ -74,6 +74,7 @@ _write_secret_handoff() {
 # Stop this project's builder-api daemon + close its panes on launcher exit.
 _teardown_builder_api() {
     [ -n "${_BUILDER_API_PORT:-}" ] || return 0
+    _log API "teardown: port=$_BUILDER_API_PORT panes=${_BUILDER_API_PANES:-0} shared=${_BUILDER_API_SHARED:-0} ttys=$(printf '%s' "${_BUILDER_API_PANE_TTYS:-none}" | tr '\n' ' ')"
     # Close the panes first (while the daemon is still alive so the port-based
     # lookup resolves), then make sure the daemon is dead for the bg/no-pane case.
     # macOS only (AppleScript). The script self-guards which terminal app is
@@ -82,10 +83,26 @@ _teardown_builder_api() {
         # Pass our OWN tty so the teardown closes the whole right column
         # (status/api/verbose) in this tab and spares only this pane.
         local _caller_tty; _caller_tty="$(tty 2>/dev/null || true)"
-        osascript "$SCRIPT_DIR/builder-api/close_api_panes.applescript" \
-            "$_BUILDER_API_PORT" "$CURRENT_DIR" "$_caller_tty" >/dev/null 2>&1 || true
+        # The panes we created, by the identity they reported at creation.
+        # Passed through so teardown closes exactly those and nothing else.
+        local _tty_arg=""
+        if [ -n "${_BUILDER_API_PANE_TTYS:-}" ]; then
+            _tty_arg="ttys=$(printf '%s' "$_BUILDER_API_PANE_TTYS" | tr '\n' ',')"
+        fi
+        # Sharing another window's daemon: match ONLY our own tab (no port, no
+        # title) so we close our two views and leave the owner's column alone.
+        if [ "${_BUILDER_API_SHARED:-0}" = "1" ]; then
+            osascript "$SCRIPT_DIR/builder-api/close_api_panes.applescript" \
+                "" "$CURRENT_DIR" "$_caller_tty" caller-only "$_tty_arg" >/dev/null 2>&1 || true
+        else
+            osascript "$SCRIPT_DIR/builder-api/close_api_panes.applescript" \
+                "$_BUILDER_API_PORT" "$CURRENT_DIR" "$_caller_tty" "$_tty_arg" >/dev/null 2>&1 || true
+        fi
     fi
-    lsof -ti :"$_BUILDER_API_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+    # Only the window that started the daemon stops it.
+    if [ "${_BUILDER_API_SHARED:-0}" != "1" ]; then
+        lsof -ti :"$_BUILDER_API_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+    fi
 }
 
 # _maybe_start_api TOOL PROJECT_DIR — spawn the builder-api daemon (+ panels)
@@ -173,16 +190,17 @@ _maybe_start_api() {
     # Record for teardown on launcher exit (see _teardown_builder_api).
     _BUILDER_API_PORT="$port"
 
-    # Orphan-daemon cleanup: kill any previous daemon still bound to this
-    # project's port so the fresh spawn binds clean — reliably gives new panels
-    # every `-a` instead of "no panels" when the old pane is gone but the daemon
-    # lingered (the AppleScript reuse path only covers pane-still-alive).
+    # A daemon already on this port belongs to ANOTHER cld/ocd window serving
+    # the same project. Never kill it — doing that closed the first window's
+    # panel column and re-opened it here. Share it instead: this window gets
+    # its own status + api-view + verbose stack onto the same daemon.
+    _BUILDER_API_SHARED=0
     if command -v lsof >/dev/null 2>&1; then
         local _api_existing_pid
         _api_existing_pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
         if [ -n "$_api_existing_pid" ]; then
-            kill "$_api_existing_pid" 2>/dev/null
-            sleep 0.4
+            _BUILDER_API_SHARED=1
+            _log "$_tag" "builder-api already running on port $port — sharing it (PID $_api_existing_pid)"
         fi
         unset _api_existing_pid
     fi
@@ -232,12 +250,48 @@ _maybe_start_api() {
 
         # 1a) Inside iTerm? Split the current window left/right. The AppleScript
         # handles its own reuse + orphan cleanup before spawning.
+        #
+        # Capture the CALLER's iTerm window id FIRST (before any slow work):
+        # passed through so new panes always split in THIS window even if the
+        # user switches windows while the spawn is still running.
+        local _origin_win=""
         if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
-            if osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" "$status_cmd" "$verbose_cmd" >/dev/null 2>&1; then
+            _origin_win="$(osascript -e 'tell application "iTerm" to get id of current window' 2>/dev/null)"
+        fi
+        local _share_arg="" _share_view="" _owner_log=""
+        # Same log contract as run-local.sh: the owner mirrors daemon output
+        # here, share-mode windows tail it for their own api-view pane.
+        _owner_log="/tmp/builder-api-$port.log"
+        if [ "${_BUILDER_API_SHARED:-0}" = "1" ]; then
+            _share_arg="share"
+            _share_view="clear; tail -n 80 -F '$_owner_log'"
+        fi
+        if [ "${TERM_PROGRAM:-}" = "iTerm.app" ]; then
+            local _pane_ttys _osa_err _osa_rc
+            _osa_err="$(mktemp)"
+            _pane_ttys="$(osascript "$SCRIPT_DIR/builder-api/builder_api.applescript" "$launcher" "$project_dir" split "$port" "$handoff" "$status_cmd" "$verbose_cmd" "$_share_arg" "$_share_view" "$_origin_win" "$_owner_log" 2>"$_osa_err")"
+            _osa_rc=$?
+            [ "$_osa_rc" -eq 0 ] || _log "$_tag" WARNING "pane split failed (rc=$_osa_rc): $(head -2 "$_osa_err" | tr '\n' ' ')"
+            /bin/rm -f "$_osa_err"
+            if [ "$_osa_rc" -eq 0 ]; then
                 _BUILDER_API_PANES=1
-                _log "$_tag" "builder-api split into right pane (port $port)"
+                # ttys of the panes just created — teardown kills what runs on
+                # them, which is what actually makes the panes close.
+                _BUILDER_API_PANE_TTYS="$_pane_ttys"
+                if [ "$_share_arg" = "share" ]; then
+                    _log "$_tag" "status + api + verbose panes split in (sharing the daemon on port $port)"
+                else
+                    _log "$_tag" "builder-api split into right pane (port $port)"
+                fi
                 return 0
             fi
+        fi
+
+        # Sharing means the daemon is already up; the remaining paths all try to
+        # START one, which would just fail to bind the port. Stop here instead.
+        if [ "$_share_arg" = "share" ]; then
+            _log "$_tag" WARNING "no iTerm split available — using the builder-api already running on port $port, without panels."
+            return 0
         fi
 
         # 1b) Not in iTerm, or split denied: positioned new window.

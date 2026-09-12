@@ -1,6 +1,6 @@
 # 🐳 llm-docker
 
-![Version](https://img.shields.io/badge/Version-v2.9-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-v4.0.0-blue?style=for-the-badge)
 ![OpenCode](https://img.shields.io/badge/OpenCode-Supported-00A86B?style=for-the-badge&logo=openai&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-Supported-D1913C?style=for-the-badge&logo=anthropic&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Isolated-2496ED?style=for-the-badge&logo=docker&logoColor=white)
@@ -174,6 +174,8 @@ cld ./my-project 4 -c --slot 1 --delay 0.3 -a -- --permission-mode plan
 | `-tc` / `--tmux-codeman` | Launch the [Ark0N/Codeman](https://github.com/Ark0N/Codeman) web UI on `http://localhost:3000` — session management + real-time xterm.js terminals for Claude/OpenCode. Opt-in via `INSTALL_TMUX_CODEMAN`; the container auto-publishes port `3000` when this flag is used. |
 | `-tcl` / `--tmux-claude` | **cld only.** Launch [nielsgroen/claude-tmux](https://github.com/nielsgroen/claude-tmux) — a tmux popup session manager for Claude Code. Starts `claude` in a tmux session and pre-binds `Ctrl+b Ctrl+c` to the popup. Opt-in via `INSTALL_TMUX_CLAUDE`. |
 | `--clean` | Stop + remove any leftover `llm-docker` containers before launching. |
+| `--dbrestore` | Interactive OpenCode DB repair/restore menu (litestream replica, backups, dumps) — runs instead of opencode. Same tool standalone: `scripts/ocd_db_restore.sh`. |
+| `--dbbackup` | Quick safety backup of the OpenCode DB, then exits. |
 | `--build` | Smart rebuild — re-runs the install scripts INSIDE the existing image and `docker commit`s the result. Skips already-installed tools (Go binaries, cargo crates, npm globals, ferox/nikto/codeman). Falls back to full build when no image exists. |
 | `--rebuild-force` | Full rebuild from the Dockerfile — `docker rmi llm-docker[-tool]:latest` then a fresh `docker build`. Use when `--build` cruft is bothering you, or when you've edited the Dockerfile itself (smart can only re-run the install scripts). |
 | `--` | Everything after `--` passes through to the underlying tool verbatim. Example: `cld -- --permission-mode plan` → `claude --permission-mode plan`. |
@@ -202,7 +204,6 @@ When launching with a window count (`cld 4`, `cld 8`), terminals are automatical
 - **3+ monitors**: windows on all monitors except the middle one (your coding screen)
 
 ## Tmux
-
 
 - `-t` / `--tmux` — wrap tool in tmux inside the container; prompts on host-tmux collision.
 - `-tt [N]` / `--tmux-team [N]` — multi-pane one-container layouts (1+3 default, 2, 1+2, 2x2). Last pane auto-runs `claude --model haiku` with orange border — cheap/fast runner slot.
@@ -249,6 +250,8 @@ Config splits across two files in `src/`. Secrets live in `.env` (gitignored); e
 | `INTERNET_ACCESS`               | `false` → iptables blocks outbound internet, LAN still works            | `true`                    |
 | `NODE_ENV`                      | `production` / `development` — dev flips verbose logging in entrypoint  | `production`              |
 | `EXIT_TO_DOCKER`                | On Claude/OpenCode exit, drop to bash inside container instead of quitting | `false`                |
+| `UPDATE_ON_START`               | Auto-update the LAUNCHED tool's npm package: `cld` → claude-code only, `ocd` → opencode only. Needs `INTERNET_ACCESS=true` | `true` |
+| `CHECK_UPDATE_EVERY_X_DAYS`     | Min days between update checks (per-tool timer, host-persisted). `0` = check every start, `UPDATE_FORCE=1` overrides once | `7` |
 | `LOG_MAX_KILOBYTES`             | Rotate `logs/llm-docker.log` when exceeded (0 = disable file logging)    | `1024`                    |
 | `BUILDER_API_HOST`              | Hostname the container uses to reach builder-api                        | `host.docker.internal`    |
 | `BUILDER_API_PORT`              | Builder-api daemon port                                                 | `6666`                    |
@@ -293,9 +296,10 @@ The llm-docker container includes:
   - `~/.llm-docker/claude/.config` → `/root/.config` — secondary Claude config
   - `~/.llm-docker/claude/.claude.json` → `/root/.claude.json` — top-level user config (trusted projects, MCP state)
   - `~/.llm-docker/opencode/.config/opencode` → `/root/.config/opencode` — OpenCode user config, agents, modes
-  - `~/.llm-docker/opencode/.local/share/opencode` → `/root/.local/share/opencode` — OpenCode auth + sessions
+  - `llm-docker-opencode-data` (Docker volume) → `/root/.local/share/opencode` — OpenCode auth + sessions. Lives on the Docker VM's own ext4 (WAL-safe — the macOS bind mount corrupted the SQLite DB, see anomalyco/opencode#14970). Survives rebuilds; `docker volume rm` is the only thing that kills it.
+  - `~/.llm-docker/opencode/.local/share/opencode` → `/mnt/opencode-mirror` — disaster-recovery mirror of the volume. `src/docker/opencode-db.sh` seeds an empty volume from it at boot and mirrors changes back: the DB streams continuously via Litestream (`litestream-replica/`, sub-second lag, restores with `litestream restore -o <db> file://<replica>`); auth + slot files sync after each change; a plain full-file copy stays as fallback seed. Watch it live: `tail -f ~/.llm-docker/opencode/.local/share/opencode/db-mirror.log`
   - `~/.llm-docker/opencode/.cache/opencode` → `/root/.cache/opencode` — OpenCode plugin cache
-  - `src/llm-container-opencode-config.jsonc` → `/opt/llm-docker/templates/opencode.config.jsonc` — OpenCode config template (seeded on each launch)
+  - `src/llm-container-opencode-config.jsonc` → `/opt/llm-docker/templates/opencode.config.jsonc` — OpenCode config template (seeded only on first launch — your host `config.json` is never overwritten)
   - `src/llm-container-claude-settings.json` → `/opt/llm-docker/templates/claude-settings.json` — Claude permissions template (seeded on fresh sessions)
   - `src/docker/docker-entrypoint.sh` → `/usr/local/bin/docker-entrypoint.sh` (ro) — live entrypoint bind
   - `README.md` → `/opt/llm-docker/README.md` (ro) — source of the version number shown in the startup banner
@@ -318,6 +322,8 @@ ocd -c <uuid>            # Resume a specific OpenCode session by UUID
 ```
 
 Sessions are scoped to the current workdir — a session started in `~/Projects/foo` won't surface when you launch from `~/Projects/bar`.
+
+**Per-terminal memory:** plain `-c` first restores the session THIS terminal pane last used (tracked per iTerm pane / tmux pane / tty in `terminal-sessions.tsv`) — terminal B no longer wakes up in terminal A's chat. No binding yet → falls back to the project's most recent session; nothing restorable → starts fresh instead of erroring.
 
 ### Slot system (N parallel chats per project)
 
@@ -379,7 +385,7 @@ If you run `ocd --slot 1` and `ocd --slot 2` from the same directory simultaneou
         └── <basename(CWD)>               ← CWD             (per-invocation, when CWD is outside WORKSPACE_DIR)
 
 
-## 🔑 SSH Access
+## 🔑 SSH Access (optional)
 
 Enable SSH for remote access and debugging. Public-key auth only (passwords disabled). Enabling SSH forces bridge networking — can't coexist with host-mode networking because `docker -p` requires bridge.
 

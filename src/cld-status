@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cld-status — live status panel for running cld containers.
+cld-status — live status panel for running llm-docker containers (cld + ocd).
 
 Polls every 5s and renders one row per cld container:
     <project>  CPU [▁▂▃▆█▇▆▅▃] 42.3%   MEM [████░░░░░░] 38.1%
@@ -106,20 +106,21 @@ def iterm_tab_color(name: str) -> str:
 
 
 # ── docker introspection ──────────────────────────────────────────────
-def list_cld_containers() -> list[tuple[str, str, str]]:
-    """Return [(container_id, project_name, started_at_iso), …] for running cld containers."""
+def list_cld_containers() -> list[tuple[str, str, str, str]]:
+    """Return [(container_id, project_name, started_at_iso, tool), …] for every
+    running llm-docker container — cld AND ocd. `tool` is "cld" or "ocd"."""
     try:
         out = subprocess.run(
             [
                 "docker", "ps",
                 "--filter", "label=com.docker.compose.project=llm-docker",
-                "--format", "{{.ID}}\t{{.Labels}}\t{{.CreatedAt}}",
+                "--format", "{{.ID}}\t{{.Labels}}\t{{.CreatedAt}}\t{{.Names}}",
             ],
             capture_output=True, text=True, timeout=4,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
-    containers: list[tuple[str, str, str]] = []
+    containers: list[tuple[str, str, str, str]] = []
     for line in out.stdout.strip().splitlines():
         if not line:
             continue
@@ -127,12 +128,19 @@ def list_cld_containers() -> list[tuple[str, str, str]]:
         if len(parts) < 3:
             continue
         cid, labels, created_at = parts[0], parts[1], parts[2]
+        name = parts[3] if len(parts) > 3 else ""
         project = "unknown"
+        tool_label = ""
         for kv in labels.split(","):
             if kv.startswith("llm-docker-project="):
                 project = kv.split("=", 1)[1] or "unknown"
-                break
-        containers.append((cid, project, created_at))
+            elif kv.startswith("llm-docker-tool="):
+                tool_label = kv.split("=", 1)[1]
+        # Containers started before the tool label existed still get tagged,
+        # from their name (ocd: llm-docker-opencode-<pid>, cld: claude-<pid>).
+        if not tool_label:
+            tool_label = "opencode" if "opencode" in name else "claude"
+        containers.append((cid, project, created_at, "ocd" if tool_label == "opencode" else "cld"))
     return containers
 
 
@@ -301,7 +309,7 @@ def mem_bar(mem_pct: float) -> str:
 
 
 def render(
-    containers: list[tuple[str, str, str]],
+    containers: list[tuple[str, str, str, str]],
     stats: dict[str, dict],
     history: dict[str, deque],
     chrm: int,
@@ -314,12 +322,12 @@ def render(
     # prefix ("proj:<11" + space = 12) and the stats suffix
     # (" NNN% mNNN%" = 13). Recomputed every render so it tracks resizes.
     cols = shutil.get_terminal_size((40, 20)).columns
-    spark_width = max(8, cols - 25)
+    spark_width = max(8, cols - 29)
     out: list[str] = []
-    out.append(_titlebar(f"cld · status · {time.strftime('%H:%M:%S')}"))
+    out.append(_titlebar(f"llm · status · {time.strftime('%H:%M:%S')}"))
     if not containers:
-        out.append(f"{D}  no cld containers running{RST}\n")
-    for cid, proj, created_at in containers:
+        out.append(f"{D}  no containers running{RST}\n")
+    for cid, proj, created_at, tool in containers:
         cid_short = cid[:12]
         s = stats.get(cid_short, {"cpu": 0.0, "mem": 0.0,
                                   "net_rx_rate": 0.0, "net_tx_rate": 0.0,
@@ -331,12 +339,17 @@ def render(
         tx_kb = s.get("net_tx_rate", 0.0) / 1024
         pids = s.get("pids", 0)
         uptime = fmt_uptime(created_at)
-        ctx_bytes, _sess = claude_ctx_size(proj)
-        ctx_short = fmt_bytes(ctx_bytes) if ctx_bytes else "—"
-        # Line 1: project + sparkline (both in the project's own color) + cpu% + mem%
+        # Transcript size is a Claude-only measure (OpenCode keeps its history
+        # in one shared SQLite file, not per-project transcripts).
+        if tool == "cld":
+            ctx_bytes, _sess = claude_ctx_size(proj)
+            ctx_short = fmt_bytes(ctx_bytes) if ctx_bytes else "—"
+        else:
+            ctx_short = "—"
+        # Line 1: project + tool tag + sparkline (project color) + cpu% + mem%
         col = project_color(proj)
         out.append(
-            f"{col}{proj:<11}{RST} {col}{spark}{RST} "
+            f"{col}{proj:<11}{RST} {D}{tool}{RST} {col}{spark}{RST} "
             f"{cpu:4.0f}% {D}m{RST}{mem:4.0f}%\n"
         )
         # Line 2: net + up + pids + ctx (all dim labels)
@@ -351,43 +364,10 @@ def render(
     return "".join(out)
 
 
-def resize_iterm_pane(rows: int) -> bool:
-    """Resize the iTerm pane this script is running in. No-op outside
-    iTerm. Returns True if the resize was dispatched (regardless of
-    whether iTerm accepted it)."""
-    session_id = os.environ.get("ITERM_SESSION_ID")
-    if not session_id:
-        return False
-    script = f'''
-    tell application "iTerm"
-        repeat with w in windows
-            repeat with t in tabs of w
-                repeat with s in sessions of t
-                    try
-                        if id of s is "{session_id}" then
-                            set rows of s to {rows}
-                            return
-                        end if
-                    end try
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    '''
-    try:
-        subprocess.run(
-            ["osascript", "-e", script],
-            timeout=2, capture_output=True,
-        )
-        return True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
 # ── main loop ─────────────────────────────────────────────────────────
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Live status panel for running cld containers.",
+        description="Live status panel for running llm-docker containers (cld + ocd).",
     )
     ap.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S,
                     help="poll interval in seconds (default 5)")
@@ -407,7 +387,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Per-container history: cpu samples + previous net counters (for rates).
     cpu_history: dict[str, deque] = {}
     last_net: dict[str, dict] = {}    # cid -> {rx, tx, ts}
-    last_rows = 0                     # last iTerm pane height we set
 
     def _exit(_signum, _frame):
         sys.stdout.write(f"\n{D}cld-status: exiting{RST}\n")
@@ -431,7 +410,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         play = count_processes("playwright")
 
         # Derive net rates per container; update cpu history.
-        for cid, _proj, _created in containers:
+        for cid, _proj, _created, _tool in containers:
             cid_short = cid[:12]
             s = stats.get(cid_short)
             if s is None:
@@ -450,7 +429,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             last_net[cid] = {"rx": s["net_rx"], "tx": s["net_tx"], "ts": now}
 
         # Evict history for containers that disappeared.
-        alive = {cid for cid, _proj, _created in containers}
+        alive = {cid for cid, _proj, _created, _tool in containers}
         for dead in [k for k in cpu_history if k not in alive]:
             cpu_history.pop(dead, None)
             last_net.pop(dead, None)
@@ -460,13 +439,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         sys.stdout.write(CLEAR + rendered)
         sys.stdout.flush()
-
-        # Auto-resize the iTerm pane to fit what we just rendered.
-        # +1 buffer row for breathing space. No-op when not in iTerm.
-        needed_rows = rendered.count("\n") + 1
-        if needed_rows != last_rows:
-            if resize_iterm_pane(needed_rows):
-                last_rows = needed_rows
 
         time.sleep(args.interval)
 

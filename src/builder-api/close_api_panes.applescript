@@ -20,6 +20,15 @@
 -- Processes are killed BEFORE the sessions are closed, so iTerm shows no
 -- "close this session?" confirmation.
 
+-- Split "a,b,c" into a list on the given delimiter.
+on splitText(txt, delim)
+    set AppleScript's text item delimiters to delim
+    set parts to text items of txt
+    set AppleScript's text item delimiters to ""
+    return parts
+end splitText
+
+
 on run argv
     if (count of argv) < 2 then return "need <port> <project-dir>"
     set portStr to item 1 of argv
@@ -29,10 +38,21 @@ on run argv
     -- (status/api/verbose) — and spare only the caller. Far more reliable than
     -- matching each pane by tty/name, which drift.
     set keepTty to ""
-    if (count of argv) >= 3 and item 3 of argv is not "debug" then set keepTty to item 3 of argv
+    if (count of argv) >= 3 and item 3 of argv is not "debug" and item 3 of argv is not "caller-only" then set keepTty to item 3 of argv
     set dbg to false
+    -- "caller-only": match the tab by the caller's tty ALONE. Used when another
+    -- window owns the daemon — matching by port/title would find THAT window's
+    -- tab and close its column.
+    set callerOnly to false
+    -- "ttys=/dev/ttys1,/dev/ttys2": the exact panes to close, recorded when they
+    -- were created. Exact identity beats re-finding them by port or title —
+    -- those drift as soon as a pane is renamed or a second window joins in.
+    set ttyList to {}
     repeat with _a in argv
-        if (_a as text) is "debug" then set dbg to true
+        set _t to _a as text
+        if _t is "debug" then set dbg to true
+        if _t is "caller-only" then set callerOnly to true
+        if _t starts with "ttys=" then set ttyList to my splitText(text 6 thru -1 of _t, ",")
     end repeat
     set logTxt to "keepTty=" & keepTty & linefeed
 
@@ -63,7 +83,25 @@ on run argv
     --    target sessions + their ttys inside THAT tab.
     set victims to {}
     set victimTtys to {}
-    if application "iTerm" is running then
+    if ttyList is not {} and application "iTerm" is running then
+      try
+        tell application "iTerm"
+            repeat with w in windows
+                repeat with tb in tabs of w
+                    repeat with s in sessions of tb
+                        try
+                            set stt to tty of s
+                            if my listHas(ttyList, stt) and stt is not keepTty then
+                                set end of victims to s
+                                set end of victimTtys to stt
+                            end if
+                        end try
+                    end repeat
+                end repeat
+            end repeat
+        end tell
+      end try
+    else if application "iTerm" is running then
       try
         tell application "iTerm"
             repeat with w in windows
@@ -71,8 +109,10 @@ on run argv
                     set hasApi to false
                     repeat with s in sessions of tb
                         try
-                            if apiTty is not "" and (tty of s) is apiTty then set hasApi to true
-                            if (name of s) is sessTitle then set hasApi to true
+                            if not callerOnly then
+                                if apiTty is not "" and (tty of s) is apiTty then set hasApi to true
+                                if (name of s) is sessTitle then set hasApi to true
+                            end if
                             if keepTty is not "" and (tty of s) is keepTty then set hasApi to true
                         end try
                     end repeat

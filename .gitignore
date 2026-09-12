@@ -50,13 +50,5 @@ Thumbs.db
 *.bak
 *.orig
 
-# Private agent notes / scratch
-.claude/
-CLAUDE.md
-
-# Private user slash commands (carry private project refs)
-.claude/commands/SHAKETREE.md
-.claude/commands/SYNC_CLAUDE.md
-
 # Local audit artifacts (per-session reports, may quote private context)
 audits/

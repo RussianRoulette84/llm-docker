@@ -97,6 +97,15 @@ on titleForProject(projectDir)
     return "builder-api: " & projName
 end titleForProject
 
+-- Join a list of strings with linefeeds (osascript prints the result on stdout).
+on joinLines(lst)
+    set AppleScript's text item delimiters to linefeed
+    set out to lst as text
+    set AppleScript's text item delimiters to ""
+    return out
+end joinLines
+
+
 on run argv
     if (count of argv) < 2 then
         error "builder_api.applescript: need <launcher> <project-dir> [mode]"
@@ -131,6 +140,35 @@ on run argv
     if (count of argv) >= 7 then
         set verboseCmd to item 7 of argv
     end if
+    -- Optional 8th arg: "share" — a daemon for this project is ALREADY running
+    -- (another cld/ocd window). Leave its panes alone; this window gets its
+    -- own stack INCLUDING an api-view pane (9th arg) that tails the shared
+    -- log instead of starting a second daemon.
+    set shareDaemon to false
+    if (count of argv) >= 8 and (item 8 of argv) is "share" then set shareDaemon to true
+    -- Optional 9th arg: in share mode, the shell command for the api-view
+    -- pane (typically `clear; tail -F <log>`). Empty = skip the api pane.
+    -- Ignored outside share mode (the owner always runs the real daemon).
+    set shareViewCmd to ""
+    if (count of argv) >= 9 then
+        set shareViewCmd to item 9 of argv
+    end if
+    -- Optional 10th arg: iTerm window id of the CALLER (captured by the
+    -- launcher before any slow work). Panes always split in THAT window,
+    -- even if the user switches windows mid-spawn (otherwise the new
+    -- panes land in whichever window is frontmost = dup panels elsewhere).
+    -- Empty = fall back to the current window.
+    set originWinId to ""
+    if (count of argv) >= 10 then
+        set originWinId to item 10 of argv
+    end if
+    -- Optional 11th arg: path for the shared daemon log. The owner pane's
+    -- command gets a BUILDER_API_LOG env prefix so run-local.sh mirrors
+    -- its output there for share-mode viewers. Empty = no mirror.
+    set ownerLogPath to ""
+    if (count of argv) >= 11 then
+        set ownerLogPath to item 11 of argv
+    end if
 
     -- Build the shell command that needs to run in the new pane.
     -- We invoke via `bash` so run-local.sh doesn't need the execute bit
@@ -141,6 +179,10 @@ on run argv
     if handoffPath is not "" then
         set cmd to cmd & " " & quoted form of handoffPath
     end if
+    if ownerLogPath is not "" and not shareDaemon then
+        set cmd to "BUILDER_API_LOG=" & quoted form of ownerLogPath & " " & cmd
+    end if
+    if shareDaemon then set cmd to ""
 
     set sessionTitle to my titleForProject(projectDir)
     -- Reuse-path command: kill ONLY the daemon bound to this project's
@@ -165,47 +207,63 @@ on run argv
     -- exited claude in the main window and relaunched). Fall back to
     -- the title-tagged lookup when the daemon is dead but the pane is
     -- still open, so we relaunch in-place instead of opening a new one.
-    set reuseSession to my findSessionByPort(portStr)
-    set daemonAlive to (reuseSession is not missing value)
-    if reuseSession is missing value then
-        set reuseSession to my findSessionByTitle(sessionTitle)
-    end if
-    if reuseSession is not missing value then
-        tell application "iTerm"
-            activate
-            tell reuseSession
-                select
-                if not daemonAlive then
-                    write text reuseCmd
-                end if
+    if not shareDaemon then
+        set reuseSession to my findSessionByPort(portStr)
+        set daemonAlive to (reuseSession is not missing value)
+        if reuseSession is missing value then
+            set reuseSession to my findSessionByTitle(sessionTitle)
+        end if
+        if reuseSession is not missing value then
+            tell application "iTerm"
+                activate
+                tell reuseSession
+                    select
+                    if not daemonAlive then
+                        write text reuseCmd
+                    end if
+                end tell
             end tell
-        end tell
-        return
+            return
+        end if
+
+        -- No reuse pane found anywhere. If an orphan daemon is still bound
+        -- to this port (its pane was closed), kill it so the fresh spawn
+        -- below can bind cleanly.
+        if portStr is not "" then
+            try
+                do shell script "lsof -ti :" & portStr & " 2>/dev/null | xargs kill 2>/dev/null; sleep 0.4"
+            end try
+        end if
     end if
 
-    -- No reuse pane found anywhere. If an orphan daemon is still bound
-    -- to this port (its pane was closed), kill it so the fresh spawn
-    -- below can bind cleanly.
-    if portStr is not "" then
-        try
-            do shell script "lsof -ti :" & portStr & " 2>/dev/null | xargs kill 2>/dev/null; sleep 0.4"
-        end try
-    end if
-
+    set paneTtys to {}
     if mode is "split" then
-        -- Split the current iTerm window left/right and shrink the new
-        -- right pane to winCols. iTerm's `set columns` on a session
-        -- resizes the entire OUTER window (not just the pane) — so we
-        -- snapshot the window bounds before the split, apply the column
-        -- count, then restore the snapshot. iTerm rebalances the two
-        -- panes to fit the original window width, which leaves the
-        -- user's left pane visually untouched outside the divider.
+        -- Split the current iTerm window left/right and narrow the new right
+        -- column to winCols. Setting a session's columns resizes the OUTER
+        -- window, so we snapshot the window first and put it back after — once,
+        -- verified, at the very end. Nothing else may resize the window after
+        -- this point (cld-status used to, every few seconds, which is what made
+        -- the restore look broken).
         tell application "iTerm"
             activate
-            tell current window
+            -- Bind the caller's window NOW (before any slow splits/delays):
+            -- the origin id was captured up front so a window switch
+            -- mid-spawn can't redirect the new panes elsewhere.
+            set targetWin to current window
+            if originWinId is not "" then
+                try
+                    set winIdNum to originWinId as integer
+                    repeat with w in windows
+                        if id of w is winIdNum then
+                            set targetWin to w
+                            exit repeat
+                        end if
+                    end repeat
+                end try
+            end if
+            tell targetWin
                 set origBounds to bounds
                 set sourceSession to current session
-
                 if statusCmd is not "" then
                     -- TOP-RIGHT: status pane created and written FIRST.
                     -- Same proven pattern: write IMMEDIATELY after split,
@@ -232,13 +290,22 @@ on run argv
                     -- BOTTOM-RIGHT: builder-api pane. Split rightPane
                     -- horizontally; new pane appears below. Write text
                     -- to it IMMEDIATELY before touching anything else.
-                    tell rightPane
-                        set bottomPane to (split horizontally with default profile)
-                    end tell
-                    tell bottomPane
-                        set name to sessionTitle
-                        write text cmd
-                    end tell
+                    -- Sharing another window's daemon (cmd empty) runs the
+                    -- view command instead (same pane, daemon stays put);
+                    -- without a view command there is no api pane and
+                    -- verbose stacks under the status pane.
+                    set bottomPane to rightPane
+                    set apiCmd to cmd
+                    if shareDaemon and shareViewCmd is not "" then set apiCmd to shareViewCmd
+                    if apiCmd is not "" then
+                        tell rightPane
+                            set bottomPane to (split horizontally with default profile)
+                        end tell
+                        tell bottomPane
+                            set name to sessionTitle
+                            write text apiCmd
+                        end tell
+                    end if
 
                     -- THIRD pane: verbose console, split horizontally BELOW the
                     -- builder-api pane. Write IMMEDIATELY after the split, same
@@ -254,48 +321,48 @@ on run argv
                         end tell
                     end if
 
-                    -- Rebalance row heights. Setting rows on both top+bottom
-                    -- panes made iTerm redistribute evenly (equal thirds).
-                    -- Instead: set ONLY the middle pane to 50% of window
-                    -- height — iTerm splits the remaining 50% between top
-                    -- and bottom, giving ~25% each. Without a verbose pane
-                    -- we keep the original status=15 shape.
-                    delay 0.2
-                    if verboseCmd is not "" then
-                        set half to ((rows of current window) / 2) as integer
-                        if half < 10 then set half to 10
-                        tell bottomPane
-                            try
-                                set rows to half
-                            end try
-                        end tell
-                    else
-                        tell rightPane
-                            try
-                                set rows to 15
-                            end try
-                        end tell
-                    end if
-                else
+                else if cmd is not "" then
                     -- Single-pane HEAD code path (no status pane).
                     tell sourceSession
                         set rightPane to (split vertically with default profile)
                     end tell
                     tell rightPane
-                        try
-                            set columns to winCols
-                        end try
                         set name to sessionTitle
                         write text cmd
                     end tell
                 end if
 
+                -- Put the window back exactly as we found it. Once, after all
+                -- pane work has settled, then verified — iTerm applies pane
+                -- geometry asynchronously and can land a frame late.
+                delay 0.3
                 try
                     set bounds to origBounds
+                    delay 0.15
+                    if bounds is not origBounds then set bounds to origBounds
                 end try
+
+                -- Hand the caller the ttys of the panes we just made. Teardown
+                -- kills what runs on them, which closes the panes — no second
+                -- round of iTerm lookups that can drift or come up empty.
+                try
+                    set end of paneTtys to (tty of rightPane)
+                end try
+                -- api pane tty (owner daemon OR shared view) — its process is
+                -- what teardown kills to close the pane.
+                if cmd is not "" or (shareDaemon and shareViewCmd is not "") then
+                    try
+                        set end of paneTtys to (tty of bottomPane)
+                    end try
+                end if
+                if verboseCmd is not "" then
+                    try
+                        set end of paneTtys to (tty of verbosePane)
+                    end try
+                end if
             end tell
         end tell
-        return
+        return my joinLines(paneTtys)
     end if
 
     -- Default mode: open a new window pinned to the right edge of the
@@ -333,8 +400,12 @@ on run argv
                 end try
                 set name to sessionTitle
                 write text cmd
+                try
+                    set end of paneTtys to tty
+                end try
             end tell
         end tell
+        return my joinLines(paneTtys)
     else
         -- iTerm not installed. Do NOT fall back to Terminal.app — this is an
         -- iTerm-only setup. Error so the caller's shell fallback path runs.

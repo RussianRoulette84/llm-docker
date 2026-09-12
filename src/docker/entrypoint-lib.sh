@@ -23,10 +23,15 @@ cleanup() {
             kill -KILL "$PID" 2>/dev/null || true
         fi
     fi
-    # Save session ID for slot restore (dispatch by tool).
+    # Save session ID for slot restore (dispatch by tool), then run the
+    # opencode DB exit sync if this is the opencode tool (cleanup exits
+    # below, so the normal post-tool path never runs).
     case "${TOOL:-}" in
         claude)   _save_claude_slot_session ;;
-        opencode) _save_opencode_slot_session ;;
+        opencode)
+            _save_opencode_slot_session
+            type _oc_db_finish >/dev/null 2>&1 && _oc_db_finish
+            ;;
     esac
     exit 0
 }

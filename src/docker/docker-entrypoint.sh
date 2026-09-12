@@ -143,33 +143,59 @@ if [ -n "${LLMD0CKER_SHH_3D25519_PVYT_B64:-}${PS4_SHH_3D25519_PVYT_B64:-}${LLM_D
     trap 'ssh-agent -k >/dev/null 2>&1' EXIT
 fi
 
-# Auto-update claude-code and opencode on launch when UPDATE_ON_START=true.
-# Skipped when internet is blocked (npm registry unreachable).
-# Throttled to once per 24h via a marker in /root/.claude/ (host-persisted
-# bind mount, so the timer survives container restarts). Override with
-# UPDATE_FORCE=1 when you want to force a check immediately.
+# Auto-update the LAUNCHED tool's npm package when UPDATE_ON_START=true:
+# cld (TOOL=claude) updates claude-code only, ocd (TOOL=opencode) updates
+# opencode only. Skipped when internet is blocked (npm registry unreachable).
+# Throttled to once per CHECK_UPDATE_EVERY_X_DAYS days (src/llm-docker.conf,
+# default 7) via a per-tool marker in a host-persisted bind mount — timers
+# survive container restarts and the two tools never reset each other.
+# Override with UPDATE_FORCE=1 when you want to force a check immediately.
 if [ "${UPDATE_ON_START:-false}" = "true" ] && [ "${INTERNET_ACCESS:-true}" = "true" ]; then
-    _upd_marker=/root/.claude/.last_update_check
-    _upd_age=999999
-    if [ "${UPDATE_FORCE:-false}" != "true" ] && [ -f "$_upd_marker" ]; then
-        _upd_age=$(( $(date +%s) - $(stat -c %Y "$_upd_marker" 2>/dev/null || echo 0) ))
-    fi
-    if [ "$_upd_age" -lt 86400 ]; then
-        echo "[update] Last check $((_upd_age / 3600))h ago — skipping (UPDATE_FORCE=1 to override)."
-    else
-        echo "[update] Checking for claude-code and opencode updates..."
-        _upd_log=$(mktemp)
-        if npm install -g --silent @anthropic-ai/claude-code@latest opencode-ai@latest >"$_upd_log" 2>&1 \
-             && node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs >>"$_upd_log" 2>&1; then
-            sed 's/^/[update] /' "$_upd_log"
-            echo "[update] Done."
-            touch "$_upd_marker" 2>/dev/null || true
-        else
-            sed 's/^/[update] /' "$_upd_log"
-            echo "[update] Update failed — continuing with installed versions."
+    case "${TOOL:-opencode}" in
+        claude)
+            _upd_pkg="@anthropic-ai/claude-code@latest"
+            _upd_marker=/root/.claude/.last_update_check
+            ;;
+        opencode)
+            _upd_pkg="opencode-ai@latest"
+            _upd_marker=/root/.config/opencode/.last_update_check
+            ;;
+        *)
+            _upd_pkg=""
+            _upd_marker=""
+            ;;
+    esac
+    if [ -n "$_upd_pkg" ]; then
+        _upd_interval=$(( ${CHECK_UPDATE_EVERY_X_DAYS:-7} * 86400 ))
+        _upd_due=true
+        if [ "${UPDATE_FORCE:-false}" != "true" ] && [ -f "$_upd_marker" ]; then
+            _upd_age=$(( $(date +%s) - $(stat -c %Y "$_upd_marker" 2>/dev/null || echo 0) ))
+            if [ "$_upd_age" -lt "$_upd_interval" ]; then
+                _upd_due=false
+                echo "[update] Last ${TOOL:-opencode} check $((_upd_age / 86400))d ago — skipping (UPDATE_FORCE=1 to override)."
+            fi
         fi
+        if [ "$_upd_due" = true ]; then
+            echo "[update] Checking for ${TOOL:-opencode} updates..."
+            _upd_log=$(mktemp)
+            _upd_ok=true
+            npm install -g --silent "$_upd_pkg" >"$_upd_log" 2>&1 || _upd_ok=false
+            if [ "$_upd_ok" = true ] && [ "${TOOL:-opencode}" = "claude" ]; then
+                node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs >>"$_upd_log" 2>&1 || _upd_ok=false
+            fi
+            if [ "$_upd_ok" = true ]; then
+                sed 's/^/[update] /' "$_upd_log"
+                echo "[update] Done."
+                touch "$_upd_marker" 2>/dev/null || true
+            else
+                sed 's/^/[update] /' "$_upd_log"
+                echo "[update] Update failed — continuing with installed version."
+            fi
+            unset _upd_log _upd_ok
+        fi
+        unset _upd_interval _upd_due _upd_age
     fi
-    unset _upd_marker _upd_age _upd_log
+    unset _upd_pkg _upd_marker
 fi
 
 # Source /root/.zprofile so PATH (composer/vendor/bin, go/bin, GOPATH/bin,
@@ -187,11 +213,44 @@ fi
 TOOL=${TOOL:-opencode}
 
 if [ "$TOOL" = "opencode" ]; then
-    if [ -f /opt/llm-docker/templates/opencode.config.jsonc ]; then
-        echo "Applying OpenCode configuration..."
-        mkdir -p /root/.config/opencode
+    # DB maintenance mode (ocd --dbrestore / --dbbackup): run the repair
+    # tool interactively instead of opencode. No bootstrap, no replicator —
+    # a restore must not race live writers.
+    if [ -n "${DB_MAINTAIN:-}" ]; then
+        _maint=/usr/local/bin/ocd-db-maintain.sh
+        if [ ! -f "$_maint" ]; then
+            echo "[opencode-db] ERROR: maintenance script missing at $_maint" >&2
+            exit 1
+        fi
+        _maint_args=()
+        [ "$DB_MAINTAIN" = "backup" ] && _maint_args=(--backup)
+        echo "[opencode-db] maintenance mode: ${DB_MAINTAIN} (opencode not started)"
+        bash "$_maint" "${_maint_args[@]}"
+        _rc=$?
+        _exit_or_drop_to_shell "OpenCode-db" "$_rc"
+    fi
+
+    # SQLite safety: live data dir is a Docker volume (WAL-safe ext4);
+    # opencode-db.sh seeds it from the macOS mirror on first boot and
+    # mirrors changes back after every write burst. See the script header.
+    if [ -f /usr/local/bin/opencode-db.sh ]; then
+        # shellcheck disable=SC1091
+        . /usr/local/bin/opencode-db.sh
+        _oc_db_bootstrap
+    else
+        echo "[opencode-db] ERROR: opencode-db.sh missing — DB mirror disabled"
+    fi
+
+    # Seed OpenCode config from the repo-bundled template ONLY on first
+    # launch (when the host-persisted config.json is absent/empty).
+    # ~/.llm-docker/opencode/.config/opencode/ is bind-mounted and is the
+    # user's source of truth — clobbering it every launch threw away model
+    # changes made on the host (same rule Claude's settings.local.json uses).
+    mkdir -p /root/.config/opencode
+    if [ ! -s /root/.config/opencode/config.json ] \
+       && [ -f /opt/llm-docker/templates/opencode.config.jsonc ]; then
         cp /opt/llm-docker/templates/opencode.config.jsonc /root/.config/opencode/config.json
-        echo "Configuration applied to /root/.config/opencode/config.json"
+        echo "[opencode] first launch — seeded config.json from template"
     fi
 
     # Slot save baseline: use the DB's current MAX(time_created) so the unit
@@ -201,6 +260,26 @@ if [ "$TOOL" = "opencode" ]; then
     if [ -f "$_OCD_DB" ] && [ -n "$SLOT" ]; then
         _OCD_START_EPOCH="$(sqlite3 "$_OCD_DB" \
             "SELECT COALESCE(MAX(time_created), 0) FROM session" 2>/dev/null || echo 0)"
+    fi
+
+    # Degrade-to-fresh guards: a remembered session that no longer exists
+    # (wiped volume, other machine) or `-c` with zero sessions in this
+    # project must start FRESH, not exit with an error.
+    if [ -n "${SLOT_RESUME_ID:-}" ] && [ -f "$_OCD_DB" ]; then
+        if ! sqlite3 "$_OCD_DB" "SELECT 1 FROM session WHERE id='${SLOT_RESUME_ID}'" 2>/dev/null | grep -q 1; then
+            echo "[opencode] remembered session $SLOT_RESUME_ID not found — starting fresh"
+            SLOT_RESUME_ID=""
+        fi
+    fi
+    if [ -z "${SLOT_RESUME_ID:-}" ] && [ "${CONTINUE_SESSION:-false}" = "true" ] && [ -f "$_OCD_DB" ]; then
+        _wd="$(pwd)"; _wd_esc="${_wd//\'/\'\'}"
+        _have_sessions="$(sqlite3 "$_OCD_DB" \
+            "SELECT COUNT(*) FROM session WHERE directory='$_wd_esc'" 2>/dev/null || echo 1)"
+        if [ "${_have_sessions:-1}" = "0" ]; then
+            echo "[opencode] no sessions in this project yet — starting fresh"
+            CONTINUE_SESSION=false
+        fi
+        unset _wd _wd_esc _have_sessions
     fi
 
     # Dispatch: explicit session ID wins, then --continue, then fresh.
@@ -219,11 +298,9 @@ if [ "$TOOL" = "opencode" ]; then
     else
         echo "Starting OpenCode..."
     fi
-    # Run opencode in the FOREGROUND. Backgrounding with `&` + `wait` prevents
-    # opencode's TUI from owning the TTY — arrow keys leak through as literal
-    # `^[[A/B/Z` instead of being intercepted as navigation. Signal handling
-    # for graceful shutdown still works because bash's SIGTERM/SIGINT trap
-    # runs on the next command-boundary.
+    # Plain launch runs opencode in the FOREGROUND — see the else-branch
+    # comment. tmux/codeman paths wrap it in a server that owns the TTY, so
+    # they are unaffected.
     if [ "${TMUX_TEAM:-false}" = "true" ] && command -v tmux >/dev/null 2>&1; then
         _launch_tmux_team opencode "${OPENCODE_ARGS[@]}" "$@"
     elif [ "${TMUX_CODEMAN:-false}" = "true" ]; then
@@ -243,11 +320,21 @@ if [ "$TOOL" = "opencode" ]; then
         done
         tmux new-session -A -s opencode "$_tmux_cmd"
     else
+        # FOREGROUND on purpose — do NOT use the claude `&` + `wait` shape
+        # here. A backgrounded opencode TUI loses raw-mode input handling:
+        # arrow keys and mouse events leak to the shell as literal escape
+        # garbage (iTerm2 shows junk chars while scrolling / typing %% at
+        # the prompt). Ctrl+C still exits on ONE press in this shape:
+        # SIGINT hits the foreground process group → opencode quits itself
+        # (its "ctrl+c exit" binding) and restores the terminal → bash then
+        # runs the deferred SIGINT trap (cleanup() → slot save + DB exit
+        # sync) → container ends → you land back on the macOS prompt.
         opencode "${OPENCODE_ARGS[@]}" "$@"
     fi
     _rc=$?
 
     _save_opencode_slot_session
+    type _oc_db_finish >/dev/null 2>&1 && _oc_db_finish
     _exit_or_drop_to_shell "OpenCode" "$_rc"
 
 elif [ "$TOOL" = "claude" ]; then
