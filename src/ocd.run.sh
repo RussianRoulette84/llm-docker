@@ -2,6 +2,17 @@
 # ocd.run.sh — run_opencode_container, sourced by ocd. Tool-specific (sqlite
 # session tracking); uses globals the launcher sets before the call.
 
+# Session id still in opencode's index? Old chats get pruned, so a remembered id
+# can outlive the chat it points at. The sqlite DB itself lives on a Docker
+# volume we can't read from the host — the index file next to it is the stand-in.
+# No index yet → treat as alive; docker-entrypoint.sh re-checks against the real
+# DB and degrades to fresh there.
+_opencode_session_alive() {
+    local idx="$HOME/.llm-docker/opencode/.local/share/opencode/sessions-index.tsv"
+    [ -f "$idx" ] || return 0
+    awk -F'\t' -v s="$1" '$1==s {f=1} END{exit !f}' "$idx"
+}
+
 run_opencode_container() {
     local WORKDIR="$1"
     shift
@@ -74,21 +85,22 @@ run_opencode_container() {
         [ -f "$SLOT_FILE" ] && RESUME_SESSION="$(cat "$SLOT_FILE")"
     fi
 
-    # Per-terminal continue: `-c` without --slot/UUID restores THIS pane's
-    # own session. A pane with no memory yet starts a FRESH session (and
-    # binds it on exit) — never silently joins the last-used one.
-    _TS_FRESH=""
+    # Per-terminal continue: `-c` without --slot/UUID reopens THIS tab's own
+    # chat; with no row for this tab, the project's most recently saved chat.
+    # Dead ids are skipped on the way down. Nothing left alive → fresh.
     if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ]; then
-        local _TS_TID _TS_SAVED
+        local _TS_TID
         _TS_TID=$(_terminal_id)
-        _TS_SAVED=$(_lookup_terminal_session "$_TS_TID" "$_LLM_PROJECT_TOKEN")
-        if [ -n "$_TS_SAVED" ]; then
-            RESUME_SESSION="$_TS_SAVED"
-            echo "[OCD][terminal] pane ${_TS_TID%%:*} memory -> ${_TS_SAVED:0:24}"
+        RESUME_SESSION=$(_lookup_terminal_session "$_TS_TID" "$_LLM_PROJECT_TOKEN" \
+            _opencode_session_alive)
+        if [ -n "$RESUME_SESSION" ]; then
+            echo "[OCD][terminal] tab ${_TS_TID%%:*} -> ${RESUME_SESSION:0:24}"
         else
+            # Must be explicit: bare `opencode` reopens the newest chat on its
+            # own, so leaving -c on here is what made every tab land in the
+            # same chat. The fresh-launch branch below sends --prompt instead.
             CONTINUE_SESSION=false
-            _TS_FRESH=1
-            echo "[OCD][terminal] no session memory for pane ${_TS_TID%%:*} — starting a fresh one"
+            echo "[OCD][terminal] no remembered chat for this project — starting fresh"
         fi
     fi
 
@@ -98,7 +110,7 @@ run_opencode_container() {
 
     # Fresh session only → entrypoint injects --prompt. Prefer BOOT.md contents, fall back to CLAUDE.md default.
     export OPENCODE_INIT_PROMPT=""
-    if [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" != true ] && [ -z "${DB_MAINTAIN:-}" ] && [ -z "$_TS_FRESH" ]; then
+    if [ -z "$RESUME_SESSION" ] && [ "$CONTINUE_SESSION" != true ] && [ -z "${DB_MAINTAIN:-}" ]; then
         if [ -f "$WORKDIR/BOOT.md" ]; then
             export OPENCODE_INIT_PROMPT="$(cat "$WORKDIR/BOOT.md")"
         elif [ -f "$WORKDIR/CLAUDE.md" ]; then
@@ -110,7 +122,50 @@ run_opencode_container() {
     CODEMAN_PORT_MAPPING=""
     [ "$TMUX_CODEMAN" = true ] && CODEMAN_PORT_MAPPING="-p 3000:3000"
 
-    if [ "${INTERNET_ACCESS:-true}" = "false" ] || [ -n "$SSH_PORT_MAPPING" ] || [ -n "$CODEMAN_PORT_MAPPING" ]; then
+    # Extra ports published container -> host, from PUBLISH_PORTS in
+    # llm-docker.conf. Space-separated "HOST:CONTAINER" (or a bare port for
+    # both sides), e.g. PUBLISH_PORTS="8100:8100 5173".
+    #
+    # Docker Desktop runs containers inside a Linux VM. `--network host`
+    # joins THAT VM's network namespace, not macOS's — so a port merely
+    # bound inside the container is invisible to your Mac's browser. Only
+    # `-p` published ports cross the VM boundary, and `-p` requires bridge
+    # networking (see the NETWORK_MODE decision below).
+    APP_PORT_MAPPING=""
+    if [ -n "${PUBLISH_PORTS:-}" ]; then
+        for _pp in $PUBLISH_PORTS; do
+            case "$_pp" in
+                *:*) ;;
+                *)   _pp="${_pp}:${_pp}" ;;
+            esac
+            if printf '%s' "$_pp" | grep -qE '^[0-9]{1,5}:[0-9]{1,5}$'; then
+                # Host side auto-bumps when taken, so a second container for
+                # another project doesn't fail to start on a busy port (same
+                # rule as the SSH port above). Container side never moves —
+                # the app inside still binds what it was told to.
+                _pp_want="${_pp%%:*}"
+                _pp_host="$_pp_want"
+                _pp_cont="${_pp##*:}"
+                _pp_max=$(( _pp_want + 20 ))
+                while (timeout 1 bash -c "</dev/tcp/127.0.0.1/$_pp_host") 2>/dev/null; do
+                    _pp_host=$(( _pp_host + 1 ))
+                    [ "$_pp_host" -le "$_pp_max" ] || break
+                done
+                if [ "$_pp_host" -gt "$_pp_max" ]; then
+                    _log OCD WARNING "ports $_pp_want-$_pp_max all busy — not publishing $_pp_cont this time."
+                else
+                    [ "$_pp_host" = "$_pp_want" ] || \
+                        _log OCD "port $_pp_want busy — publishing container $_pp_cont on $_pp_host instead"
+                    APP_PORT_MAPPING="$APP_PORT_MAPPING -p ${_pp_host}:${_pp_cont}"
+                fi
+            else
+                _log OCD ERROR "PUBLISH_PORTS: ignoring malformed entry '$_pp' (want HOST:CONTAINER, e.g. 8100:8100)"
+            fi
+        done
+        unset _pp _pp_want _pp_host _pp_cont _pp_max
+    fi
+
+    if [ "${INTERNET_ACCESS:-true}" = "false" ] || [ -n "$SSH_PORT_MAPPING" ] || [ -n "$CODEMAN_PORT_MAPPING" ] || [ -n "$APP_PORT_MAPPING" ]; then
         export NETWORK_MODE=bridge
     else
         export NETWORK_MODE=host
@@ -119,11 +174,21 @@ run_opencode_container() {
     # Cap/security flags from the same source-of-truth cld uses.
     _compute_cap_flags "${SANDBOX_ENABLED:-true}" "${INTERNET_ACCESS:-true}" "${LLM_D0CKER_SHH_EN4BLED:-false}" CAP_DROP CAP_ADD SECURITY_OPT
 
+    # RAM / shm / pids / cpu caps from llm-docker.conf — one container can't
+    # starve the shared Docker VM.
+    _compute_limit_flags OCD LIMIT_FLAGS
+
     # Forward both config files into the container as env. Docker accepts
     # multiple --env-file flags; conf first so .env can still override.
     ENV_FILES=""
     [ -f "$SCRIPT_DIR/llm-docker.conf" ] && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/llm-docker.conf"
-    [ -f "$SCRIPT_DIR/.env" ]            && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/.env"
+    # The plain secrets file is the fallback for machines WITHOUT env-gorilla.
+    # If the tool is installed, the vault is the only source — even when a key
+    # is missing from it. Handing the file over too lets an empty key in it
+    # overwrite a real value.
+    if ! command -v env-gorilla >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/.env" ]; then
+        ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/.env"
+    fi
 
     # Workspace + project mounts were built into _LLM_MOUNT_ARGS by
     # _compute_workspace_mounts above (workspace :ro, active project :rw).
@@ -140,7 +205,20 @@ run_opencode_container() {
     export CONTAINER_NAME
 
     _iterm_tag "OpenCode" "$WORKDIR"
-    trap '_teardown_builder_api; _iterm_untag' EXIT INT TERM HUP
+    # The save lives in the trap so it also fires when the tab is closed or
+    # CMD+Q'd (HUP → trap → exit, which never reaches the code below the docker
+    # run). Idempotent: rows are keyed by tab + project.
+    # These are locals of this function and gone by the time an EXIT trap runs
+    # on the normal path, so the save reads global snapshots instead.
+    _TS_PANE_FILE="$HOME/.llm-docker/opencode/.local/share/opencode/pane-${CONTAINER_NAME}.session"
+    _TS_WORKDIR="$DOCKER_WORKDIR"
+    _ocd_on_exit() {
+        _save_terminal_session "$(_terminal_id)" "$_LLM_PROJECT_TOKEN" "$_TS_WORKDIR" \
+            "$_TS_BASELINE" "$RESUME_SESSION" "$_TS_PANE_FILE" 2>/dev/null || true
+        _teardown_builder_api
+        _iterm_untag
+    }
+    trap _ocd_on_exit EXIT INT TERM HUP
 
     # Resolve image tag: prefer the opencode-only image, fall back to the
     # combined llm-docker:latest if that's what install.sh produced.
@@ -164,7 +242,7 @@ run_opencode_container() {
     # Per-terminal session tracking: baseline = highest session time_UPDATED
     # before this launch, so the exit-side save binds the session you last
     # chatted in (switches included), never stale ones.
-    local _TS_BASELINE=0
+    _TS_BASELINE=0
     local _ts_idx="$HOME/.llm-docker/opencode/.local/share/opencode/sessions-index.tsv"
     [ -f "$_ts_idx" ] && _TS_BASELINE="$(awk -F'\t' 'NF>=4 {b=$4} END{print b+0}' "$_ts_idx")"
 
@@ -178,9 +256,11 @@ run_opencode_container() {
         --network "$NETWORK_MODE" \
         $SSH_PORT_MAPPING \
         $CODEMAN_PORT_MAPPING \
+        $APP_PORT_MAPPING \
         $CAP_DROP \
         $CAP_ADD \
         $SECURITY_OPT \
+        $LIMIT_FLAGS \
         "${_LLM_MOUNT_ARGS[@]}" \
         "${TMUX_CONF_MOUNT_ARG[@]}" \
         "${P10K_MOUNT_ARG[@]}" \
@@ -219,9 +299,4 @@ run_opencode_container() {
         $EXTRA_ENV \
         "$IMAGE_TAG" "$@"
 
-    # Save THIS terminal's opencode session ID so a subsequent `ocd -c`
-    # in the same pane resumes here, not whichever session was most
-    # recent globally. Non-blocking: silently no-ops on any error.
-    _save_terminal_session "$(_terminal_id)" "$_LLM_PROJECT_TOKEN" "$DOCKER_WORKDIR" "$_TS_BASELINE" "$RESUME_SESSION" \
-        "$HOME/.llm-docker/opencode/.local/share/opencode/pane-${CONTAINER_NAME}.session" 2>/dev/null || true
 }

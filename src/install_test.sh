@@ -2,7 +2,7 @@
 # install_test.sh — post-install health check for llm-docker.
 # Runs on macOS bash 3.2 (no homebrew bash required).
 # Spins up a throwaway container with the same mounts cld uses, probes it,
-# prints a categorized report (base, SECURITY, RUBY, CPP, LLVM_CLANG, NS,
+# prints a categorized report (base, SECURITY, RUBY, RUST, CPP, LLVM_CLANG, NS,
 # MEDIA, sandbox, net, templates, persistence, image), and — when SSH is
 # enabled — runs the end-to-end SSH smoke test too.
 #
@@ -48,6 +48,7 @@ fi
 _read_conf() { grep "^$1=" "$SCRIPT_DIR/llm-docker.conf" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'"; }
 INSTALL_SECURITY=$(_read_conf INSTALL_SECURITY)
 INSTALL_RUBY=$(_read_conf INSTALL_RUBY)
+INSTALL_RUST=$(_read_conf INSTALL_RUST)
 INSTALL_CPP=$(_read_conf INSTALL_CPP)
 INSTALL_LLVM_CLANG=$(_read_conf INSTALL_LLVM_CLANG)
 INSTALL_NS=$(_read_conf INSTALL_NS)
@@ -97,6 +98,7 @@ _v() {
         npm)          npm -v 2>/dev/null ;;
         pnpm)         pnpm -v 2>/dev/null ;;
         uv)           uv --version 2>/dev/null | awk '{print $2}' ;;
+        ruff)         ruff --version 2>/dev/null | awk '{print $2}' ;;
         git)          git --version 2>/dev/null | awk '{print $3}' ;;
         python3)      python3 --version 2>/dev/null | awk '{print $2}' ;;
         jq)           jq --version 2>/dev/null ;;
@@ -118,6 +120,16 @@ _v() {
         rbenv)        rbenv --version 2>/dev/null | awk '{print $2}' ;;
         ruby)         ruby --version 2>/dev/null | awk '{print $2}' ;;
         pod)          pod --version 2>/dev/null ;;
+        rustc)        rustc --version 2>/dev/null | awk '{print $2}' ;;
+        cargo)        cargo --version 2>/dev/null | awk '{print $2}' ;;
+        rustup)       rustup --version 2>&1 | head -1 | awk '{print $2}' ;;
+        rustfmt)      rustfmt --version 2>/dev/null | awk '{print $2}' ;;
+        clippy-driver) clippy-driver --version 2>/dev/null | awk '{print $2}' ;;
+        rust-script)  rust-script --version 2>&1 | head -1 | awk '{print $NF}' ;;
+        cargo-nextest) cargo-nextest --version 2>&1 | head -1 | awk '{print $NF}' ;;
+        cargo-watch)  cargo-watch --version 2>&1 | head -1 | awk '{print $NF}' ;;
+        cargo-upgrade) cargo-upgrade --version 2>&1 | head -1 | awk '{print $NF}' ;;
+        cargo-audit)  cargo-audit --version 2>&1 | head -1 | awk '{print $NF}' ;;
         make)         make --version 2>/dev/null | head -1 | awk '{print $3}' ;;
         cmake)        cmake --version 2>/dev/null | head -1 | awk '{print $3}' ;;
         gcc)          gcc --version 2>/dev/null | head -1 | awk '{print $NF}' ;;
@@ -144,11 +156,13 @@ echo "== mounts =="
 mount | awk '/\/root|\/etc\/ssh|\/opt\/llm-docker|\/usr\/local\/bin\/docker-entrypoint/ {print $3}' | sort -u
 
 echo "== base =="
-for t in claude opencode node npm pnpm uv git python3 jq sqlite3 tmux trash; do _row "$t"; done
+for t in claude opencode node npm pnpm uv ruff git python3 jq sqlite3 tmux trash; do _row "$t"; done
 echo "== SECURITY =="
 for t in nmap nikto sqlmap gobuster amass ffuf httpx nuclei subfinder trufflehog feroxbuster go; do _row "$t"; done
 echo "== RUBY =="
 for t in rbenv ruby pod; do _row "$t"; done
+echo "== RUST =="
+for t in rustup rustc cargo rustfmt clippy-driver rust-script cargo-nextest cargo-watch cargo-upgrade cargo-audit; do _row "$t"; done
 echo "== CPP =="
 for t in make cmake gcc; do _row "$t"; done
 echo "== LLVM_CLANG =="
@@ -207,6 +221,7 @@ _render_tool_block "base"
 # Devpacks (gated by conf)
 _render_group "SECURITY"   "SECURITY"   "$INSTALL_SECURITY"
 _render_group "RUBY"       "RUBY"       "$INSTALL_RUBY"
+_render_group "RUST"       "RUST"       "$INSTALL_RUST"
 _render_group "CPP"        "CPP"        "$INSTALL_CPP"
 _render_group "LLVM_CLANG" "LLVM_CLANG" "$INSTALL_LLVM_CLANG"
 _render_group "NS"         "NS"         "$INSTALL_NS"

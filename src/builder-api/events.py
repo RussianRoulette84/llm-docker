@@ -4,7 +4,7 @@ events.py — JSON-lines structured event feed with cap-and-drop rotation.
 Two consumers:
   - The HTTP handler calls `store.query(...)` to answer `/events?type=&...`.
   - `security.py` (and future plugin code) call `store.append(type, payload)`
-    to record notable events like `auth_failure_lockout`, build lifecycle, etc.
+    to record notable events like build lifecycle, runtime start/stop, etc.
 
 External producers (a build subprocess emitting its own JSON lines) can write
 to the same file directly — we only need a read-side filter here. The

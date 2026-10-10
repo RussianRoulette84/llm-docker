@@ -10,13 +10,13 @@ blocks on a per-entry Event instead of sleep-looping.
 
 from __future__ import annotations
 
-import os  # noqa: F401
+import os
 import secrets  # noqa: F401
 import subprocess
 import threading
 import time
 from collections import deque
-from pathlib import Path  # noqa: F401
+from pathlib import Path
 from typing import Optional
 
 from build_models import (  # noqa: F401
@@ -26,6 +26,28 @@ from build_models import (  # noqa: F401
 from build_helpers import (  # noqa: F401
     _short_id, _fingerprint, _resolve_managed_container, _kill_process_group, _tail_text,
 )
+
+
+
+def _resolve_build_log(cfg) -> Path:
+    """Where build output is written. A `build` alias under [logs] wins so
+    `/logs?file=build` and the file on disk stay the same thing; otherwise
+    <project_root>/logs/build.log."""
+    return cfg.log_aliases.get("build") or (cfg.project_root / "logs" / "build.log")
+
+
+def _open_append_nofollow(path: Path):
+    """Open `path` for append, refusing to follow a symlink at the final
+    component. The build log can live inside a project directory the container
+    mounts read-write, so a compromised agent could otherwise point it at a host
+    file and have the daemon append attacker-chosen text there."""
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+        0o644,
+    )
+    return os.fdopen(fd, "ab")
+
 
 class BuildQueue:
     """
@@ -50,12 +72,7 @@ class BuildQueue:
         self._signal = threading.Event()
         self._shutdown = False
 
-        # Log file for build output. Allow the user to declare `build` under
-        # [logs] — if they did, we reuse that path so `/logs?file=build` works.
-        # Otherwise default to <project_root>/logs/build.log.
-        self._build_log = cfg.log_aliases.get("build")
-        if self._build_log is None:
-            self._build_log = cfg.project_root / "logs" / "build.log"
+        self._build_log = _resolve_build_log(cfg)
 
         self._worker: Optional[threading.Thread] = None
 
@@ -75,12 +92,13 @@ class BuildQueue:
     def update_cfg(self, new_cfg) -> None:
         """Swap the queue's cfg reference at hot-reload. New cfg's
         `[build]` settings (allowed_args, max_pending, dedupe_window_s,
-        command) apply to subsequent enqueues. In-flight entries keep
-        their snapshotted command + timeout — they're not retroactively
-        re-validated."""
+        command) and the build-log path apply to subsequent enqueues.
+        In-flight entries keep their snapshotted command + timeout — they're
+        not retroactively re-validated."""
         with self._lock:
             self._cfg = new_cfg
             self._build_cfg = new_cfg.build
+            self._build_log = _resolve_build_log(new_cfg)
 
     def enqueue_job(
         self,
@@ -419,7 +437,7 @@ class BuildQueue:
             f"start={_iso(entry.started_at)} ===\n"
         )
         try:
-            with self._build_log.open("ab") as log_f:
+            with _open_append_nofollow(self._build_log) as log_f:
                 log_f.write(log_header.encode("utf-8"))
                 log_f.flush()
                 proc = subprocess.Popen(

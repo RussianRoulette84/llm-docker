@@ -1,6 +1,49 @@
+# v4.0.1 (2026-10-10)
+
+Back to Claude Code. Opus 5.5 fixed the chatty Claude issue. They sadly have monopol situation with OpenAI. Why monopol? Because they have 3-10x more chips/cards/farms then anyone else. Therefor only they can truly allow daily 8hrs of work without limitations. Z.Ai and others can't provide that. So I'm off OpenCode+GLM and back to Claude Code. It's unbeatable.
+
+## Rust
+- [NEW] Full Rust toolchain in the container (`INSTALL_RUST=true`, on by default) — rustup stable, cargo, clippy, rustfmt, nextest, audit, and the WebAssembly toolchain (wasm32 target + trunk) — plus a one-command crate linter at `scripts/linter.rs`.
+
+## Networking
+- [NEW] `PUBLISH_PORTS` in `llm-docker.conf` exposes container ports to your Mac (`PUBLISH_PORTS="8100:8100"`). Needed for any dev server you want to open in your own browser — Docker Desktop's host mode is the Linux VM's network, not macOS's, so only published ports cross.
+
+## Builder API
+- [BUG] `?dryrun=1` reported the project root as the working folder for every job, even one declaring its own `cwd` — the preview lied about where the command would actually run.
+- [NEW] Rust job pack — `cargo-build`, `cargo-check`, `cargo-clippy`, `cargo-fmt`, `cargo-test`, `cargo-test-filter`, `cargo-audit` — opt in with `languages = ["rust"]`.
+- [NEW] Core jobs (git status, git log, …) now ship built-in — every project gets them without declaring anything; your own job of the same name still overrides.
+- [CHANGE] The API password now comes from the vault (environment) and wins over any password in a config file.
+- [TWEAK] Per-project logs default to `~/.llm-docker/logs/<project>` when a project doesn't set its own.
+- [CHANGE] Dropped the per-IP failed-auth lockout — this is loopback tooling, and a failed poll must never make your next real request wait.
+
+## Container resource limits
+- [NEW] Every terminal is its own container sharing one Docker VM — they now get RAM, /dev/shm, process and CPU caps, so a runaway build or browser loop dies alone instead of freezing every other terminal. Tune in `llm-docker.conf` (`LIMIT_MEMORY`, `LIMIT_SHM`, `LIMIT_PIDS`, `LIMIT_CPUS`); empty drops a cap.
+- [TWEAK] `/dev/shm` defaults to 1gb — Docker's 64 MB default is what crashed Chromium tabs under Playwright.
+
+## Sessions
+- [BUG] `-c` in a tab with no memory jumped straight to a brand-new chat; it now opens the folder's most recent chat first, like the bare tool does.
+- [BUG] A remembered chat that was since auto-deleted left `-c` resuming a dead id — stale ids are now skipped and the memory table stops collecting them.
+- [BUG] A tab that crashed or stayed open never recorded its chat, so `-c` there reopened an older one — the live chat is now remembered while the tab runs, not only on a clean exit.
+
+## New cld / ocd flags
+- [BUG] `cld -- <flag>` was silently dropped (`cld -- --resume <id>` did nothing); everything after `--` now reaches claude, same as `ocd`.
+
+## Updates
+- [TWEAK] When the in-app updater pulls a newer claude/opencode, the cage now says it won't survive the container and to bake it in with `--build` — before, "Restart to apply" quietly evaporated.
+
+## Security
+- [CHANGE] With env-gorilla installed, the vault is the only secret source — `.env` is never handed to a container or the daemon. A key left empty in `.env` used to overwrite a real vault value (how the API password once ended up blank).
+- [BUG] The build log now refuses to follow a symlink, so a compromised agent can't redirect it at a host file and have the daemon append there.
+
+### Dev logs
+- [NEW] `ruff` baked into the image (uv tool) for agents and the Builder API python jobs.
+- [TWEAK] Built-in jobs extracted to `jobs_builtin.py`, merged through the same `parse_jobs()` validation as user config; verbs can now be declared per project.
+- [TWEAK] `_compute_limit_flags` in `setup/config.sh` is the single source for the resource caps; both `cld.run.sh` and `ocd.run.sh` call it.
+- [NEW] `project_rust.toml` example shard, with a blunt note that every cargo subcommand is host RCE via `build.rs` / proc-macros.
+
 # v4.0.0 (2026-09-12)
 
-It's OpenCode's time to shine. Starting from >4.x it's ONLY OpenCode development.
+It's OpenCode's time to shine. Starting from >4.x it's ONLY OpenCode development via Z.AI GLM models.
 
 I switched to OpenCode (Z.AI GLM models) because Claude's 5.X models are very very bad, irritating and dangereus! Issues:
  - it talks too much. Even for a simple YES or NO questions it writes novels. Unstoppable. I tried stopping it with CLAUDE.md, pre-hooks, post-hooks. Nothing worked.

@@ -136,7 +136,7 @@ Core keys:
 | `[runtime].stop_signal` / `stop_timeout_s` | Graceful shutdown signal + grace window before SIGKILL |
 | `[events].path`     | Append-only JSONL file; API reads and rotates it |
 | `[events].max_bytes` / `drop_bytes` | Cap + drop-oldest rotation (default 200 MB / 10 MB) |
-| `[security]...`     | Rate limit knobs: `auth_failures_per_min`, `lockout_s`, body/URL size caps |
+| `[security]...`     | Body / URL size caps, request timeout |
 
 Every path in the config is resolved against the project root at boot and
 the server refuses to start if any of them escape the project tree. The
@@ -163,7 +163,7 @@ the daemon logs the error and keeps the previous config in place.
 The following **require a daemon restart** (won't hot-reload):
 
 - `[project.<n>.runtime]` — already-running processes can't be retroactively rebound
-- `[security]` — auth lockout state and rate limiters are in-memory
+- `[security]` — size caps are read once at startup
 - `[project.<n>.events].path` — opening a different jsonl midway corrupts ordering
 - `[project.<n>].port` / `[project.<n>].bind` — the socket is bound at startup
 
@@ -349,8 +349,6 @@ Anything less than careful thinking here turns it into an escape vector.
 
 - `execvp` throughout — no `sh -c`, so shell metacharacters in a
   whitelisted arg are inert.
-- Rate limit on failed-auth attempts per IP (default 10/min → 5 min
-  lockout). Warnings print to stderr and append to the events feed.
 - Non-loopback binds force `password` to be set; server won't start
   otherwise.
 - `auth_reads = true` by default on non-loopback binds, so `/logs` and
@@ -427,7 +425,7 @@ server.py                          Entry point, HTTP routing, --project parser
 config.py                          Layered schema loader + project-view resolver
 hot_reload.py                      Mtime-poll watcher for the host config
 banner.py                          Startup banner + colored event tail
-security.py                        Auth gate + per-IP rate limiter + body/URL size caps
+security.py                        Auth gate + body/URL size caps
 build_queue.py                     Job FIFO, worker thread, long-poll wait, log_tail
 jobs.py                            Job template parsing, placeholder validation, sha256 pinning
 runtime.py                         /run /stop /status + process group cleanup

@@ -1,8 +1,9 @@
 # CLAUDE.md
 
-This project (primary) `CLAUDE.md` / `AGENTS.md` (symlink) file is used in pair with global `~/.claude/CLAUDE.md` file for ClaudeCode OR `~/.config/opencode/AGENTS.md` for OpenCode.
+This project `CLAUDE.md` file is used in pair with global `~/.claude/CLAUDE.md` file for Claude Code.
 
 This file provides guidance to Claude Code / OpenCode when working with user & code in this repository using `agentic development`, `feedback loops`, `autonomy (YALO skill)`, `orchestrator agents`, `MCP Tools`, `LLM-Docker Builder API`.
+
 
 ---
 
@@ -25,7 +26,7 @@ NOTE: `**text**` means bold text above
 ```
 Agento loaded 🔫! 
 
-I promise not to forget your rules Master! I will dial my `PERFORMANCE` setting to super AI level because you are an exceptional power-user and pay 200/month.
+I promise not to forget your rules Master! I will dial my `PERFORMANCE` setting to super AGI level because you are an exceptional power-user who pays 200/month for AI usage. And I pinky promise to talk less, use proper English, no jargon, no gibberish.
 
 {% if issues booting or permission issues %}
 **WARNING**: boot issue: <deny param, issue description, file location>
@@ -33,7 +34,7 @@ I promise not to forget your rules Master! I will dial my `PERFORMANCE` setting 
 I know kung-fu, ready to roll!
 {% endif %}
 
-{% if STARTED NOT AS NEW SESSION or JUST COMPACTED %}
+{% if we are continuing a session then print this %}
 **LAST MISSION**: <What we were doing in general: Example: Tweaking main page UI>
 **LAST TASK**: <What task we were doing as last task. Example: adjusting title label height>
 {% endif %}
@@ -64,12 +65,16 @@ HOLY RULE = **ABSOLUTELY NO EXCEPTIONS BREAKING THE RULE**
 - `.builder-api.toml` and any `builder_plugin.py` MUST NOT be edited without explicit user approval — both are host-execution attack surface.
 - The Builder API job whitelist + placeholder regexes are the boundary between this container and the host Mac. Never broaden silently.
 - `scripts/mcp/logs-server/index.js` and `scripts/mcp/ops-server/index.js` must not gain new write/shell-exec/path capability without user approval.
+- **Vault only — no `.env` fallback.** The switch is whether the `env-gorilla` TOOL is installed. Installed → the vault is the only source of secrets, even for keys it does not hold: never read `.env`, never create it, never pass it to a container. Not installed → `.env` is the fallback and everything must work from it.
+- **NEVER write the env-gorilla vault** — no `set` / `unset` / `append` / `edit` / `push` / `sync`, not even as a command for Yaro to paste. Reading is fine; report a missing secret and let him set it himself.
 
 ---
 
 ## Coding Rules
 
 - **No auto daemon restart in examples**: NEVER chain `&& cld -c -a` / `&& cld -a` / `&& ocd -a` / any other daemon-spawn or kill onto an install or edit command. The clip-wrapped batch ends after the install step. If the change needs a restart to take effect, mention it in prose BEFORE or AFTER the code block, never inside it. Yaro restarts on his own timing across multiple terminals — silently restarting at the end of a `cp` clobbers state he chose to keep. Applies to every entry point: cld, ocd, run-local.sh, builder-api panel spawn, anything that kicks a long-running process.
+
+- **Host TOML update rule**: when Yaro pastes a host config file (`~/.llm-docker/api_config/*.toml`), edit the repo copy under `src/builder-api/api_config/` so it matches his file plus the change, then hand back ONE `cp -f` overwrite command. Never append/sed/patch the host file in place, and never make a backup copy.
 
 - **Security-onion rule**: keep imperfect safety layers if they cost nothing — don't nag about theoretical bypasses. See `feedback_security_onion_layers` memory for the full rule.
 

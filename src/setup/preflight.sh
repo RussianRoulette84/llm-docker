@@ -59,9 +59,26 @@ if [ -z "${LLM_DOCKER_ENV_GORILLA:-}" ] \
     else
         _profiles="llm-docker"
     fi
-    if [ "$_refresh_env" = true ]; then
+    # Auto-refresh. The vault keeps its decrypted copy in the Secure Enclave,
+    # keyed by this exact profile combination, and serves it until told
+    # otherwise — so a secret edited in KeePassXC stays invisible. Compare the
+    # database file's timestamp against the last launch for these profiles and
+    # drop the copy when it moved. Costs one extra unlock only after a real
+    # edit; --refresh-env stays as the manual override.
+    _gdb="${GORILLA_DB:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/gorilla_tunnel.dat.kdbx}"
+    _stamp_dir="$HOME/.llm-docker/vault-stamp"
+    _stamp="$_stamp_dir/$(printf '%s' "$_profiles" | tr ',/' '__')"
+    _db_mtime=""
+    [ -f "$_gdb" ] && _db_mtime="$(stat -f %m "$_gdb" 2>/dev/null || stat -c %Y "$_gdb" 2>/dev/null || true)"
+    if [ "$_refresh_env" = true ] \
+       || { [ -n "$_db_mtime" ] && [ "$_db_mtime" != "$(cat "$_stamp" 2>/dev/null || true)" ]; }; then
         env-gorilla --clear "$_profiles" >/dev/null 2>&1 || true
+        if [ -n "$_db_mtime" ]; then
+            mkdir -p "$_stamp_dir" 2>/dev/null || true
+            printf '%s' "$_db_mtime" > "$_stamp" 2>/dev/null || true
+        fi
     fi
+    unset _gdb _stamp_dir _stamp _db_mtime
     export LLM_DOCKER_ENV_GORILLA=1
     exec env-gorilla "$_profiles" -- bash "$0" "$@"
 fi

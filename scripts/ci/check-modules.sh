@@ -13,7 +13,7 @@ _err() { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; fail=1; }
 _ok()  { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 
 # Pinned contract: every function the launchers rely on from setup.sh.
-EXPECTED="_compute_cap_flags _compute_workspace_mounts _count_apt_array _count_total_packages \
+EXPECTED="_compute_cap_flags _compute_limit_flags _compute_workspace_mounts _count_apt_array _count_total_packages \
 _dashed_session_dir _docker_format_line _docker_pretty _iterm_tag _iterm_untag \
 _llm-docker_image_for_tool llm-docker_version _log _log_docker_exec _log_ensure_dir \
 _log_file_size _log_rotate_if_needed _log_silent _log_write_file _lookup_terminal_session \

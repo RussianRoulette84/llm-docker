@@ -330,7 +330,6 @@ _FAMILY_EMOJI_DEFAULT = "📦"
 _SYS_STYLE = {  # system event type → (color, emoji)
     "server_started":       (GREEN,  "🟢"),
     "config_reloaded":      (C7,     "♻️"),
-    "auth_failure_lockout": (RED,    "🚫"),
     "runtime_started":      (ORANGE, "▶️"),
     "runtime_stopped":      (YELLOW, "⏹️"),
     "runtime_exited":       (RED,    "🟥"),
@@ -477,8 +476,6 @@ def _event_view(rec: dict) -> tuple[str, str]:
         return "config", f"reloaded·{len(rec.get('jobs', []))} jobs"
     if t == "server_started":
         return "server", f"{rec.get('bind')}:{rec.get('port')}"
-    if t == "auth_failure_lockout":
-        return "lockout", f"{rec.get('ip')}·locked {rec.get('lockout_s')}s"
     if t and t.endswith("_log"):
         return rec.get("level", "log"), (rec.get("message") or "")[:80]
     return t or "?", ""

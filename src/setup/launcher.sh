@@ -16,11 +16,31 @@ _terminal_id() {
     fi
 }
 
-# Look up the saved session id for (terminal_id, project_key) in the tool's tsv.
-_lookup_terminal_session() {
+# Candidate restore ids for (tab, project), best first: this tab's own row, then
+# the project's other rows newest -> oldest. Deduped.
+#
+# The second pass exists because iTerm mints a BRAND NEW tab id for every tab it
+# opens, so an exact-id match can only ever hit while that tab is still alive.
+# Closing the tab (or iTerm) used to lose the binding entirely.
+_terminal_session_candidates() {
     local tid="$1" proj="$2"
     [ -f "$_TERM_SESSIONS_FILE" ] || return 0
-    awk -F'\t' -v t="$tid" -v p="$proj" '$1==t && $2==p {u=$3} END{if(u) print u}' "$_TERM_SESSIONS_FILE"
+    awk -F'\t' -v t="$tid" -v p="$proj" \
+        '$2==p { print ($1==t ? 0 : 1) "\t" $4 "\t" $3 }' "$_TERM_SESSIONS_FILE" \
+        | sort -k1,1n -k2,2nr | cut -f3 | awk '!seen[$0]++'
+}
+
+# _lookup_terminal_session TID PROJECT [ALIVE_FN]
+# ALIVE_FN is a shell function name called with a candidate id; it returns 0 when
+# that chat still exists. Candidates whose chat is gone (both tools auto-delete
+# old ones) are skipped. Without ALIVE_FN the first candidate is returned as-is.
+_lookup_terminal_session() {
+    local tid="$1" proj="$2" alive="${3:-}" cand
+    while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        if [ -z "$alive" ] || "$alive" "$cand"; then printf '%s' "$cand"; return 0; fi
+    done < <(_terminal_session_candidates "$tid" "$proj")
+    return 0
 }
 
 # Register a deferred tmux INSTALL_* conf flip (accumulated, applied once).
@@ -74,7 +94,7 @@ _write_secret_handoff() {
 # Stop this project's builder-api daemon + close its panes on launcher exit.
 _teardown_builder_api() {
     [ -n "${_BUILDER_API_PORT:-}" ] || return 0
-    _log API "teardown: port=$_BUILDER_API_PORT panes=${_BUILDER_API_PANES:-0} shared=${_BUILDER_API_SHARED:-0} ttys=$(printf '%s' "${_BUILDER_API_PANE_TTYS:-none}" | tr '\n' ' ')"
+    _log_silent API "teardown: port=$_BUILDER_API_PORT panes=${_BUILDER_API_PANES:-0} shared=${_BUILDER_API_SHARED:-0} ttys=$(printf '%s' "${_BUILDER_API_PANE_TTYS:-none}" | tr '\n' ' ')"
     # Close the panes first (while the daemon is still alive so the port-based
     # lookup resolves), then make sure the daemon is dead for the bg/no-pane case.
     # macOS only (AppleScript). The script self-guards which terminal app is

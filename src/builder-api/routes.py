@@ -160,7 +160,14 @@ class RoutesMixin:
                 "dryrun": True,
                 "job": job_name,
                 "would_run": [str(resolved), *argv],
-                "cwd": str(cfg.project_root),
+                # The job's own `cwd`, resolved the same way build_queue does
+                # at execution time. Reporting project_root unconditionally
+                # made the preview lie about any job declaring a cwd.
+                "cwd": str(
+                    cfg.project_root
+                    if job.cwd in ("", ".")
+                    else (cfg.project_root / job.cwd).resolve()
+                ),
                 "timeout_s": job.timeout_s,
                 "mutates_filesystem": job.mutates_filesystem,
                 "matched_placeholders": normalized,

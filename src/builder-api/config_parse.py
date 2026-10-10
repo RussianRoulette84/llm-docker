@@ -260,8 +260,14 @@ def _expand_env(value: str) -> str:
     return _ENV_INTERP.sub(lambda m: os.environ.get(m.group(1), ""), value)
 
 
-def _parse_verbs(raw: dict, file_label: str) -> dict[str, VerbSpec]:
-    """Parse the base toml's `[verb.*]` tables into VerbSpecs.
+def _default_log_dir() -> Path:
+    """Where per-project logs live when the project does not say otherwise.
+    Resolved on each call so $HOME can be redirected in tests."""
+    return Path.home() / ".llm-docker" / "logs"
+
+
+def _parse_verbs(verbs_raw: dict, file_label: str) -> dict[str, VerbSpec]:
+    """Parse `[verb.*]` tables into VerbSpecs.
 
     Verbs are vocabulary, not implementations: each verb describes a
     well-known operation (`up`, `down`, `lint`, …), the platforms agents
@@ -270,7 +276,6 @@ def _parse_verbs(raw: dict, file_label: str) -> dict[str, VerbSpec]:
     Verb metadata flows back to clients via GET /jobs so MCP tools know
     which platforms a verb supports before they call it.
     """
-    verbs_raw = raw.get("verb") or {}
     if not isinstance(verbs_raw, dict):
         raise ConfigError(f"{file_label}: [verb] must be a table")
     out: dict[str, VerbSpec] = {}

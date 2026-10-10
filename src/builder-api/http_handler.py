@@ -33,7 +33,7 @@ _HTTP_REASONS = {
     405: "method not allowed",
     412: "command hash mismatch",
     413: "payload too large",
-    429: "rate limited",
+    429: "queue full",
     500: "server error",
     503: "busy",
 }

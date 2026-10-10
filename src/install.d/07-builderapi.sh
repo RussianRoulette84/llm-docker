@@ -7,7 +7,7 @@ info "${secondary_accent}POST /job/<name>${RESET} + ${secondary_accent}GET /jobs
 info "log tail by alias, runtime control, /ws live event stream, and a browser"
 info "console tunnel. Per-stack examples in ${secondary_accent}src/builder-api/examples/${RESET} (quake,"
 info "node, php-docker-compose). Full docs in ${secondary_accent}src/builder-api/README.md${RESET}."
-info "Security: password-guarded, rate-limited, execvp-only (no shell), paths scoped to project root."
+info "Security: password-guarded, execvp-only (no shell), paths scoped to project root."
 
 _prefill_key BUILDER_API_P4SS
 CUR_API_PW="$CUR"

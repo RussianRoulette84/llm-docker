@@ -238,6 +238,63 @@ args        = ["install", "--no-dev"]
 timeout_s   = 300
 description = "Install Composer dependencies"
 
+# ── Rust ──────────────────────────────────────────────────────────────
+# Every job has FIXED args except the one anchored test filter, so a
+# container-supplied value can never change which command runs.
+[language.rust.jobs.cargo-build]
+command     = "cargo"
+args        = ["build", "--release", "--all-features"]
+timeout_s   = 900
+description = "Release build of every target"
+
+[language.rust.jobs.cargo-check]
+command     = "cargo"
+args        = ["check", "--all-targets", "--all-features"]
+timeout_s   = 600
+description = "Type-check without producing binaries"
+
+[language.rust.jobs.cargo-clippy]
+command     = "cargo"
+args        = ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
+timeout_s   = 600
+description = "Clippy with warnings escalated to errors"
+
+[language.rust.jobs.cargo-fmt-check]
+command     = "cargo"
+args        = ["fmt", "--all", "--check"]
+timeout_s   = 60
+description = "Formatting check — rewrites nothing"
+
+[language.rust.jobs.cargo-fmt]
+command            = "cargo"
+args               = ["fmt", "--all"]
+timeout_s          = 60
+description        = "Reformat the workspace in place"
+mutates_filesystem = true
+
+[language.rust.jobs.cargo-test]
+command     = "cargo"
+args        = ["test", "--all-features"]
+timeout_s   = 600
+description = "Run the test suite"
+
+[language.rust.jobs.cargo-test-filter]
+command     = "cargo"
+args        = ["test", "--all-features", "{pattern}"]
+timeout_s   = 600
+description = "Run only tests whose name contains {pattern}"
+[language.rust.jobs.cargo-test-filter.placeholders.pattern]
+regex       = "^[A-Za-z0-9_:\\-]{1,80}$"
+max_len     = 80
+required    = true
+description = "Test name filter — letters, digits, _ : - only"
+
+[language.rust.jobs.cargo-audit]
+command     = "cargo"
+args        = ["audit"]
+timeout_s   = 180
+description = "Check dependencies against the RustSec advisory database"
+
 # ── Node / TypeScript ─────────────────────────────────────────────────
 [language.node.jobs.npm-test]
 command     = "npm"

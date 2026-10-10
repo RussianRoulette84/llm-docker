@@ -129,6 +129,35 @@ _compute_cap_flags() {
     printf -v "$out_sec"  '%s' "$sec_opt"
 }
 
+# _compute_limit_flags TAG OUT_VAR — resource caps for `docker run`.
+#   Reads LIMIT_MEMORY / LIMIT_SHM / LIMIT_PIDS / LIMIT_CPUS from
+#   llm-docker.conf. An empty value means that cap is not applied.
+#   --memory-swap is pinned to --memory so a runaway container is OOM-killed
+#   on its own instead of swapping the whole Docker VM to a crawl.
+#   LIMIT_CPUS is clamped to the cores Docker actually has — a higher value
+#   makes `docker run` refuse to start the container.
+_compute_limit_flags() {
+    local tag="${1:-LIMITS}"
+    local out="${2:-LIMIT_FLAGS}"
+    local flags="" ncpu cpus
+
+    [ -n "${LIMIT_MEMORY:-}" ] && flags="$flags --memory $LIMIT_MEMORY --memory-swap $LIMIT_MEMORY"
+    [ -n "${LIMIT_SHM:-}" ]    && flags="$flags --shm-size $LIMIT_SHM"
+    [ -n "${LIMIT_PIDS:-}" ]   && flags="$flags --pids-limit $LIMIT_PIDS"
+
+    cpus="${LIMIT_CPUS:-}"
+    if [ -n "$cpus" ]; then
+        ncpu="$(docker info --format '{{.NCPU}}' 2>/dev/null)"
+        if [[ "$ncpu" =~ ^[0-9]+$ ]] && [ "$ncpu" -gt 0 ] && [ "${cpus%%.*}" -gt "$ncpu" ]; then
+            _log "$tag" WARNING "LIMIT_CPUS=$cpus is above the $ncpu cores Docker has — using $ncpu"
+            cpus="$ncpu"
+        fi
+        flags="$flags --cpus $cpus"
+    fi
+
+    printf -v "$out" '%s' "${flags# }"
+}
+
 setup_dirs() {
     # Pre-create bind-mount targets so Docker doesn't root-own them on the host.
     mkdir -p "$HOME/.llm-docker/claude/.claude"
@@ -174,7 +203,12 @@ setup_env() {
 # the full values.
 _source_all_config() {
     local f line key val
-    for f in "$SCRIPT_DIR/llm-docker.conf" "$SCRIPT_DIR/.env"; do
+    local files=("$SCRIPT_DIR/llm-docker.conf")
+    # Secrets file only on machines without env-gorilla. Where the tool exists
+    # the vault is the single source, so an empty key in a leftover file can
+    # never overwrite a real value.
+    command -v env-gorilla >/dev/null 2>&1 || files+=("$SCRIPT_DIR/.env")
+    for f in "${files[@]}"; do
         [ -f "$f" ] || continue
         while IFS= read -r line || [ -n "$line" ]; do
             # Skip blanks and comments.

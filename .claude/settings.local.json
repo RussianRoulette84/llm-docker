@@ -3,7 +3,6 @@
     "allow": [
       "Read(/**)",
       "Edit(/**)",
-      "Write(/**)",
       "WebSearch",
       "WebFetch(domain:opencode.ai)",
       "WebFetch(domain:opencode.ai)",

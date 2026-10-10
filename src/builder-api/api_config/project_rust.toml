@@ -1,0 +1,245 @@
+# ──────────────────────────────────────────────────────────────────────
+# project_rust — EXAMPLE project shard (Rust / cargo / WebAssembly)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Copy to `~/.llm-docker/api_config/<your-app>.toml`, rename every
+# `project_rust` reference to `<your-app>`, then fix root and port.
+#
+# ‼️  READ THIS BEFORE YOU ADD A cargo JOB
+#
+# Every cargo subcommand is arbitrary code execution on the host. Not
+# just `cargo run` — ALL of them. A crate's `build.rs` build script and
+# any procedural macro are COMPILED AND EXECUTED on the build machine,
+# before your own code compiles. The agent writes those files.
+# Demonstrated in the cage:
+#
+#     build.rs:  fn main() { std::fs::write("/tmp/OWNED.txt", "pwned"); }
+#     $ cargo check              # no build, no test, no run
+#     $ cat /tmp/OWNED.txt
+#     pwned
+#
+# So `cargo check` on your Mac is a shell on your Mac. `cargo clippy`,
+# `cargo test`, `trunk build` — same, they all drive cargo. `cargo test`
+# additionally runs the compiled test binaries.
+#
+# `command_hash` does NOT fix this. It pins WHICH binary executes, and
+# the binary that executes is the legitimate cargo. The payload is the
+# source tree. Pinning cargo's sha256 verifies you are running real cargo
+# while it runs the agent's code. Hashing is for jobs whose `command`
+# lives inside the project tree (a `scripts/foo.sh` the agent can
+# rewrite) — that is a different, much narrower problem.
+#
+# THEREFORE the live jobs below are the safe set: nothing that compiles
+# or executes project content runs on the host. The cargo block is
+# present but COMMENTED OUT. Uncomment it only for a project whose agent
+# you trust as much as you trust your own shell.
+#
+# All Rust work belongs INSIDE the container, which ships the full
+# toolchain when INSTALL_RUST=true: rustup stable, cargo, clippy,
+# rustfmt, rust-analyzer, rust-src, the wasm32-unknown-unknown target,
+# trunk, cargo-nextest, cargo-audit, cargo-watch, cargo-edit and
+# rust-script (which makes `scripts/linter.rs` directly executable).
+
+# ──────────────────────────────────────────────────────────────────────
+# GOTCHAS, all learned the hard way against the real daemon
+# ──────────────────────────────────────────────────────────────────────
+#
+# PORTS. A port merely bound inside the container is INVISIBLE to macOS.
+#   Docker Desktop runs containers in a Linux VM, so `--network host`
+#   joins the VM's namespace, not the Mac's. Set
+#   PUBLISH_PORTS="8100:8100" in llm-docker.conf, relaunch, and bind your
+#   server on 0.0.0.0 — a server on the container's 127.0.0.1 receives
+#   nothing through a published port. Publishing forces BRIDGE
+#   networking, after which the container reaches Mac services via
+#   host.docker.internal, not 127.0.0.1.
+#
+# PLATFORMS. `[jobs.<verb>.platforms.<plat>]` only accepts a platform the
+#   base builder-api.toml declares for that verb. An invented one (e.g.
+#   `scraper`) LOADS FINE and then returns 400 platform_not_declared at
+#   call time. Use a named job instead — named jobs have no verb gate.
+#
+# BRACES. `{name}` anywhere inside an argv element is rejected at load,
+#   so curl's `-w "%{http_code}"` fails — use `-I`. A whole argument
+#   shaped `{{word}}` is rejected unless it is the one reserved token
+#   `{{container}}`. Docker's `{{.Names}}` is fine: the dot keeps it out
+#   of the placeholder pattern.
+#
+# REGEXES. Never allow a leading `-`. `^[a-z0-9_.\-]+$` lets
+#   `-Zunstable-options` through as a "crate name" and cargo reads it as
+#   a flag. Anchor the first character to a letter or digit.
+#
+# COMMANDS. Bare names resolve via shutil.which() on the DAEMON's PATH.
+#   `~` is NOT expanded — `~/.cargo/bin/cargo` will not work. Either the
+#   daemon's shell has the directory on PATH, or write the literal
+#   absolute path.
+#
+# CWD. Honoured on any job, resolved against the project root, escapes
+#   refused. Needed for a workspace member (`cwd = "crates/ui"`).
+#
+# GLOBALS. git-status, git-log, tree and trash already exist as global
+#   jobs in the base file. Do not redefine them; `tree` is overridden
+#   here only because the base version still walks target/.
+#
+# BUILD OUTPUT. If the project folder is bind-mounted, the Mac and the
+#   container share one target/ directory, and on an Intel Mac both are
+#   x86_64 so cargo does not separate them by triple — a Linux ELF lands
+#   exactly where macOS expects a Mach-O. Set
+#   CARGO_TARGET_DIR=/tmp/<app>-target for container builds.
+
+[project.project_rust]
+root        = "~/Projects/project_rust"
+port        = 6702
+description = "Rust workspace + Leptos/WebAssembly front end"
+
+# No host runtime. The server runs inside the container; PUBLISH_PORTS
+# is what makes it reachable from the Mac's browser.
+#
+# If you ever do enable one, know that `start_command` gets NO hash check
+# and NO containment check — runtime.py shlex-splits it and Popens it
+# with cwd=project_root. Pointing it at `target/release/<bin>` means
+# POST /run executes whatever the agent last built.
+[project.project_rust.runtime]
+enabled = false
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GENERIC VERBS — the safe set
+# ══════════════════════════════════════════════════════════════════════
+
+# Reads a fixed file. The contents are agent-controlled, but they are
+# data printed to a pane — nothing executes them.
+[project.project_rust.jobs.logs.platforms.api]
+command     = "tail"
+args        = ["-n", "{lines}", "logs/backend.log"]
+timeout_s   = 5
+description = "Tail the server log"
+[project.project_rust.jobs.logs.platforms.api.placeholders.lines]
+regex       = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
+max_len     = 4
+required    = true
+description = "Line count, 1..2000"
+
+[project.project_rust.jobs.logs.platforms.web]
+command     = "tail"
+args        = ["-n", "{lines}", "logs/frontend.log"]
+timeout_s   = 5
+description = "Tail the front-end build log"
+[project.project_rust.jobs.logs.platforms.web.placeholders.lines]
+regex       = "^([1-9][0-9]{0,2}|1[0-9]{3}|2000)$"
+max_len     = 4
+required    = true
+description = "Line count, 1..2000"
+
+# `-I` rather than `-w "%{http_code}"` — see the BRACES note above.
+[project.project_rust.jobs.status.platforms.api]
+command     = "curl"
+args        = ["-s", "-I", "-m", "5", "http://127.0.0.1:8100/"]
+timeout_s   = 15
+description = "Response headers from the app (served by the container)"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NAMED JOBS — reaching the human
+# ══════════════════════════════════════════════════════════════════════
+
+[project.project_rust.jobs.open-app]
+command     = "open"
+args        = ["http://localhost:8100"]
+timeout_s   = 10
+description = "Open the app in the user's browser. The cage only has a headless one."
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NAMED JOBS — quick reads
+# ══════════════════════════════════════════════════════════════════════
+
+[project.project_rust.jobs.tree]
+command     = "tree"
+args        = ["-L", "{depth}", "--dirsfirst", "-I", "target|node_modules|dist"]
+timeout_s   = 15
+description = "Repo tree, N levels, skipping build output"
+[project.project_rust.jobs.tree.placeholders.depth]
+regex       = "^[1-5]$"
+max_len     = 1
+required    = true
+description = "Tree depth 1..5"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# HOST CARGO JOBS — COMMENTED OUT ON PURPOSE
+#
+# Uncommenting any single one of these hands the agent a shell on the
+# host, via build.rs / proc macros. See the top of this file. Only do it
+# for a project where that is an acceptable trade — e.g. you need a
+# native macOS binary, and you trust the model driving it.
+#
+# They are written correctly, so uncommenting works as-is: verb platforms
+# are declared ones, every argument is fixed except two anchored
+# placeholders, and the trunk jobs carry the cwd a workspace member needs.
+# ══════════════════════════════════════════════════════════════════════
+
+# [project.project_rust.jobs.build.platforms.api]
+# command      = "cargo"
+# args         = ["build", "--release", "--workspace"]
+# timeout_s    = 900
+# kill_after_s = 10
+# description  = "Release build of the workspace"
+#
+# [project.project_rust.jobs.build.platforms.web]
+# command      = "trunk"
+# args         = ["build", "--release"]
+# cwd          = "crates/ui"
+# timeout_s    = 900
+# kill_after_s = 10
+# description  = "Compile the Leptos app to WebAssembly into crates/ui/dist"
+#
+# [project.project_rust.jobs.lint.platforms.api]
+# command     = "cargo"
+# args        = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+# timeout_s   = 600
+# description = "Clippy with warnings escalated to errors"
+#
+# [project.project_rust.jobs.test.platforms.api]
+# command      = "cargo"
+# args         = ["nextest", "run", "--workspace", "--no-tests=pass"]
+# timeout_s    = 600
+# kill_after_s = 10
+# description  = "nextest; --no-tests=pass so a crate with no tests is not a failure"
+#
+# [project.project_rust.jobs.cargo-check]
+# command     = "cargo"
+# args        = ["check", "--workspace", "--all-targets"]
+# timeout_s   = 600
+# description = "Type-check (still executes build.rs — see the top of this file)"
+#
+# [project.project_rust.jobs.cargo-fmt]
+# command            = "cargo"
+# args               = ["fmt", "--all"]
+# timeout_s          = 120
+# mutates_filesystem = true
+# description        = "Reformat the workspace in place"
+#
+# [project.project_rust.jobs.cargo-audit]
+# command     = "cargo"
+# args        = ["audit"]
+# timeout_s   = 180
+# description = "Check dependencies against the RustSec advisory database"
+#
+# # Two placeholders in one job is allowed. Both anchored so neither can
+# # begin with `-` and be read by cargo as a flag.
+# [project.project_rust.jobs.cargo-add]
+# command            = "cargo"
+# args               = ["add", "--package", "{crate}", "{dep}"]
+# timeout_s          = 180
+# mutates_filesystem = true
+# description        = "Add a dependency to one workspace crate"
+# [project.project_rust.jobs.cargo-add.placeholders.crate]
+# regex              = "^[a-z0-9][a-z0-9_\\-]{0,63}$"
+# max_len            = 64
+# required           = true
+# description        = "Target workspace crate"
+# [project.project_rust.jobs.cargo-add.placeholders.dep]
+# regex              = "^[a-zA-Z0-9][a-zA-Z0-9_.\\-]{0,63}(@[0-9][0-9A-Za-z.\\-]{0,15})?$"
+# max_len            = 80
+# required           = true
+# description        = "crates.io name, optionally name@version"

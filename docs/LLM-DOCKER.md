@@ -131,10 +131,12 @@ N` for slots in both launchers.
 | Add / change an API key | Vault mode: KeePassXC entry `ENV/llm-docker` .env attachment. Plain mode: `src/.env`. Run installer to pre-fill from vault. | No |
 | Add an SSH pubkey (inbound) | Re-run installer step 6a; picks from `~/.ssh/*.pub` or paste. | No |
 | Add / rotate outbound SSH key | Re-run installer step 6b; can also provision remote llmdocker user. | No |
-| Turn on a build-time toolkit (ruby, browsing, media, php, tmux helpers) | `src/llm-docker.conf` (`INSTALL_*=true`) | **Yes** — `cld --build` |
+| Turn on a build-time toolkit (ruby, rust, browsing, media, php, tmux helpers) | `src/llm-docker.conf` (`INSTALL_*=true`) | **Yes** — `cld --build` |
 | Enable / disable SSH inbound | `src/llm-docker.conf` (`LLM_D0CKER_SHH_EN4BLED`) | Yes (first time, to bake openssh-server) |
 | Change `WORKSPACE_DIR` (persistent host mirror) | `src/llm-docker.conf` | No |
 | Toggle internet block | `src/llm-docker.conf` (`INTERNET_ACCESS=false`) | No (forces bridge networking on next launch) |
+| Change a container resource cap (RAM, /dev/shm, pids, cores) | `src/llm-docker.conf` (`LIMIT_MEMORY`, `LIMIT_SHM`, `LIMIT_PIDS`, `LIMIT_CPUS`) | No |
+| Open a container dev server in your Mac's browser | `src/llm-docker.conf` (`PUBLISH_PORTS="8100:8100"`) | No (forces bridge networking on next launch) |
 | Auto-start builder-api on every launch | `src/llm-docker.conf` (`BUILDER_API_AUTOSTART=true`) | No |
 | Switch vault ↔ .env mode | `src/llm-docker.conf` (`IS_S3C_GORILLA_ENABLED=true/false`) or re-run installer step 3 | No |
 
@@ -366,6 +368,7 @@ llm-docker/
 ├── plans/                                 ← per-work-item plans (ephemeral)
 ├── scripts/
 │   ├── ci/                                ← 9 CI scripts — see section 11
+│   ├── linter.rs                          ← Rust linter (fmt/clippy/check/test/audit); needs INSTALL_RUST
 │   ├── git-hooks/                         ← pre-commit_private-terms.sh
 │   └── tools/                             ← install-git-hooks.sh
 └── src/
@@ -414,7 +417,7 @@ llm-docker/
     │   ├── jobs.py / jobs_parse.py / jobs_models.py / jobs_errors.py
     │   ├── build_queue.py                 ← FIFO worker, dedupe, snapshot-per-entry
     │   ├── banner.py                      ← boot ASCII + terminal-height-aware event tail
-    │   ├── security.py                    ← AuthGate + rate limit + size caps
+    │   ├── security.py                    ← AuthGate + size caps
     │   ├── http_handler.py / ws.py        ← HTTP + WebSocket handlers
     │   ├── client.py                      ← Python helper for in-container callers
     │   ├── run-local.sh                   ← per-project launcher (passes --project)
@@ -444,6 +447,22 @@ llm-docker/
 3. Run `cld --build` (smart rebuild — re-runs the install scripts inside
    the existing image and commits).
 4. Re-launch `cld` to verify.
+
+### Lint a Rust crate
+
+`scripts/linter.rs` runs `cargo fmt --check`, `cargo check`, `cargo clippy -D
+warnings`, the test suite (nextest when present) and `cargo audit`, printing one
+purple tree with a PASS/FAIL per step; the exit code is the number of failures.
+
+```bash
+./scripts/linter.rs                 # lint the crate at/above the current dir
+./scripts/linter.rs ../my-crate     # lint somewhere else
+./scripts/linter.rs --fix           # cargo fmt + clippy --fix instead of checking
+./scripts/linter.rs --no-test --no-audit
+```
+
+It runs through `rust-script` (installed by the RUST devpack group). Without it:
+`rustc -O -o /tmp/linter scripts/linter.rs && /tmp/linter`.
 
 ### Add a tmux helper (recon-style)
 
@@ -522,8 +541,13 @@ Plus one git hook + installer:
 | `safe_delete: failed to trash /var/folders/...` mid-install | macOS `brew install trash` doesn't accept `--` as end-of-options. | Fixed — helper no longer passes `--`. Callers absolute-path any `-`-prefixed target. |
 | `env-gorilla: loading ENV/llm-docker,.llm-docker …` warning | Running cld from `~/.llm-docker` treated `.llm-docker` as a project name. | Fixed — dot-strip in preflight; `~/.llm-docker` resolves to just the cage profile. |
 | `Permission denied` exec'ing a script via env-gorilla | Non-executable script; env-gorilla can't `exec()` it directly. | All 5 re-exec sites use `bash "$0" "$@"` — works regardless of the file's exec bit. |
+| `cargo: command not found` after a build with a Rust tmux helper on | The tmux block used to uninstall rustup unconditionally at the end of the build. | Fixed — teardown now runs only when `INSTALL_RUST=false`. |
+| A cargo helper installs but dies with `GLIBC_2.39 not found` | Some crates publish prebuilts linked against a newer glibc than Debian bookworm's 2.36. | Fixed — the RUST group runs each prebuilt once and rebuilds it from source when the loader rejects it. |
 | `--build` fallback silently no-ops | Legacy `setup_image` short-circuits when image exists. | If `cld --build` doesn't rebuild what you expect, run `cld --rebuild-force`. |
 | Python edits don't take effect | Hot-reload only watches the host `builder-api.toml`, not Python source. | `pkill -f builder-api/server.py` then re-launch via `cld -a`. |
+| A dev server bound inside the container is unreachable from the Mac's browser | Docker Desktop runs containers in a Linux VM; `--network host` joins the VM's namespace, not macOS's. Only `-p` published ports cross. | Set `PUBLISH_PORTS="<port>:<port>"` in `src/llm-docker.conf` and relaunch. Note it forces bridge networking, so the container must reach Mac services via `host.docker.internal`, not `127.0.0.1`. |
+| Chromium tabs crash / hang under Playwright inside the container | `/dev/shm` was Docker's 64 MB default. | Fixed — `LIMIT_SHM=1gb` in `src/llm-docker.conf` is applied on every launch. |
+| A terminal dies with exit 137 mid-build | The container hit `LIMIT_MEMORY` (3g default) and was OOM-killed on its own — by design, so the other terminals survive. | Raise `LIMIT_MEMORY`, or give the Docker Desktop VM more RAM. |
 | `sleep: invalid time interval 'Read ./CLAUDE.md...'` on launch | Ancient smart-rebuild bug (fixed in v2.2). | `cld --rebuild-force` once. |
 | `docker/00-LLM-DOCKER.md not found` | Legacy path — this doc is now `docs/LLM-DOCKER.md`. | Update your bookmark. |
 

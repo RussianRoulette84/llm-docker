@@ -48,7 +48,11 @@ else
     success "Plain .env mode"
 fi
 
-if [ -f "$SCRIPT_DIR/.env" ]; then
+# With env-gorilla installed, secrets stay off disk entirely — seeding a template
+# full of empty keys is how a blank value ended up overriding a real one.
+if command -v env-gorilla >/dev/null 2>&1; then
+    success "Vault mode — no .env file"
+elif [ -f "$SCRIPT_DIR/.env" ]; then
     success ".env already exists"
 else
     setup_env >/dev/null

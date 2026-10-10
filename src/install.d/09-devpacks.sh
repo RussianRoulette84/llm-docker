@@ -3,10 +3,11 @@ header_tui "9/12  Optional devpacks (build-time)"
 info "These flags bake extra tooling into the image. Flipping them only takes"
 info "effect after ${secondary_accent}docker rmi llm-docker:latest${RESET} forces a rebuild."
 
-DEVPACK_NAMES=(INSTALL_SECURITY INSTALL_RUBY INSTALL_CPP INSTALL_LLVM_CLANG INSTALL_NS INSTALL_MEDIA INSTALL_BROWSING)
+DEVPACK_NAMES=(INSTALL_SECURITY INSTALL_RUBY INSTALL_RUST INSTALL_CPP INSTALL_LLVM_CLANG INSTALL_NS INSTALL_MEDIA INSTALL_BROWSING)
 DEVPACK_DESCS=(
   "pentest toolkit: nmap, sqlmap, nuclei, amass (go), nikto (git)"
   "Ruby stack: rbenv + ruby-build + cocoapods"
+  "Rust: rustup stable + cargo + clippy/rustfmt + nextest/audit/rust-script"
   "C/C++ basics: make + cmake + gcc"
   "LLVM/Clang toolchain (superset of CPP)"
   "NativeScript CLI + n (Node version manager)"

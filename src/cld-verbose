@@ -14,7 +14,7 @@ Usage:
     cld-verbose                 — connect to host.docker.internal:6666 (env-driven)
     NO_COLOR=1 cld-verbose      — strip ANSI
 
-Env: BUILDER_API_HOST / BUILDER_API_PORT / BUILDER_API_PASSWORD (same as client.py).
+Env: BUILDER_API_HOST / BUILDER_API_PORT / BUILDER_API_P4SS (same as client.py).
 """
 from __future__ import annotations
 
@@ -171,7 +171,7 @@ def main() -> int:
     aliases = _discover_log_aliases()
     _header(project)
     if not client.DEFAULT_PASSWORD:
-        out(f"{B.YELLOW}⚠ BUILDER_API_PASSWORD not set — /ws auth will be refused. "
+        out(f"{B.YELLOW}⚠ BUILDER_API_P4SS not set — /ws auth will be refused. "
             f"Export it in this shell to see traffic.{B.RST}\n")
 
     # Reconnect loop: ws() returns after duration_s or on drop; we re-attach.
@@ -180,17 +180,14 @@ def main() -> int:
             client.ws(logs_aliases=aliases, duration_s=3600.0, on_message=on_message)
             time.sleep(2.0)   # clean return (duration elapsed) → quick re-attach
         except client.BuilderAPIError as e:
-            # Auth-refused / rate-limited: back off HARD (60s). Retrying fast
-            # just trips the daemon's auth-failure lockout (10 fails/60s → 429)
-            # and spams the pane — exactly the failure we're avoiding.
+            # Auth-refused: back off 60s so a wrong password doesn't spam the
+            # pane with a reconnect line every couple of seconds.
             st = getattr(e, "status", 0)
             if st in (401, 403):
-                out(f"{B.YELLOW}⚠ /ws auth refused — check BUILDER_API_PASSWORD (retry 60s){B.RST}\n")
-            elif st == 429:
-                out(f"{B.YELLOW}⚠ rate limited — backing off 60s{B.RST}\n")
+                out(f"{B.YELLOW}⚠ /ws auth refused — check BUILDER_API_P4SS (retry 60s){B.RST}\n")
             else:
                 out(f"{B.YELLOW}… reconnecting ({st}){B.RST}\n")
-            time.sleep(60.0 if st in (401, 403, 429) else 5.0)
+            time.sleep(60.0 if st in (401, 403) else 5.0)
         except Exception as e:
             out(f"{B.YELLOW}… reconnecting ({type(e).__name__}){B.RST}\n")
             time.sleep(5.0)

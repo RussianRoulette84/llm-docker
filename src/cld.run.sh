@@ -13,8 +13,21 @@ run_claude_container() {
 
     _iterm_tag "Claude" "$WORKDIR"
 
-    # Cleanup on exit: kill watchdog, stop container
+    # Per-terminal session tracking: marker created before the trap is armed so
+    # the exit-side save only picks jsonl files touched by THIS run.
+    _TS_MARKER="$(mktemp)" && touch "$_TS_MARKER"
+
+    # Cleanup on exit: remember this tab's chat, kill watchdog, stop container.
+    # The save lives HERE and not after `docker run` so it also fires when the
+    # tab is closed or CMD+Q'd (HUP → trap → exit, which never reaches the code
+    # below the docker run). Idempotent: rows are keyed by tab + project.
+    # $WORKDIR is local to this function and gone by the time an EXIT trap runs
+    # on the normal path, so the save reads a global snapshot instead.
+    _TS_WORKDIR="$WORKDIR"
     cleanup_container() {
+        _save_terminal_session "$(_terminal_id)" "$(_project_key "$_TS_WORKDIR")" \
+            "$(_claude_session_dir "$_TS_WORKDIR")" "$_TS_MARKER" "$RESUME_SESSION" 2>/dev/null || true
+        [ -n "$_TS_MARKER" ] && /bin/rm -f "$_TS_MARKER" 2>/dev/null
         [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
         docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
         _teardown_builder_api
@@ -51,23 +64,44 @@ run_claude_container() {
     fi
     DOCKER_WORKDIR="$_LLM_DOCKER_WORKDIR"
 
+    # Session diagnostics. `-c` coming up empty was invisible before: nothing
+    # said which folder Claude would look in, or whether anything was there.
+    _log CLD "Starting Claude sandbox in $DOCKER_WORKDIR..."
+    _SESS_DIR="$(_dashed_session_dir "${CLAUDE_HOME:-$HOME/.llm-docker/claude}" "$DOCKER_WORKDIR")"
+    _SESS_N=0
+    [ -d "$_SESS_DIR" ] && _SESS_N=$(ls -1 "$_SESS_DIR"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+    _log_silent CLD "session lookup: continue=${CONTINUE_SESSION:-false} resume=${RESUME_SESSION:-none} slot=${SLOT:-none} flags=[${CLAUDE_FLAGS[*]}] dir=$_SESS_DIR files=$_SESS_N"
+    if [ "${CONTINUE_SESSION:-false}" = true ] && [ "$_SESS_N" -eq 0 ]; then
+        _log CLD WARNING "-c asked for, but this folder has no saved chats yet ($_SESS_DIR) — starting fresh."
+    fi
+
     # Background watchdog: survives CMD+Q / crashes
     # - Periodically finds active session via lsof inside the container (process-specific, no race)
     # - If parent shell dies, kills the container
     WATCHDOG_PID=""
     DOCKER_SESSION_DIR="/root/.claude/projects/$(echo "$DOCKER_WORKDIR" | sed 's|[/_.]|-|g')"
+    _TID="$(_terminal_id)"
     (
         set +e
         PARENT_PID=$$
+        _LAST_SID=""
         sleep 10
         while kill -0 "$PARENT_PID" 2>/dev/null; do
-            if [ -n "$SLOT" ]; then
-                # Find which .jsonl the claude process has open via /proc (unique to THIS container)
-                SID=$(docker exec "$CONTAINER_NAME" sh -c \
-                    "for f in /proc/*/fd/*; do readlink \"\$f\" 2>/dev/null; done | grep '$DOCKER_SESSION_DIR/.*\.jsonl' | sort -u | tail -1" \
-                    2>/dev/null)
-                if [ -n "$SID" ]; then
-                    basename "$SID" .jsonl > "$CLAUDE_HOME/.claude/slot_${SLOT}.id"
+            # Find which .jsonl the claude process has open via /proc (unique to THIS container)
+            SID=$(docker exec "$CONTAINER_NAME" sh -c \
+                "for f in /proc/*/fd/*; do readlink \"\$f\" 2>/dev/null; done | grep '$DOCKER_SESSION_DIR/.*\.jsonl' | sort -u | tail -1" \
+                2>/dev/null)
+            if [ -n "$SID" ]; then
+                SID_ONLY="$(basename "$SID" .jsonl)"
+                [ -n "$SLOT" ] && printf '%s\n' "$SID_ONLY" > "$CLAUDE_HOME/.claude/slot_${SLOT}.id"
+                # Remember which chat this pane is on WHILE it runs. Writing only
+                # on a clean exit meant a pane that crashed, or one still open,
+                # was never recorded — so `-c` there resumed an older chat.
+                # Only on change: this file is shared by every running pane.
+                if [ "$SID_ONLY" != "$_LAST_SID" ]; then
+                    _save_terminal_session "$_TID" "$_LLM_PROJECT_TOKEN" \
+                        "$_SESS_DIR" "" "$SID_ONLY" 2>/dev/null
+                    _LAST_SID="$SID_ONLY"
                 fi
             fi
             sleep 5
@@ -111,10 +145,20 @@ run_claude_container() {
     SANDBOX_ENABLED=${SANDBOX_ENABLED:-true}
     INTERNET_ACCESS=${INTERNET_ACCESS:-true}
     [ -f "$SCRIPT_DIR/llm-docker.conf" ] && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/llm-docker.conf"
-    [ -f "$SCRIPT_DIR/.env" ]            && ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/.env"
+    # The plain secrets file is the fallback for machines WITHOUT env-gorilla.
+    # If the tool is installed, the vault is the only source — even when a key
+    # is missing from it. Handing the file over too lets an empty key in it
+    # overwrite a real value.
+    if ! command -v env-gorilla >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/.env" ]; then
+        ENV_FILES="$ENV_FILES --env-file $SCRIPT_DIR/.env"
+    fi
 
     # Single source of truth for cap/security flags (see setup.sh).
     _compute_cap_flags "$SANDBOX_ENABLED" "$INTERNET_ACCESS" "${LLM_D0CKER_SHH_EN4BLED:-false}" CAP_DROP CAP_ADD SECURITY_OPT
+
+    # RAM / shm / pids / cpu caps from llm-docker.conf — one container can't
+    # starve the shared Docker VM.
+    _compute_limit_flags CLD LIMIT_FLAGS
 
     # SSH port publish requires bridge networking (`-p` can't be used with host).
     # With SLOT: offset host port by (SLOT - 1) → slot 1=8884, slot 2=8885, etc.
@@ -149,19 +193,63 @@ run_claude_container() {
     # in the ssh-agent's memory only.
 
     # Codeman exposes its web UI on port 3000 — needs bridge networking to
-    # publish with `-p`. In host mode the port is already reachable on localhost.
+    # publish with `-p`. Host mode does NOT expose it to macOS: Docker
+    # Desktop's host mode is the Linux VM's namespace, not the Mac's.
     CODEMAN_PORT_MAPPING=""
     if [ "$TMUX_CODEMAN" = true ]; then
         CODEMAN_PORT_MAPPING="-p 3000:3000"
     fi
 
-    if [ "$INTERNET_ACCESS" = "false" ] || [ -n "$SSH_PORT_MAPPING" ] || [ -n "$CODEMAN_PORT_MAPPING" ]; then
+    # Extra ports published container -> host, from PUBLISH_PORTS in
+    # llm-docker.conf. Space-separated "HOST:CONTAINER" (or a bare port for
+    # both sides), e.g. PUBLISH_PORTS="8100:8100 5173".
+    #
+    # Docker Desktop runs containers inside a Linux VM. `--network host`
+    # joins THAT VM's network namespace, not macOS's — so a port merely
+    # bound inside the container is invisible to your Mac's browser. Only
+    # `-p` published ports cross the VM boundary, and `-p` requires bridge
+    # networking (see the NETWORK_MODE decision below).
+    APP_PORT_MAPPING=""
+    if [ -n "${PUBLISH_PORTS:-}" ]; then
+        for _pp in $PUBLISH_PORTS; do
+            case "$_pp" in
+                *:*) ;;
+                *)   _pp="${_pp}:${_pp}" ;;
+            esac
+            if printf '%s' "$_pp" | grep -qE '^[0-9]{1,5}:[0-9]{1,5}$'; then
+                # Host side auto-bumps when taken, so a second container for
+                # another project doesn't fail to start on a busy port (same
+                # rule as the SSH port above). Container side never moves —
+                # the app inside still binds what it was told to.
+                _pp_want="${_pp%%:*}"
+                _pp_host="$_pp_want"
+                _pp_cont="${_pp##*:}"
+                _pp_max=$(( _pp_want + 20 ))
+                while (timeout 1 bash -c "</dev/tcp/127.0.0.1/$_pp_host") 2>/dev/null; do
+                    _pp_host=$(( _pp_host + 1 ))
+                    [ "$_pp_host" -le "$_pp_max" ] || break
+                done
+                if [ "$_pp_host" -gt "$_pp_max" ]; then
+                    _log CLD WARNING "ports $_pp_want-$_pp_max all busy — not publishing $_pp_cont this time."
+                else
+                    [ "$_pp_host" = "$_pp_want" ] || \
+                        _log CLD "port $_pp_want busy — publishing container $_pp_cont on $_pp_host instead"
+                    APP_PORT_MAPPING="$APP_PORT_MAPPING -p ${_pp_host}:${_pp_cont}"
+                fi
+            else
+                _log CLD ERROR "PUBLISH_PORTS: ignoring malformed entry '$_pp' (want HOST:CONTAINER, e.g. 8100:8100)"
+            fi
+        done
+        unset _pp _pp_want _pp_host _pp_cont _pp_max
+    fi
+
+    if [ "$INTERNET_ACCESS" = "false" ] || [ -n "$SSH_PORT_MAPPING" ] || [ -n "$CODEMAN_PORT_MAPPING" ] || [ -n "$APP_PORT_MAPPING" ]; then
         NETWORK_MODE="bridge"
     else
         NETWORK_MODE="host"
     fi
 
-    PORT_MAPPING="$SSH_PORT_MAPPING $CODEMAN_PORT_MAPPING"
+    PORT_MAPPING="$SSH_PORT_MAPPING $CODEMAN_PORT_MAPPING $APP_PORT_MAPPING"
 
     # SLOT env var tells the entrypoint to save session ID on exit
     # SLOT_RESUME_ID tells it which session was resumed (so it can identify THIS container's session)
@@ -209,11 +297,6 @@ run_claude_container() {
     done < <(env)
     unset _ename _ENV_BLOCK
 
-    # Per-terminal session tracking: marker created just before launch so
-    # the exit-side save only picks jsonl files touched by THIS run.
-    local _TS_MARKER=""
-    _TS_MARKER="$(mktemp)" && touch "$_TS_MARKER"
-
     docker run --rm -it \
         --label com.docker.compose.project=llm-docker \
         --label "llm-docker-project=$_LLM_PROJECT_TOKEN" \
@@ -239,6 +322,7 @@ run_claude_container() {
         $CAP_DROP \
         $CAP_ADD \
         $SECURITY_OPT \
+        $LIMIT_FLAGS \
         -e TERM \
         -e COLUMNS \
         -e LINES \
@@ -256,10 +340,4 @@ run_claude_container() {
         $ENV_FILES \
         $EXTRA_ENV \
         "$IMAGE_TAG" "${CLAUDE_FLAGS[@]}" "$@" "${INIT_PROMPT[@]}"
-
-    # Save THIS terminal's claude session UUID so a subsequent `cld -c`
-    # in the same pane resumes here, not whichever session was most
-    # recent globally. Non-blocking: silently no-ops on any error.
-    _save_terminal_session "$(_terminal_id)" "$(_project_key "$WORKDIR")" "$(_claude_session_dir "$WORKDIR")" "$_TS_MARKER" "$RESUME_SESSION" 2>/dev/null || true
-    [ -n "$_TS_MARKER" ] && /bin/rm -f "$_TS_MARKER" 2>/dev/null
 }

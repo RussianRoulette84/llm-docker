@@ -1,11 +1,11 @@
 """
-security.py — auth gate + per-IP rate limit for failed-auth lockouts.
+security.py — auth gate for the builder-api.
 
 Import points:
     - `AuthGate(cfg, events)` is constructed once in server.py.
     - `gate.check(handler)` is called at the top of every request. It returns
       True if the request passes auth, False if it was rejected (in which case
-      the gate has already written the 401/429 response body).
+      the gate has already written the 401 response body).
 
 This module has NO knowledge of HTTP framing; it only needs the handler's
 client_address, headers, and a helper to send short status responses. Keeping
@@ -15,10 +15,6 @@ it pure means it's easy to unit-test.
 from __future__ import annotations
 
 import json
-import sys
-import threading
-import time
-from collections import deque
 from typing import Optional
 
 
@@ -30,22 +26,11 @@ class HTTPReject(Exception):
     """
 
 
-# ---------------------------------------------------------------------------
-# Rate limit: sliding window per IP. Failures only — successful auth is not
-# counted. Lockout is a timestamp-until; we skip the window check while locked.
-# ---------------------------------------------------------------------------
-
-class _IPState:
-    __slots__ = ("failures", "locked_until")
-
-    def __init__(self) -> None:
-        self.failures: deque[float] = deque()  # timestamps of recent fails
-        self.locked_until: float = 0.0         # 0 when not locked
-
-
 class AuthGate:
     """
-    Combines password check, rate limiting, and request-size limits.
+    Password check only. There is no per-IP throttling or lockout: this
+    daemon is loopback-bound tooling and a failed poll must never make the
+    next legitimate request wait.
 
     Behavior:
       - POST / DELETE → always auth-required.
@@ -53,23 +38,11 @@ class AuthGate:
                         this to True by default when bind != 127.0.0.1).
       - WS           → ALWAYS auth, regardless of auth_reads (streaming is
                         more sensitive than single reads).
-
-    The rate limiter counts ONLY *authentication failures* (401). It does not
-    throttle successful requests. On lockout we return 429 for the remaining
-    window; the event `auth_failure_lockout` is appended once per transition
-    into locked state.
     """
 
     def __init__(self, cfg, events_appender) -> None:
         self._cfg = cfg
         self._events = events_appender  # callable(type: str, payload: dict)
-        self._lock = threading.Lock()
-        self._ips: dict[str, _IPState] = {}
-
-        sec = cfg.security
-        self._window_s = 60.0
-        self._max_failures = sec.auth_failures_per_min
-        self._lockout_s = float(sec.lockout_s)
 
     # ---- public gate ------------------------------------------------------
 
@@ -78,41 +51,27 @@ class AuthGate:
         Returns True if the request may proceed; False if already rejected
         (handler.send_response has been called).
         """
-        ip = handler.client_address[0] if handler.client_address else "unknown"
-
-        # 1. Check lockout first — cheaper than a password comparison, and a
-        #    locked-out attacker shouldn't even get the auth branch.
-        now = time.time()
-        with self._lock:
-            state = self._ips.get(ip)
-            if state is not None and state.locked_until > now:
-                remaining = int(state.locked_until - now)
-                self._short_response(
-                    handler,
-                    429,
-                    f"rate limited: {remaining}s remaining",
-                    retry_after=remaining,
-                )
-                return False
-
-        # 2. Auth branch.
         if not require_auth:
             return True
 
-        # If no password is configured, auth is inherently unenforceable.
-        # config.py already refuses non-loopback binds without a password,
-        # so reaching this branch implies the operator accepted loopback-
-        # trust. Fail open rather than brick every POST/DELETE with 401.
+        # No password configured = nothing to check against. Refuse, never
+        # allow: this branch used to let every write through, which turned a
+        # single renamed environment variable into a daemon that ran jobs for
+        # anyone who could reach the port. Reads are unaffected.
         expected = self._cfg.password
         if not expected:
-            return True
+            self._short_response(
+                handler,
+                401,
+                "no password configured on the daemon — set BUILDER_API_P4SS "
+                "and restart it",
+            )
+            return False
 
         password = self._extract_password(handler)
         if password and _constant_time_eq(password, expected):
             return True
 
-        # Auth failed — record, maybe lock out.
-        self._record_failure(ip, now)
         self._short_response(handler, 401, "authentication required")
         return False
 
@@ -140,48 +99,6 @@ class AuthGate:
             return vals[0]
         return None
 
-    def _record_failure(self, ip: str, now: float) -> None:
-        with self._lock:
-            state = self._ips.setdefault(ip, _IPState())
-            window_start = now - self._window_s
-
-            # Drop failures older than the window.
-            while state.failures and state.failures[0] < window_start:
-                state.failures.popleft()
-
-            state.failures.append(now)
-            if len(state.failures) >= self._max_failures:
-                was_locked = state.locked_until > now
-                state.locked_until = now + self._lockout_s
-                state.failures.clear()
-                if not was_locked:
-                    self._emit_lockout(ip, now)
-
-    def _emit_lockout(self, ip: str, now: float) -> None:
-        # Warn the operator on the tty so they notice; also append an event
-        # so the feed shows it historically.
-        sys.stderr.write(
-            f"[builder-api] SECURITY: {self._max_failures} failed auth "
-            f"attempts from {ip} in {int(self._window_s)}s — "
-            f"locked out for {int(self._lockout_s)}s\n"
-        )
-        sys.stderr.flush()
-        try:
-            self._events(
-                "auth_failure_lockout",
-                {
-                    "ip": ip,
-                    "lockout_s": int(self._lockout_s),
-                    "at": now,
-                    "threshold": self._max_failures,
-                    "window_s": int(self._window_s),
-                },
-            )
-        except Exception:
-            # Events backend might not be ready during early boot; never let
-            # a logging failure turn a security event into a 500.
-            pass
-
     # ---- small helper to avoid pulling BaseHTTPRequestHandler into tests ---
 
     def _short_response(self, handler, status: int, message: str, *, retry_after: int = 0) -> None:
@@ -201,7 +118,7 @@ class AuthGate:
             handler.wfile.write(body)
         except BrokenPipeError:
             pass
-        # Mirror rejected calls (401/429) into the verbose console — they
+        # Mirror rejected calls (401) into the verbose console — they
         # bypass _serve_json. Live-only; never break the request path.
         try:
             from urllib.parse import urlsplit, parse_qs

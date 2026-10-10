@@ -34,8 +34,6 @@ class EventsCfg:
 
 @dataclass
 class SecurityCfg:
-    auth_failures_per_min: int = 10
-    lockout_s: int = 300
     max_body_bytes: int = 1024 * 1024       # 1 MB
     max_url_bytes: int = 8 * 1024           # 8 KB
     request_timeout_s: int = 30

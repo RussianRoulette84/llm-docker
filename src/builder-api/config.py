@@ -48,7 +48,9 @@ from config_parse import (  # noqa: F401
     DEFAULT_HOST_CONFIG, DEFAULT_PROJECTS_DIR, _read_toml, _merge_project_shards,
     _check_shard_safety, _merge_project_block, _expand_env, _parse_verbs,
     _warn_stale_plugin, _resolve_in_root, _default_config_path, _default_projects_dir,
+    _default_log_dir,
 )
+from jobs_builtin import builtin_jobs
 
 def load(project_name: str, config_path: Optional[Path] = None) -> Config:
     """Load the host config, resolve the per-project view, return a frozen
@@ -108,9 +110,16 @@ def _resolve_project_view(
         raise ConfigError(
             f"[project.{project_name}].port missing or invalid in {path}"
         )
-    password = _expand_env(str(
-        proj_block.get("password") or defaults.get("password") or ""
-    ))
+    # The vault hands the password to the daemon through the environment.
+    # A password in a config file still works while configs are being moved
+    # over, but the environment always wins.
+    password = (
+        os.environ.get("BUILDER_API_P4SS")
+        or os.environ.get("BUILDER_API_PASSWORD")
+        or _expand_env(str(
+            proj_block.get("password") or defaults.get("password") or ""
+        ))
+    )
     if "auth_reads" in proj_block:
         auth_reads = bool(proj_block["auth_reads"])
     elif "auth_reads" in defaults:
@@ -157,8 +166,13 @@ def _resolve_project_view(
     for name, j in (proj_block.get("jobs") or {}).items():
         raw_jobs_table[str(name)] = j
 
+    # Built-ins first, config on top: a job declared in config replaces the
+    # built-in of the same name, exactly as the old layering did.
     try:
-        jobs_table = parse_jobs(raw_jobs_table, file_label=str(path))
+        jobs_table = {
+            **builtin_jobs(),
+            **parse_jobs(raw_jobs_table, file_label=str(path)),
+        }
     except JobConfigError as e:
         raise ConfigError(str(e))
 
@@ -193,7 +207,9 @@ def _resolve_project_view(
 
     # --- logs (project-scoped) ---
     log_aliases: dict[str, Path] = {}
-    log_dir_raw = proj_block.get("log_dir") or defaults.get("log_dir")
+    log_dir_raw = (
+        proj_block.get("log_dir") or defaults.get("log_dir") or _default_log_dir()
+    )
     if log_dir_raw:
         log_dir = Path(str(log_dir_raw)).expanduser() / project_name
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -231,8 +247,6 @@ def _resolve_project_view(
     sec_src = {**(defaults.get("security") or {}),
                **(proj_block.get("security") or {})}
     security = SecurityCfg(
-        auth_failures_per_min=int(sec_src.get("auth_failures_per_min") or 10),
-        lockout_s=int(sec_src.get("lockout_s") or 300),
         max_body_bytes=int(sec_src.get("max_body_bytes") or 1024 * 1024),
         max_url_bytes=int(sec_src.get("max_url_bytes") or 8 * 1024),
         request_timeout_s=int(sec_src.get("request_timeout_s") or 30),
@@ -248,7 +262,12 @@ def _resolve_project_view(
             continue
     mtime = max(mtimes) if mtimes else 0.0
 
-    verbs = _parse_verbs(raw, file_label=str(path))
+    # Verbs may be declared per project; a shared [verb.*] table still works
+    # while configs are being moved over. Project wins on a name clash.
+    verbs = _parse_verbs(
+        {**(raw.get("verb") or {}), **(proj_block.get("verb") or {})},
+        file_label=str(path),
+    )
 
     return Config(
         name=project_name,

@@ -124,6 +124,7 @@ Optionally it bind-mounts your `~/Projects` workspace folder into Docker as work
 * ✅ **Path-scoping guards** - `WORKSPACE_DIR` / `DOCKER_DIR` refuse dangerous values (`/`, `$HOME`, container system dirs, anything shallower than 3 segments) at launch — not at runtime.
 * ✅ **Dropped capabilities** - `cap_drop: ALL` when `SANDBOX_ENABLED=true` (default); `NET_BIND_SERVICE` always, `NET_ADMIN` only when internet is blocked.
 * ✅ **No new privileges** - `no-new-privileges:true` security_opt. Flip `SANDBOX_ENABLED=false` when you need `ptrace` / `gdb` for debugging.
+* ✅ **Resource caps per container** - every terminal is its own container on one shared Docker VM, so each gets `--memory` / `--memory-swap` (3g), `--pids-limit` (4096) and `--cpus` (8, clamped to the cores Docker has). A runaway build or browser loop is killed on its own instead of freezing every other terminal. `/dev/shm` is raised to 1gb — Docker's 64 MB default is what makes Chromium tabs crash under Playwright. All four are knobs in `src/llm-docker.conf` (`LIMIT_*`); empty drops that cap.
 * ✅ **Narrow persistence mounts** - Claude persists three paths (`.claude/`, `.config/`, `.claude.json`); OpenCode persists three paths (`.config/opencode/`, `.local/share/opencode/`, `.cache/opencode/`). Everything else in `/root` is ephemeral.
 * ✅ **No docker socket access** - `/var/run/docker.sock` is NOT bind-mounted. The container cannot escape via the Docker API.
 * ✅ **Claude agent permission hardening** - `.claude/settings.local.json` ships with ~200 deny rules: secret reads, install scripts, shell-exec escape hatches, chain-operator variants, path-traversal patterns, and explicit container-escape guards (`*docker.sock*`, `nsenter`, `--privileged`, kernel namespace tools).
@@ -248,6 +249,11 @@ Config splits across two files in `src/`. Secrets live in `.env` (gitignored); e
 | `IS_S3C_GORILLA_ENABLED`        | `true` → cld/ocd inject secrets from the KeePassXC `llm-docker` vault via env-gorilla; `.env` becomes an optional fallback. Underscores only. | `false` |
 | `SANDBOX_ENABLED`               | Drop all caps + `no-new-privileges`. Disable for `gdb`/`ptrace`         | `true`                    |
 | `INTERNET_ACCESS`               | `false` → iptables blocks outbound internet, LAN still works            | `true`                    |
+| `PUBLISH_PORTS`                 | Ports the container exposes to your Mac, space-separated `HOST:CONTAINER` (bare port = both sides). Required for any dev server you want to open in your own browser — Docker Desktop's host mode is the Linux VM's network, not macOS's, so only published ports cross. Forces bridge networking. | -  |
+| `LIMIT_MEMORY`                  | RAM ceiling per container (swap pinned to the same value, so an over-budget container is killed instead of swapping the VM). Empty = no cap. | `3g` |
+| `LIMIT_SHM`                     | `/dev/shm` size. Docker's 64 MB default is what crashes Chromium tabs under Playwright. Empty = Docker default. | `1gb` |
+| `LIMIT_PIDS`                    | Max processes/threads per container — stops a fork explosion. Empty = no cap. | `4096` |
+| `LIMIT_CPUS`                    | Cores one container may use; clamped at launch to what Docker actually has. Empty = all cores. | `8` |
 | `NODE_ENV`                      | `production` / `development` — dev flips verbose logging in entrypoint  | `production`              |
 | `EXIT_TO_DOCKER`                | On Claude/OpenCode exit, drop to bash inside container instead of quitting | `false`                |
 | `UPDATE_ON_START`               | Auto-update the LAUNCHED tool's npm package: `cld` → claude-code only, `ocd` → opencode only. Needs `INTERNET_ACCESS=true` | `true` |
@@ -263,6 +269,7 @@ Config splits across two files in `src/`. Secrets live in `.env` (gitignored); e
 | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | Upper bound on Claude's output size                                     | `48000`                   |
 | `INSTALL_SECURITY`              | Build-time: pen-test toolkit (nmap, nikto, amass, nuclei, …)            | `false`                   |
 | `INSTALL_RUBY`                  | Build-time: rbenv + ruby-build + cocoapods                              | `false`                   |
+| `INSTALL_RUST`                  | Build-time: rustup stable + cargo + rustfmt/clippy/rust-analyzer + wasm32 target + nextest/watch/edit/audit/rust-script/trunk | `true` |
 | `INSTALL_CPP`                   | Build-time: make + cmake + gcc                                          | `false`                   |
 | `INSTALL_LLVM_CLANG`            | Build-time: full LLVM/Clang toolchain (superset of CPP)                 | `false`                   |
 | `INSTALL_NS`                    | Build-time: NativeScript CLI + `n` node version manager                 | `false`                   |
@@ -286,6 +293,7 @@ The llm-docker container includes:
 * **Claude Code CLI**: Globally installed via `npm install -g @anthropic-ai/claude-code`
 * **Shell**: zsh + oh-my-zsh + Powerlevel10k + zsh-autosuggestions + zsh-syntax-highlighting + fzf (Ctrl-T / Ctrl-R / Alt-C)
 * **Development Tools**: Python, pip, git, curl, wget, micro, bat, ripgrep, ncdu, jq, tree, tmux
+* **Rust (on by default, `INSTALL_RUST`)**: rustup stable + cargo, rustfmt, clippy, rust-analyzer, rust-src, the `wasm32-unknown-unknown` target, plus cargo-nextest / cargo-watch / cargo-edit / cargo-audit / rust-script / trunk (browser-side Rust: Leptos, Yew). Lint a crate with [`scripts/linter.rs`](scripts/linter.rs) — it's directly executable.
 * **Tmux helpers (opt-in, gated by `INSTALL_TMUX_*` in `llm-docker.conf`)**: [gavraz/recon](https://github.com/gavraz/recon) (`cld -tr`) + [Ark0N/Codeman](https://github.com/Ark0N/Codeman) (`cld -tc` / `ocd -tc`, binds `:3000`) + [nielsgroen/claude-tmux](https://github.com/nielsgroen/claude-tmux) (`cld -tcl`, popup session manager)
 * **Security**: Capability drop toggled by `SANDBOX_ENABLED`; `no-new-privileges` when sandbox is on
 * **Network**: Host mode when `INTERNET_ACCESS=true` (default); bridge + iptables block when `false`
@@ -501,7 +509,6 @@ Every layer below is enforced. Defeating one is not enough; an attacker has to g
 * ✅ **Password mandatory on non-loopback** — `bind = 0.0.0.0` refuses to start without a password. The daemon won't accidentally expose itself to the LAN unauthenticated.
 * ✅ **`auth_reads` auto-on for non-loopback** — when bound to non-loopback, GET endpoints also require the password by default. `/logs` and `/events` aren't passive data leaks on your LAN.
 * ✅ **`/ws` always requires auth** — even when `auth_reads = false`. The WebSocket sees everything; it doesn't get the "reads are public" exemption.
-* ✅ **Rate-limited auth failures** — 10 failed attempts per minute per IP → 5 min lockout. Logged to stderr + the event feed. No silent password-spraying.
 * ✅ **Slowloris timeout** — 30 s read timeout per socket (`security.request_timeout_s`). Bounded by config, distinct from build timeout.
 * ✅ **Body size cap** — 1 MB max per request body. Bigger gets 413.
 * ✅ **URL size cap** — 8 KB max. Bigger gets 414.

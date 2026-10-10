@@ -155,10 +155,12 @@ if [ "${UPDATE_ON_START:-false}" = "true" ] && [ "${INTERNET_ACCESS:-true}" = "t
         claude)
             _upd_pkg="@anthropic-ai/claude-code@latest"
             _upd_marker=/root/.claude/.last_update_check
+            _upd_cmd="cld"
             ;;
         opencode)
             _upd_pkg="opencode-ai@latest"
             _upd_marker=/root/.config/opencode/.last_update_check
+            _upd_cmd="ocd"
             ;;
         *)
             _upd_pkg=""
@@ -166,6 +168,17 @@ if [ "${UPDATE_ON_START:-false}" = "true" ] && [ "${INTERNET_ACCESS:-true}" = "t
             ;;
     esac
     if [ -n "$_upd_pkg" ]; then
+        # The npm global lives in the container's throwaway layer, so an update
+        # done here only lasts for this session. The marker records the version
+        # it landed on; when the image still ships an older one, the previous
+        # update evaporated and only a rebuild makes it stick.
+        _upd_baked="$(${TOOL:-opencode} --version 2>/dev/null | awk '{print $1}')"
+        _upd_last="$(head -1 "$_upd_marker" 2>/dev/null)"
+        if [ -n "$_upd_last" ] && [ -n "$_upd_baked" ] && [ "$_upd_last" != "$_upd_baked" ]; then
+            echo "[update] ${TOOL:-opencode} $_upd_last was downloaded earlier, but this image still ships $_upd_baked."
+            echo "[update] In-app updates do not survive the container. Bake it in with:  ${_upd_cmd:-cld} --build"
+        fi
+
         _upd_interval=$(( ${CHECK_UPDATE_EVERY_X_DAYS:-7} * 86400 ))
         _upd_due=true
         if [ "${UPDATE_FORCE:-false}" != "true" ] && [ -f "$_upd_marker" ]; then
@@ -186,16 +199,17 @@ if [ "${UPDATE_ON_START:-false}" = "true" ] && [ "${INTERNET_ACCESS:-true}" = "t
             if [ "$_upd_ok" = true ]; then
                 sed 's/^/[update] /' "$_upd_log"
                 echo "[update] Done."
-                touch "$_upd_marker" 2>/dev/null || true
+                ${TOOL:-opencode} --version 2>/dev/null | awk '{print $1}' \
+                    > "$_upd_marker" 2>/dev/null || touch "$_upd_marker" 2>/dev/null || true
             else
                 sed 's/^/[update] /' "$_upd_log"
                 echo "[update] Update failed — continuing with installed version."
             fi
             unset _upd_log _upd_ok
         fi
-        unset _upd_interval _upd_due _upd_age
+        unset _upd_interval _upd_due _upd_age _upd_baked _upd_last
     fi
-    unset _upd_pkg _upd_marker
+    unset _upd_pkg _upd_marker _upd_cmd
 fi
 
 # Source /root/.zprofile so PATH (composer/vendor/bin, go/bin, GOPATH/bin,

@@ -24,8 +24,9 @@
 #   Small files (always): auth.json + slot_N.id mirrored by a poll loop
 #     after each change, plus one final sync at container exit.
 #
-# Every step logs event=... lines to the console AND the host-visible
-# mirror dir (db-mirror.log) with durations, sizes and errors.
+# Every step logs event=... lines to the host-visible mirror dir
+# (db-mirror.log). Terminal output: problems (WARN/ERROR) always; INFO
+# only when DEBUG=true (llm-docker.conf).
 
 OC_DB_DATA_DIR="${OC_DB_DATA_DIR:-/root/.local/share/opencode}"
 OC_DB_MIRROR_DIR="${OC_DB_MIRROR_DIR:-/mnt/opencode-mirror}"
@@ -42,11 +43,20 @@ OC_DB_LITESTREAM=0
 
 _db_now_ms() { date +%s%3N; }
 
+# Console policy (mirrors DEBUG= in llm-docker.conf, injected via
+# --env-file): INFO chatter goes to db-mirror.log ONLY. The terminal sees
+# WARN/ERROR always, INFO only when DEBUG=true.
+_db_verbose() { [ "${DEBUG:-false}" = "true" ]; }
+
 _dblog() {
-    # _dblog LEVEL event=key value pairs...  -> console + mirror logfile
+    # _dblog LEVEL event=key value pairs...  -> mirror logfile (+ console
+    # for problems, or everything when DEBUG=true)
     local _lvl="$1"; shift
     local _line="[$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)] level=$_lvl $*"
-    echo "[opencode-db] $_line"
+    case "$_lvl" in
+        ERROR|WARN) echo "[opencode-db] $_line" ;;
+        *)          _db_verbose && echo "[opencode-db] $_line" ;;
+    esac
     if [ -d "$OC_DB_MIRROR_DIR" ]; then
         # keep the log bounded: chop the head when it grows past 256 KB
         if [ -f "$OC_DB_LOG" ] && [ "$(stat -c %s "$OC_DB_LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
@@ -278,7 +288,7 @@ _oc_db_finish() {
     [ "${OC_DB_FINISHED:-0}" = "1" ] && return 0
     OC_DB_FINISHED=1
     local _t0=$(_db_now_ms) _f0
-    echo "[opencode-db] exit: stopping workers..."
+    _dblog INFO event=exit_stage stage="stopping workers"
     # litestream: 0.2s grace — it ignores TERM anyway; KILL is safe (it
     # only reads the live db, the replica is crash-safe). The watcher is a
     # bash loop and dies on TERM instantly.
@@ -291,10 +301,10 @@ _oc_db_finish() {
         local _p
         for _p in $(pgrep -x sqlite3 2>/dev/null); do kill "$_p" 2>/dev/null; done
     fi
-    echo "[opencode-db] exit: workers stopped ($(( $(_db_now_ms) - _t0 ))ms)"
+    _dblog INFO event=exit_stage stage="workers stopped" "dur_ms=$(( $(_db_now_ms) - _t0 ))"
     _f0=$(_db_now_ms)
-    echo "[opencode-db] exit: final copy running..."
+    _dblog INFO event=exit_stage stage="final copy running"
     _oc_db_sync_once --wait || true
-    echo "[opencode-db] exit: DONE (copy $(( $(_db_now_ms) - _f0 ))ms, total $(( $(_db_now_ms) - _t0 ))ms)"
+    _dblog INFO event=exit_stage stage="done" "copy_ms=$(( $(_db_now_ms) - _f0 ))" "total_ms=$(( $(_db_now_ms) - _t0 ))"
     _dblog INFO event=finish "dur_ms=$(( $(_db_now_ms) - _t0 ))"
 }

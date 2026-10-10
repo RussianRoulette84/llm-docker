@@ -17,6 +17,9 @@
 #   INSTALL_BROWSING    — chromium-headless-shell + headful chromium
 #   INSTALL_PHP         — PHP 8.3 CLI + extensions + Composer
 #                         (+ INSTALL_PHP_ENVOY=true → laravel/envoy global)
+#   INSTALL_RUST        — rustup stable + cargo + rustfmt/clippy/rust-analyzer
+#                         + wasm32 target + prebuilt cargo helpers
+#                         (rust-script, nextest, trunk, ...)
 #
 # Inspired by the macOS `devpack` script — same array-of-packages idea,
 # adapted to Linux/apt.
@@ -58,6 +61,26 @@ SW_BROWSING_APT=(chromium-headless-shell chromium)
 # need the sury.org repo for 8.3. Composer goes in via the upstream installer
 # (apt's composer is stale). Envoy is an optional laravel/envoy install on top.
 SW_PHP_APT=(php8.3-cli php8.3-mbstring php8.3-xml php8.3-curl php8.3-zip unzip)
+
+# Rust. apt bits are what most crates need to link (openssl-sys, ring, etc.).
+# Components come from rustup; the cargo helpers are fetched PREBUILT via
+# cargo-binstall (compiling cargo-audit/nextest from source costs ~15 min).
+# Each helper is "crate:binary" — the binary name is the idempotency probe,
+# because e.g. cargo-edit installs `cargo-upgrade`, not `cargo-edit`.
+SW_RUST_APT=(pkg-config libssl-dev build-essential)
+SW_RUST_COMPONENTS=(rustfmt clippy rust-src rust-analyzer)
+# Compile targets beyond the host one. wasm32 is what browser-side Rust
+# (Leptos / Yew / egui) builds against — without it `trunk build` fails.
+SW_RUST_TARGETS=(wasm32-unknown-unknown)
+SW_RUST_CARGO=(
+    "rust-script:rust-script"
+    "cargo-nextest:cargo-nextest"
+    "cargo-watch:cargo-watch"
+    "cargo-edit:cargo-upgrade"
+    "cargo-audit:cargo-audit"
+    "trunk:trunk"
+)
+SW_RUST_BINSTALL_URL="https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh"
 
 # ── Helpers ─────────────────────────────────────────────────────────
 _apt_install() {
@@ -107,6 +130,20 @@ _is_true() {
         true|yes|on|1) return 0 ;;
         *)             return 1 ;;
     esac
+}
+
+# Install rustup once and put cargo on PATH for the rest of this build.
+# Shared by the RUST group and by the Rust-built tmux helpers (recon,
+# claude-tmux) so we never install the toolchain twice.
+_ensure_rustup() {
+    if [ -x /root/.cargo/bin/rustup ]; then
+        export PATH="/root/.cargo/bin:$PATH"
+        return 0
+    fi
+    echo "[DEVPACK] installing rustup (stable toolchain)..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+    export PATH="/root/.cargo/bin:$PATH"
 }
 
 echo "[DEVPACK] refreshing apt cache..."
@@ -295,6 +332,91 @@ https://packages.sury.org/php/ $(lsb_release -sc) main" \
     fi
 fi
 
+# ── RUST (rustup stable + cargo helpers) ────────────────────────────
+# rustup rather than apt: Debian bookworm ships rustc 1.63, which most
+# modern crates already refuse to build on. Helper binaries come down
+# PREBUILT through cargo-binstall — building cargo-audit / nextest from
+# source is a ~15 min per-crate compile on every rebuild.
+if _is_true "${INSTALL_RUST:-false}"; then
+    echo "[DEVPACK] RUST group"
+    _apt_install "${SW_RUST_APT[@]}"
+    _ensure_rustup
+    rustup default stable
+
+    for _comp in "${SW_RUST_COMPONENTS[@]}"; do
+        if rustup component list --installed 2>/dev/null | grep -q "^${_comp}"; then
+            echo "[DEVPACK] RUST → component $_comp already installed — skipping"
+        else
+            echo "[DEVPACK] RUST → component $_comp"
+            rustup component add "$_comp" \
+                || echo "[DEVPACK][WARNING] rustup component $_comp failed — skipping"
+        fi
+    done
+    unset _comp
+
+    for _tgt in "${SW_RUST_TARGETS[@]}"; do
+        if rustup target list --installed 2>/dev/null | grep -qx "$_tgt"; then
+            echo "[DEVPACK] RUST → target $_tgt already installed — skipping"
+        else
+            echo "[DEVPACK] RUST → target $_tgt"
+            rustup target add "$_tgt" \
+                || echo "[DEVPACK][WARNING] rustup target $_tgt failed — skipping"
+        fi
+    done
+    unset _tgt
+
+    # cargo-binstall itself ships as a prebuilt tarball, so this is a download,
+    # not a compile.
+    if [ -x /root/.cargo/bin/cargo-binstall ]; then
+        echo "[DEVPACK] RUST → cargo-binstall already installed — skipping"
+    else
+        echo "[DEVPACK] RUST → installing cargo-binstall (prebuilt fetcher)"
+        curl -sSL "$SW_RUST_BINSTALL_URL" | bash \
+            || echo "[DEVPACK][WARNING] cargo-binstall install failed — falling back to source builds"
+    fi
+
+    for _entry in "${SW_RUST_CARGO[@]}"; do
+        _crate="${_entry%%:*}"
+        _bin="${_entry##*:}"
+        if [ -x "/root/.cargo/bin/$_bin" ]; then
+            echo "[DEVPACK] RUST → $_crate already installed — skipping"
+            continue
+        fi
+        echo "[DEVPACK] RUST → $_crate"
+        # --force on both paths: we only get here when the binary is genuinely
+        # absent, and cargo/binstall would otherwise no-op on their own
+        # "already installed" bookkeeping (which outlives a deleted binary).
+        _got=false
+        if [ -x /root/.cargo/bin/cargo-binstall ] \
+           && cargo binstall --no-confirm --force --locked "$_crate" \
+           && [ -x "/root/.cargo/bin/$_bin" ]; then
+            # A downloaded binary that exists is not the same as one that runs.
+            # Some crates publish prebuilts linked against a newer glibc than
+            # Debian bookworm ships (rust-script wants 2.39, we have 2.36) and
+            # the loader kills them at startup. Catch that, then build properly.
+            _probe="$("/root/.cargo/bin/$_bin" --version 2>&1 || true)"
+            if printf '%s' "$_probe" | grep -qiE "GLIBC_|required by|cannot execute"; then
+                echo "[DEVPACK] RUST → prebuilt $_crate will not run on this glibc — building from source"
+            else
+                _got=true
+            fi
+        fi
+        if [ "$_got" = false ]; then
+            cargo install --locked --force "$_crate" \
+                || echo "[DEVPACK][WARNING] $_crate install failed — skipping"
+        fi
+    done
+    unset _entry _crate _bin _got _probe
+
+    # Post-condition: a Rust build box without cargo is a broken build, not a
+    # warning. rustfmt/clippy failures above stay soft — cargo does not.
+    if [ ! -x /root/.cargo/bin/cargo ]; then
+        echo "[DEVPACK][ERROR] INSTALL_RUST=true but cargo is missing at /root/.cargo/bin/cargo"
+        exit 1
+    fi
+    echo "[DEVPACK] RUST → $(/root/.cargo/bin/rustc --version 2>&1 | head -1)"
+fi
+
 # ── SSH (openssh-server only when user enabled SSH in llm-docker.conf) ────
 if _is_true "${LLM_DOCKER_SSH_ENABLED:-false}"; then
     echo "[DEVPACK] SSH group"
@@ -327,10 +449,7 @@ _is_true "${INSTALL_TMUX_RECON:-false}"  && [ ! -x /usr/local/bin/recon ]       
 _is_true "${INSTALL_TMUX_CLAUDE:-false}" && [ ! -x /usr/local/bin/claude-tmux ] && _tmux_need_rustup=true
 
 if [ "$_tmux_need_rustup" = true ]; then
-    echo "[DEVPACK] installing rustup (build dependency for recon / claude-tmux)..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
-    export PATH="/root/.cargo/bin:$PATH"
+    _ensure_rustup
 fi
 
 # Litestream — SQLite WAL streamer for continuous opencode DB mirroring
@@ -389,10 +508,13 @@ if _is_true "${INSTALL_TMUX_CLAUDE:-false}"; then
     fi
 fi
 
-if [ "$_tmux_need_rustup" = true ]; then
-    echo "[DEVPACK] uninstalling rustup (keep image lean)..."
+# Teardown is ONLY for the borrowed-toolchain case (rustup pulled in purely to
+# build recon / claude-tmux). With INSTALL_RUST=true the toolchain IS the
+# deliverable — wiping it here is what used to leave the image with no cargo.
+if [ "$_tmux_need_rustup" = true ] && ! _is_true "${INSTALL_RUST:-false}"; then
+    echo "[DEVPACK] uninstalling rustup (borrowed for tmux helpers; INSTALL_RUST is off)..."
     /root/.cargo/bin/rustup self uninstall -y 2>/dev/null || true
-    rm -rf /root/.cargo /root/.rustup
+    /bin/rm -rf /root/.cargo /root/.rustup
 fi
 
 if _is_true "${INSTALL_TMUX_CODEMAN:-false}"; then

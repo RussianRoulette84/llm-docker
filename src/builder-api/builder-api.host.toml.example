@@ -30,7 +30,7 @@
 
 # ── Defaults ──────────────────────────────────────────────────────────
 [defaults]
-password = "${BUILDER_API_PASSWORD}"      # env-interpolated; never inline secrets
+password = "${BUILDER_API_P4SS}"          # env-interpolated; never inline secrets
 log_dir  = "~/.llm-docker/logs"            # per-project logs go under <log_dir>/<project>/
 bind     = "127.0.0.1"                     # 0.0.0.0 requires password (non-loopback)
 

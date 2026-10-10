@@ -125,10 +125,12 @@ export PATH="$PATH:$GOPATH/bin"
 export PATH="$HOME/.config/composer/vendor/bin:$PATH"
 
 ##########################################################################################
-## Rust / Cargo
+## Rust / Cargo  (INSTALL_RUST=true in llm-docker.conf)
 ##########################################################################################
-# export PATH="$HOME/.cargo/bin:$PATH"
-# [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+# The image already puts /root/.cargo/bin on PATH via ENV, but SSH logins get
+# a fresh login shell that does NOT inherit the container ENV — so wire it here
+# too. Guarded on the dir so it is a no-op when INSTALL_RUST is off.
+[[ -d "$HOME/.cargo/bin" ]] && export PATH="$HOME/.cargo/bin:$PATH"
 
 ##########################################################################################
 ## Ruby / Gem

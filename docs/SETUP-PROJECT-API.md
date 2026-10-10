@@ -108,8 +108,9 @@ scannable when Claude/OpenCode has to reason about it):
 Reference examples in the repo:
 - `src/builder-api/api_config/project_python.toml` — Python-heavy (FastAPI + Django + Vite + Swift), launchd services, brew redis, pytest / e2e / mypy dev tools
 - `src/builder-api/api_config/project_php.toml` — PHP-heavy (Lumen + Slim in docker-compose), Angular workspace, iOS + Objective-C library, Envoy-based deploys, allowlist compose-exec pattern
+- `src/builder-api/api_config/project_rust.toml` — Rust binary crate (cargo build / clippy / nextest / audit), a long-lived `cargo run` runtime, and the smallest useful shard: self-contained, almost no placeholders
 
-Both follow the layout above and are safe to copy-and-rename as your starting point.
+All three follow the layout above and are safe to copy-and-rename as your starting point.
 
 Save it — the daemon **hot-reloads** within ~2s; new jobs apply on next enqueue.
 

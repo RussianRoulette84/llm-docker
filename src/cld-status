@@ -4,7 +4,7 @@ cld-status — live status panel for running llm-docker containers (cld + ocd).
 
 Polls every 5s and renders one row per cld container:
     <project>  CPU [▁▂▃▆█▇▆▅▃] 42.3%   MEM [████░░░░░░] 38.1%
-               NET ↓  12.4 kB/s   ↑   3.1 kB/s
+               NET ↓ 340B/s  ↑ 15kB/s   (adaptive B/s / kB/s / MB/s)
 
 Footer:
     CHRM: 3   PLAY: 2
@@ -209,6 +209,17 @@ def fmt_bytes(b: float) -> str:
     return f"{b / 1024 / 1024:5.1f}MB"
 
 
+def fmt_rate(bps: float) -> str:
+    """Bytes/sec → fixed-width human rate. LLM traffic is bursty (dead air
+    while the model thinks), so sub-kB/s trickles must stay visible instead
+    of rounding to a wall of zeros: ' 340B/s', ' 15kB/s', '1.2MB/s'."""
+    if bps < 1024:
+        return f"{bps:4.0f}B/s"
+    if bps < 1024 * 1024:
+        return f"{bps / 1024:3.0f}kB/s"
+    return f"{bps / 1024 / 1024:3.1f}MB/s"
+
+
 def docker_stats(container_ids: list[str]) -> dict[str, dict]:
     """One-shot `docker stats` for the given container IDs."""
     if not container_ids:
@@ -335,8 +346,8 @@ def render(
         spark = sparkline(list(history.get(cid, deque())), spark_width)
         cpu = s.get("cpu", 0.0)
         mem = s.get("mem", 0.0)
-        rx_kb = s.get("net_rx_rate", 0.0) / 1024
-        tx_kb = s.get("net_tx_rate", 0.0) / 1024
+        rx_rate = s.get("net_rx_rate", 0.0)   # bytes/sec
+        tx_rate = s.get("net_tx_rate", 0.0)
         pids = s.get("pids", 0)
         uptime = fmt_uptime(created_at)
         # Transcript size is a Claude-only measure (OpenCode keeps its history
@@ -354,7 +365,7 @@ def render(
         )
         # Line 2: net + up + pids + ctx (all dim labels)
         out.append(
-            f"  {D}↓{RST}{rx_kb:4.0f} {D}↑{RST}{tx_kb:4.0f}kB/s "
+            f"  {D}↓{RST}{fmt_rate(rx_rate)} {D}↑{RST}{fmt_rate(tx_rate)} "
             f"{D}up{RST}{uptime:<5} {D}p{RST}{pids:<3} "
             f"{D}ctx{RST} {ctx_short}\n"
         )

@@ -83,8 +83,17 @@ cd "$PROJECT_DIR"
 
 # Plain-file fallbacks. Order: llm-docker.conf → llm-docker/.env → ./.env.
 # Per-line read (not `source`) tolerates multi-line values like SSH keys.
+# Settings always; secret files ONLY on machines without env-gorilla. With the
+# tool installed the vault is the single source, even for keys it does not hold
+# — a key present-but-empty in a .env would otherwise overwrite a real value,
+# which is exactly how the api password ended up empty.
+CONF_CANDIDATES=("$SCRIPT_DIR/../llm-docker.conf")
+if ! command -v env-gorilla >/dev/null 2>&1; then
+    CONF_CANDIDATES+=("$SCRIPT_DIR/../.env" "./.env")
+fi
+
 LOADED=()
-for CONF_FILE in "$SCRIPT_DIR/../llm-docker.conf" "$SCRIPT_DIR/../.env" "./.env"; do
+for CONF_FILE in "${CONF_CANDIDATES[@]}"; do
     [ -f "$CONF_FILE" ] || continue
     LOADED+=("$(basename "$CONF_FILE")")
     while IFS= read -r line || [ -n "$line" ]; do

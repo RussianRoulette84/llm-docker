@@ -91,6 +91,20 @@ ENV LC_ALL=en_US.UTF-8
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
+# Python linter/formatter — used by agents directly and by Builder API
+# python-pack jobs (`ruff`, `ruff format`). uv tool → isolated env, binary
+# shim lands in /root/.local/bin (already on PATH).
+RUN uv tool install ruff
+
+# Rust toolchain paths (INSTALL_RUST group in install_devpack.sh). Set
+# unconditionally — harmless when the flag is off, and it keeps cargo/rustc
+# on PATH for the build itself, the entrypoint, and every shell the agent
+# spawns. rustup's own PATH edit is skipped (--no-modify-path) precisely so
+# this one line stays the single source of truth.
+ENV RUSTUP_HOME=/root/.rustup
+ENV CARGO_HOME=/root/.cargo
+ENV PATH="/root/.cargo/bin:$PATH"
+
 WORKDIR /root
 
 # Bake build timestamp into image (used to detect image updates at runtime)
