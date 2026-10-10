@@ -17,29 +17,30 @@ _terminal_id() {
 }
 
 # Candidate restore ids for (tab, project), best first: this tab's own row, then
-# the project's other rows newest -> oldest. Deduped.
+# (unless OWN_ONLY) the project's other rows newest -> oldest. Deduped.
 #
 # The second pass exists because iTerm mints a BRAND NEW tab id for every tab it
 # opens, so an exact-id match can only ever hit while that tab is still alive.
-# Closing the tab (or iTerm) used to lose the binding entirely.
+# cld skips it (claude's own --continue already opens the newest chat); ocd uses it.
 _terminal_session_candidates() {
-    local tid="$1" proj="$2"
+    local tid="$1" proj="$2" own_only="${3:-}"
     [ -f "$_TERM_SESSIONS_FILE" ] || return 0
-    awk -F'\t' -v t="$tid" -v p="$proj" \
-        '$2==p { print ($1==t ? 0 : 1) "\t" $4 "\t" $3 }' "$_TERM_SESSIONS_FILE" \
+    awk -F'\t' -v t="$tid" -v p="$proj" -v o="$own_only" \
+        '$2==p && (o=="" || $1==t) { print ($1==t ? 0 : 1) "\t" $4 "\t" $3 }' "$_TERM_SESSIONS_FILE" \
         | sort -k1,1n -k2,2nr | cut -f3 | awk '!seen[$0]++'
 }
 
-# _lookup_terminal_session TID PROJECT [ALIVE_FN]
+# _lookup_terminal_session TID PROJECT [ALIVE_FN] [own]
 # ALIVE_FN is a shell function name called with a candidate id; it returns 0 when
 # that chat still exists. Candidates whose chat is gone (both tools auto-delete
 # old ones) are skipped. Without ALIVE_FN the first candidate is returned as-is.
+# A 4th arg of "own" limits the search to this tab's own row.
 _lookup_terminal_session() {
-    local tid="$1" proj="$2" alive="${3:-}" cand
+    local tid="$1" proj="$2" alive="${3:-}" own="${4:-}" cand
     while IFS= read -r cand; do
         [ -n "$cand" ] || continue
         if [ -z "$alive" ] || "$alive" "$cand"; then printf '%s' "$cand"; return 0; fi
-    done < <(_terminal_session_candidates "$tid" "$proj")
+    done < <(_terminal_session_candidates "$tid" "$proj" "$own")
     return 0
 }
 

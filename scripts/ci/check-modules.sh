@@ -17,7 +17,7 @@ EXPECTED="_compute_cap_flags _compute_limit_flags _compute_workspace_mounts _cou
 _dashed_session_dir _docker_format_line _docker_pretty _iterm_tag _iterm_untag \
 _llm-docker_image_for_tool llm-docker_version _log _log_docker_exec _log_ensure_dir \
 _log_file_size _log_rotate_if_needed _log_silent _log_write_file _lookup_terminal_session \
-print_banner _project_docker_workdir _project_key _project_root _project_token _read_env_var \
+print_banner _project_docker_workdir _project_root _project_token _read_env_var \
 _register_tmux_flip run_setup setup_dirs setup_env setup_image setup_image_incremental \
 _source_all_config _spawn_api_bg _teardown_builder_api _terminal_id _tmux_nested_prompt \
 _validate_workspace_paths _write_secret_handoff _maybe_start_api _ensure_docker_running spawn_multi_windows _set_tab_color"

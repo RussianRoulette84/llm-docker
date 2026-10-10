@@ -13,21 +13,24 @@ run_claude_container() {
 
     _iterm_tag "Claude" "$WORKDIR"
 
-    # Per-terminal session tracking: marker created before the trap is armed so
-    # the exit-side save only picks jsonl files touched by THIS run.
-    _TS_MARKER="$(mktemp)" && touch "$_TS_MARKER"
+    # Per-terminal session tracking: the in-container SessionStart hook writes
+    # the exact chat id of THIS container into this file (see session-hook.sh).
+    # The host reads it while the tab runs and once more on exit.
+    _TS_SID_FILE="$CLAUDE_HOME/.claude/llm-docker-runs/$CONTAINER_NAME.sid"
+    _TS_SID_FILE_DOCKER="/root/.claude/llm-docker-runs/$CONTAINER_NAME.sid"
+    /bin/rm -f "$_TS_SID_FILE" 2>/dev/null
+    _TID="$(_terminal_id)"
+    _SESS_DIR=""
 
     # Cleanup on exit: remember this tab's chat, kill watchdog, stop container.
     # The save lives HERE and not after `docker run` so it also fires when the
     # tab is closed or CMD+Q'd (HUP → trap → exit, which never reaches the code
-    # below the docker run). Idempotent: rows are keyed by tab + project.
-    # $WORKDIR is local to this function and gone by the time an EXIT trap runs
-    # on the normal path, so the save reads a global snapshot instead.
-    _TS_WORKDIR="$WORKDIR"
+    # below the docker run). Idempotent: rows are keyed by tab + session folder.
     cleanup_container() {
-        _save_terminal_session "$(_terminal_id)" "$(_project_key "$_TS_WORKDIR")" \
-            "$(_claude_session_dir "$_TS_WORKDIR")" "$_TS_MARKER" "$RESUME_SESSION" 2>/dev/null || true
-        [ -n "$_TS_MARKER" ] && /bin/rm -f "$_TS_MARKER" 2>/dev/null
+        if [ -n "$_SESS_DIR" ] && [ -f "$_TS_SID_FILE" ]; then
+            _save_terminal_session "$_TID" "$_SESS_DIR" "$(cat "$_TS_SID_FILE")"
+            /bin/rm -f "$_TS_SID_FILE" 2>/dev/null
+        fi
         [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
         docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
         _teardown_builder_api
@@ -49,6 +52,10 @@ run_claude_container() {
         INIT_PROMPT=("$(cat "$WORKDIR/BOOT.md")")
     elif [ -f "$WORKDIR/CLAUDE.md" ]; then
         INIT_PROMPT=("Read ./CLAUDE.md in full and follow its instructions.")
+    fi
+    # recon / codeman are not claude itself and would choke on --settings.
+    if [ "$TMUX_RECON" != true ] && [ "$TMUX_CODEMAN" != true ]; then
+        CLAUDE_FLAGS+=(--settings "{\"hooks\":{\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"/usr/local/bin/llm-docker-session-hook $_TS_SID_FILE_DOCKER\"}]}]}}")
     fi
 
     # Deletion-safe mounts + stable identity (see setup.sh). Mounts the
@@ -76,35 +83,24 @@ run_claude_container() {
     fi
 
     # Background watchdog: survives CMD+Q / crashes
-    # - Periodically finds active session via lsof inside the container (process-specific, no race)
+    # - Remembers which chat this tab is on WHILE it runs (read from the
+    #   SessionStart hook's file), so a crashed or still-open tab is recorded too
     # - If parent shell dies, kills the container
     WATCHDOG_PID=""
-    DOCKER_SESSION_DIR="/root/.claude/projects/$(echo "$DOCKER_WORKDIR" | sed 's|[/_.]|-|g')"
-    _TID="$(_terminal_id)"
     (
         set +e
         PARENT_PID=$$
         _LAST_SID=""
-        sleep 10
         while kill -0 "$PARENT_PID" 2>/dev/null; do
-            # Find which .jsonl the claude process has open via /proc (unique to THIS container)
-            SID=$(docker exec "$CONTAINER_NAME" sh -c \
-                "for f in /proc/*/fd/*; do readlink \"\$f\" 2>/dev/null; done | grep '$DOCKER_SESSION_DIR/.*\.jsonl' | sort -u | tail -1" \
-                2>/dev/null)
-            if [ -n "$SID" ]; then
-                SID_ONLY="$(basename "$SID" .jsonl)"
+            SID_ONLY=""
+            [ -f "$_TS_SID_FILE" ] && SID_ONLY="$(cat "$_TS_SID_FILE")"
+            # Only on change: the table is shared by every running tab.
+            if [ -n "$SID_ONLY" ] && [ "$SID_ONLY" != "$_LAST_SID" ]; then
                 [ -n "$SLOT" ] && printf '%s\n' "$SID_ONLY" > "$CLAUDE_HOME/.claude/slot_${SLOT}.id"
-                # Remember which chat this pane is on WHILE it runs. Writing only
-                # on a clean exit meant a pane that crashed, or one still open,
-                # was never recorded — so `-c` there resumed an older chat.
-                # Only on change: this file is shared by every running pane.
-                if [ "$SID_ONLY" != "$_LAST_SID" ]; then
-                    _save_terminal_session "$_TID" "$_LLM_PROJECT_TOKEN" \
-                        "$_SESS_DIR" "" "$SID_ONLY" 2>/dev/null
-                    _LAST_SID="$SID_ONLY"
-                fi
+                _save_terminal_session "$_TID" "$_SESS_DIR" "$SID_ONLY"
+                _LAST_SID="$SID_ONLY"
             fi
-            sleep 5
+            sleep 3
         done
         docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
     ) &
@@ -313,6 +309,7 @@ run_claude_container() {
         -v "$SCRIPT_DIR/docker/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
         -v "$SCRIPT_DIR/docker/entrypoint-lib.sh:/usr/local/bin/entrypoint-lib.sh:ro" \
         -v "$SCRIPT_DIR/docker/rm-guard.sh:/usr/local/bin/rm:ro" \
+        -v "$SCRIPT_DIR/docker/session-hook.sh:/usr/local/bin/llm-docker-session-hook:ro" \
         -v "$SCRIPT_DIR/../README.md:/opt/llm-docker/README.md:ro" \
         -v "$SCRIPT_DIR/ascii/llm-docker.txt:/opt/llm-docker/ascii.txt:ro" \
         -v "$SCRIPT_DIR/docker/colorize.sh:/opt/llm-docker/colorize.sh:ro" \

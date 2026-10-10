@@ -468,20 +468,14 @@ _spin() {
 CLAUDE_HOME="$HOME/.llm-docker/claude"
 
 # ── per-terminal session tracking ──────────────────────────────────────
-# Map (iTerm pane / tty, project) → claude session UUID so `cld -c`
-# from the same terminal where a session started resumes THAT session,
-# not whichever session was used most recently across all terminals.
+# Map (iTerm pane / tty, claude session folder) → claude session UUID so
+# `cld -c` from the same terminal where a session started resumes THAT session,
+# not whichever session was used most recently across all terminals. Keyed by
+# the session folder (not the project) so a tab in a subfolder never touches
+# the rows of a tab in the project root. The id itself comes from Claude's
+# SessionStart hook (see cld.run.sh + docker/session-hook.sh).
 _TERM_SESSIONS_FILE="$CLAUDE_HOME/.claude/terminal-sessions.tsv"
 # _terminal_id + _lookup_terminal_session live in setup.sh (shared with ocd).
-
-# Self-heal: v2.9-era launcher keyed rows by the full host path instead of
-# the project token — re-key them (idempotent).
-if [ -f "$_TERM_SESSIONS_FILE" ]; then
-    _tsv_tmp="$(mktemp)"
-    awk -F'\t' -v OFS='\t' '{ if ($2 ~ /^\//) { n=$2; sub(/.*\//, "", n); $2=n } print }' \
-        "$_TERM_SESSIONS_FILE" > "$_tsv_tmp" && mv "$_tsv_tmp" "$_TERM_SESSIONS_FILE"
-    unset _tsv_tmp
-fi
 
 # Compute claude's per-project session dir for a host workdir, using the SAME
 # stable-token logic as _compute_workspace_mounts so the path matches the
@@ -500,32 +494,35 @@ _claude_session_dir() {
     _dashed_session_dir "$CLAUDE_HOME" "$docker_wd"
 }
 
-# Save the session THIS terminal used for (terminal, project):
-#   - resumed a known session (`exact`) → that exact UUID
-#   - fresh launch → the jsonl most recently written since `marker` (created
-#     just before the container started)
-#   - nothing touched this run → keep the previous binding untouched.
-# Also drops this project's rows whose jsonl is gone, so the table stops
-# collecting dead ids as claude prunes old chats.
+# _save_terminal_session TID SESSION_DIR SID — bind this tab to SID for that
+# session folder. Also drops that folder's rows whose chat is gone, so the table
+# stops collecting dead ids as claude prunes old chats. Every running tab writes
+# this table, so the read-modify-write runs under a mkdir lock (no flock on macOS).
 _save_terminal_session() {
-    local tid="$1" proj="$2" sess_dir="$3" marker="${4:-}" exact="${5:-}"
-    local sid="$exact" newest
-    if [ -z "$sid" ] && [ -d "$sess_dir" ] && [ -n "$marker" ] && [ -f "$marker" ]; then
-        newest=$(find "$sess_dir" -name '*.jsonl' -newer "$marker" -exec ls -t {} + 2>/dev/null | head -1)
-        [ -n "$newest" ] && sid=$(basename "$newest" .jsonl)
-    fi
-    [ -z "$sid" ] && return 0
+    local tid="$1" sess_dir="$2" sid="$3" key lock tmp tries=0
+    [ -n "$sid" ] && [ -n "$sess_dir" ] || return 0
+    key="$(basename "$sess_dir")"
     mkdir -p "$(dirname "$_TERM_SESSIONS_FILE")"
-    local tmp
+    lock="$_TERM_SESSIONS_FILE.lock"
+    while ! mkdir "$lock" 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            _log_silent CLAUDE "WARNING: terminal-sessions lock busy for 5s — taking it over ($lock)"
+            break
+        fi
+        sleep 0.1
+    done
     tmp="$(mktemp)"
     if [ -f "$_TERM_SESSIONS_FILE" ]; then
-        awk -F'\t' -v t="$tid" -v p="$proj" -v d="$sess_dir" '
+        awk -F'\t' -v t="$tid" -v p="$key" -v d="$sess_dir" '
             $1==t && $2==p { next }
             $2==p { cmd = "test -f \"" d "/" $3 ".jsonl\""; if (system(cmd) != 0) next }
             { print }' "$_TERM_SESSIONS_FILE" > "$tmp"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$tid" "$proj" "$sid" "$(date +%s)" >> "$tmp"
+    printf '%s\t%s\t%s\t%s\n' "$tid" "$key" "$sid" "$(date +%s)" >> "$tmp"
     mv "$tmp" "$_TERM_SESSIONS_FILE"
+    rmdir "$lock" 2>/dev/null
+    return 0
 }
 
 if [ -n "$SLOT" ]; then
@@ -543,18 +540,17 @@ fi
 # can outlive the chat it points at.
 _claude_session_alive() { [ -f "$_TS_SDIR/$1.jsonl" ]; }
 
-# Per-terminal continue: `-c` without --slot/UUID reopens THIS tab's own chat;
-# with no row for this tab, the project's most recently saved chat. Dead ids are
-# skipped on the way down. Nothing left alive → a genuinely fresh chat.
+# Per-terminal continue: `-c` without --slot/UUID reopens THIS tab's own chat.
+# Only this tab's row counts: other tabs' rows point at chats that are still
+# open elsewhere or days old, which is how `-c` landed in an ancient chat.
 if [ "$CONTINUE_SESSION" = true ] && [ -z "$RESUME_SESSION" ] && [ -z "$SLOT" ]; then
     _TS_SDIR=$(_claude_session_dir "$CURRENT_DIR")
     RESUME_SESSION=$(_lookup_terminal_session "$(_terminal_id)" \
-        "$(_project_key "$CURRENT_DIR")" _claude_session_alive)
+        "$(basename "$_TS_SDIR")" _claude_session_alive own)
     if [ -z "$RESUME_SESSION" ]; then
-        # No row for this tab: fall through to claude's own --continue, which
-        # opens the folder's most recent chat. (The "no chats at all" guard
-        # below is what turns this into a genuinely fresh one.) This used to
-        # jump straight to a fresh chat, skipping the middle step.
+        # No live chat remembered for this tab: fall through to claude's own
+        # --continue, which opens the folder's most recently used chat. (The
+        # "no chats at all" guard below turns this into a genuinely fresh one.)
         _log CLAUDE "no remembered chat for this tab — opening the most recent one"
     fi
     unset _TS_SDIR
