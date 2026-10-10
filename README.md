@@ -331,7 +331,7 @@ ocd -c <uuid>            # Resume a specific OpenCode session by UUID
 
 Sessions are scoped to the current workdir — a session started in `~/Projects/foo` won't surface when you launch from `~/Projects/bar`.
 
-**Per-terminal memory:** plain `-c` first restores the session THIS terminal pane last used (tracked per iTerm pane / tmux pane / tty in `terminal-sessions.tsv`) — terminal B no longer wakes up in terminal A's chat. No binding yet → falls back to the project's most recent session; nothing restorable → starts fresh instead of erroring.
+**Per-terminal memory:** plain `-c` first restores the session THIS terminal pane last used (tracked per iTerm pane / tmux pane / tty in `terminal-sessions.tsv`) — terminal B no longer wakes up in terminal A's chat. The chat id comes straight from Claude (a start-up hook), so it stays right after `/clear` and while other tabs are busy. No binding yet → `cld` opens the folder's most recently used chat; nothing restorable → starts fresh instead of erroring.
 
 ### Slot system (N parallel chats per project)
 

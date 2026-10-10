@@ -24,6 +24,9 @@ Back to Claude Code. Opus 5.5 fixed the chatty Claude issue. They sadly have mon
 - [BUG] `-c` in a tab with no memory jumped straight to a brand-new chat; it now opens the folder's most recent chat first, like the bare tool does.
 - [BUG] A remembered chat that was since auto-deleted left `-c` resuming a dead id — stale ids are now skipped and the memory table stops collecting them.
 - [BUG] A tab that crashed or stayed open never recorded its chat, so `-c` there reopened an older one — the live chat is now remembered while the tab runs, not only on a clean exit.
+- [BUG] `cld -c` in a tab you had just left reopened a weeks-old chat. The tab's chat was guessed from "newest file on disk" (which grabbed another tab's chat or a sub-agent log), and the live watcher never saw anything. Claude now reports the exact chat id through a start-up hook, so each tab gets back its own chat — also after `/clear`.
+- [BUG] A tab working in a subfolder of a project wiped the chat memory of tabs in the project root (and the other way round). Memory is now kept per chat folder.
+- [CHANGE] `cld -c` in a tab with no memory now opens the folder's most recently used chat, instead of whatever chat another tab saved last.
 
 ## New cld / ocd flags
 - [BUG] `cld -- <flag>` was silently dropped (`cld -- --resume <id>` did nothing); everything after `--` now reaches claude, same as `ocd`.

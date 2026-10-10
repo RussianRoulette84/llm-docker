@@ -94,12 +94,6 @@ _dashed_session_dir() {
     printf '%s/.claude/projects/-%s' "$claude_home" "$dpath"
 }
 
-# _project_key HOST_DIR — stable per-project key (token) for terminal-session
-# tracking. Uses the global WORKSPACE_DIR. Shared by cld + ocd.
-_project_key() {
-    _project_token "$(_project_root "$1" "$WORKSPACE_DIR")"
-}
-
 # _project_docker_workdir CWD WS DD WS_ACTIVE WS_TARGET — prints ONLY the
 # container workdir for CWD (no mounts), using the same stable-token logic as
 # _compute_workspace_mounts. Single source of truth for session/sqlite lookups.
